@@ -2,8 +2,18 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from typing import Any
+import json
 
-from .base import DEFAULT_MAX_TOKENS, ChatMessage, ProviderError, ProviderProfile
+from mewcode.tools import ToolCallRequest, ToolRegistry, ToolResult
+
+from .base import (
+    DEFAULT_MAX_TOKENS,
+    ChatMessage,
+    ProviderError,
+    ProviderProfile,
+    ProviderTextDelta,
+    ProviderToolCall,
+)
 
 ADAPTIVE_THINKING = {"type": "adaptive", "display": "omitted"}
 MANUAL_THINKING = {"type": "enabled", "budget_tokens": 1024, "display": "omitted"}
@@ -23,8 +33,15 @@ class AnthropicProvider:
             base_url=profile.base_url,
         )
 
-    def stream_reply(self, messages: list[ChatMessage]) -> Iterator[str]:
-        request = self._build_request(messages)
+    def tool_definitions(self, registry: ToolRegistry) -> list[dict[str, Any]]:
+        return registry.to_anthropic_tools()
+
+    def stream_reply(
+        self,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> Iterator[ProviderTextDelta | ProviderToolCall]:
+        request = self._build_request(messages, tools)
         if not self._profile.thinking:
             try:
                 yield from self._stream_request(request)
@@ -48,19 +65,55 @@ class AnthropicProvider:
         except Exception as exc:
             raise self._to_provider_error(exc) from exc
 
-    def _build_request(self, messages: list[ChatMessage]) -> dict[str, Any]:
-        return {
+    def tool_result_message(
+        self, tool_call: ToolCallRequest, result: ToolResult
+    ) -> ChatMessage:
+        return ChatMessage(
+            role="user",
+            content=[
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_call.id,
+                    "content": _tool_result_payload(result),
+                    "is_error": not result.ok,
+                }
+            ],
+        )
+
+    def tool_call_message(self, tool_call: ToolCallRequest) -> ChatMessage:
+        return ChatMessage(
+            role="assistant",
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": tool_call.id,
+                    "name": tool_call.name,
+                    "input": tool_call.arguments,
+                }
+            ],
+        )
+
+    def _build_request(
+        self, messages: list[ChatMessage], tools: list[dict[str, Any]] | None
+    ) -> dict[str, Any]:
+        request = {
             "model": self._profile.model,
             "max_tokens": DEFAULT_MAX_TOKENS,
             "messages": [
                 {"role": message.role, "content": message.content} for message in messages
             ],
         }
+        if tools:
+            request["tools"] = tools
+        return request
 
-    def _stream_request(self, request: dict[str, Any]) -> Iterator[str]:
+    def _stream_request(self, request: dict[str, Any]) -> Iterator[ProviderTextDelta | ProviderToolCall]:
         with self._client.messages.stream(**request) as stream:
+            if hasattr(stream, "events"):
+                yield from _parse_anthropic_events(stream.events)
+                return
             for text in stream.text_stream:
-                yield text
+                yield ProviderTextDelta(text)
 
     def _is_adaptive_thinking_unsupported(self, exc: Exception) -> bool:
         status_code = getattr(exc, "status_code", None)
@@ -73,3 +126,65 @@ class AnthropicProvider:
         message = str(exc).strip() or exc.__class__.__name__
         message = message.replace(self._profile.api_key, "[redacted]")
         return ProviderError(f"Anthropic request failed: {message}")
+
+
+def _tool_result_payload(result: ToolResult) -> str:
+    return json.dumps(
+        {
+            "ok": result.ok,
+            "content": result.content,
+            "error": result.error,
+            "metadata": result.metadata,
+        },
+        ensure_ascii=False,
+    )
+
+
+def _parse_anthropic_events(events: Any) -> Iterator[ProviderTextDelta | ProviderToolCall]:
+    tool_id = ""
+    tool_name = ""
+    input_parts: list[str] = []
+
+    for event in events:
+        event_type = _get_event_attr(event, "type")
+        if event_type == "content_block_start":
+            block = _get_event_attr(event, "content_block") or _get_event_attr(event, "block") or {}
+            block_type = _get_event_attr(block, "type")
+            if block_type == "tool_use":
+                tool_id = _get_event_attr(block, "id") or ""
+                tool_name = _get_event_attr(block, "name") or ""
+                input_parts = []
+        elif event_type == "content_block_delta":
+            delta = _get_event_attr(event, "delta") or {}
+            delta_type = _get_event_attr(delta, "type")
+            if delta_type == "text_delta":
+                text = _get_event_attr(delta, "text") or ""
+                if text:
+                    yield ProviderTextDelta(text)
+            elif delta_type == "input_json_delta":
+                input_parts.append(_get_event_attr(delta, "partial_json") or "")
+        elif event_type == "content_block_stop" and tool_name:
+            raw_arguments = "".join(input_parts)
+            try:
+                arguments = json.loads(raw_arguments) if raw_arguments else {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+            except json.JSONDecodeError:
+                arguments = {}
+            yield ProviderToolCall(
+                ToolCallRequest(
+                    id=tool_id,
+                    name=tool_name,
+                    arguments=arguments,
+                    raw_arguments=raw_arguments,
+                )
+            )
+            tool_id = ""
+            tool_name = ""
+            input_parts = []
+
+
+def _get_event_attr(value: Any, name: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)

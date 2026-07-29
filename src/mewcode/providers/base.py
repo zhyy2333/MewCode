@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator, Literal, Protocol as TypingProtocol
+from typing import Any, Iterator, Literal, Protocol as TypingProtocol
+
+from mewcode.tools import ToolCallRequest, ToolRegistry, ToolResult
 
 Protocol = Literal["anthropic", "openai"]
-ChatRole = Literal["user", "assistant"]
+ChatRole = str
 
 DEFAULT_MAX_TOKENS = 4096
 
@@ -12,7 +14,7 @@ DEFAULT_MAX_TOKENS = 4096
 @dataclass(frozen=True)
 class ChatMessage:
     role: ChatRole
-    content: str
+    content: Any
 
 
 @dataclass(frozen=True)
@@ -56,8 +58,38 @@ class ProviderError(MewCodeError):
 
 
 class LLMProvider(TypingProtocol):
-    def stream_reply(self, messages: list[ChatMessage]) -> Iterator[str]:
+    def tool_definitions(self, registry: ToolRegistry) -> list[dict[str, Any]]:
         ...
+
+    def stream_reply(
+        self,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> Iterator[ProviderEvent]:
+        ...
+
+    def tool_result_message(
+        self,
+        tool_call: ToolCallRequest,
+        result: ToolResult,
+    ) -> ChatMessage:
+        ...
+
+    def tool_call_message(self, tool_call: ToolCallRequest) -> ChatMessage:
+        ...
+
+
+@dataclass(frozen=True)
+class ProviderTextDelta:
+    text: str
+
+
+@dataclass(frozen=True)
+class ProviderToolCall:
+    request: ToolCallRequest
+
+
+ProviderEvent = ProviderTextDelta | ProviderToolCall
 
 
 def create_provider(profile: ProviderProfile) -> LLMProvider:

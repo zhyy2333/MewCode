@@ -5,7 +5,10 @@ from .base import (
     ConfigError,
     LLMProvider,
     ProviderError,
+    ProviderEvent,
     ProviderProfile,
+    ProviderTextDelta,
+    ProviderToolCall,
     RawProviderProfile,
     create_provider,
 )
@@ -17,7 +20,10 @@ __all__ = [
     "ConfigError",
     "LLMProvider",
     "ProviderError",
+    "ProviderEvent",
     "ProviderProfile",
+    "ProviderTextDelta",
+    "ProviderToolCall",
     "RawProviderProfile",
     "create_provider",
 ]

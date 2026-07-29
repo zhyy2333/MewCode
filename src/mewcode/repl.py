@@ -4,7 +4,7 @@ import sys
 from collections.abc import Callable
 from typing import TextIO
 
-from .conversation import Conversation
+from .conversation import Conversation, ConversationTextDelta, ConversationToolStatus
 from .providers import ProviderError
 
 InputFunc = Callable[[str], str]
@@ -41,11 +41,26 @@ class Repl:
                 return 0
 
             try:
-                for part in self._conversation.ask(user_text):
-                    self._stdout.write(part)
-                    self._stdout.flush()
+                for event in self._conversation.ask(user_text):
+                    if isinstance(event, ConversationTextDelta):
+                        self._stdout.write(event.text)
+                        self._stdout.flush()
+                    elif isinstance(event, ConversationToolStatus):
+                        self._stdout.write(_format_tool_status(event))
+                        self._stdout.flush()
                 self._stdout.write("\n")
                 self._stdout.flush()
             except ProviderError as exc:
                 self._stderr.write(f"Error: {exc.message}\n")
                 self._stderr.flush()
+
+
+def _format_tool_status(event: ConversationToolStatus) -> str:
+    if event.status == "started":
+        return f"tool: {event.tool_name} ...\n"
+    label = {
+        "succeeded": "ok",
+        "failed": "failed",
+        "skipped": "skipped",
+    }[event.status]
+    return f"tool: {event.tool_name} {label} - {event.summary}\n"

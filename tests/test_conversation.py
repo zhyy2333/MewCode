@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from mewcode.conversation import Conversation
-from mewcode.providers import ChatMessage, ProviderError
+from mewcode.conversation import Conversation, ConversationTextDelta
+from mewcode.providers import ChatMessage, ProviderError, ProviderTextDelta
 
 
 class FakeProvider:
@@ -11,13 +11,14 @@ class FakeProvider:
         self.parts = parts
         self.calls: list[list[ChatMessage]] = []
 
-    def stream_reply(self, messages: list[ChatMessage]):
+    def stream_reply(self, messages: list[ChatMessage], tools=None):
         self.calls.append(list(messages))
-        yield from self.parts
+        for part in self.parts:
+            yield ProviderTextDelta(part)
 
 
 class FailingProvider:
-    def stream_reply(self, messages: list[ChatMessage]):
+    def stream_reply(self, messages: list[ChatMessage], tools=None):
         raise ProviderError("request failed")
         yield ""
 
@@ -26,7 +27,10 @@ def test_ask_streams_parts_and_appends_history() -> None:
     provider = FakeProvider(["hel", "lo"])
     conversation = Conversation(provider)
 
-    assert list(conversation.ask("Hi")) == ["hel", "lo"]
+    assert list(conversation.ask("Hi")) == [
+        ConversationTextDelta("hel"),
+        ConversationTextDelta("lo"),
+    ]
 
     assert provider.calls == [[ChatMessage(role="user", content="Hi")]]
     assert conversation.messages() == [

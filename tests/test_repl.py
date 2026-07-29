@@ -3,13 +3,14 @@ from __future__ import annotations
 import io
 
 from mewcode import cli
+from mewcode.conversation import ConversationTextDelta, ConversationToolStatus
 from mewcode.providers import ProviderError, ProviderProfile
 from mewcode.repl import Repl
 
 
 class FakeConversation:
-    def __init__(self, parts: list[str] | None = None, fail: bool = False) -> None:
-        self.parts = parts or []
+    def __init__(self, events: list[object] | None = None, fail: bool = False) -> None:
+        self.events = events or []
         self.fail = fail
         self.asked: list[str] = []
 
@@ -17,7 +18,7 @@ class FakeConversation:
         self.asked.append(user_text)
         if self.fail:
             raise ProviderError("provider failed")
-        yield from self.parts
+        yield from self.events
 
 
 def input_sequence(values: list[str]):
@@ -55,7 +56,7 @@ def test_repl_eof_returns_zero() -> None:
 
 
 def test_repl_ignores_empty_input() -> None:
-    conversation = FakeConversation(["ok"])
+    conversation = FakeConversation([ConversationTextDelta("ok")])
     repl = Repl(conversation, stdout=io.StringIO(), input_func=input_sequence(["", "hello", "/exit"]))
 
     assert repl.run() == 0
@@ -64,11 +65,29 @@ def test_repl_ignores_empty_input() -> None:
 
 def test_repl_streams_output_parts() -> None:
     stdout = io.StringIO()
-    conversation = FakeConversation(["hel", "lo"])
+    conversation = FakeConversation([ConversationTextDelta("hel"), ConversationTextDelta("lo")])
     repl = Repl(conversation, stdout=stdout, input_func=input_sequence(["hello", "/exit"]))
 
     assert repl.run() == 0
     assert "hello\n" in stdout.getvalue()
+
+
+def test_repl_prints_tool_status_without_json_arguments() -> None:
+    stdout = io.StringIO()
+    conversation = FakeConversation(
+        [
+            ConversationToolStatus("read_file", "started", "running"),
+            ConversationToolStatus("read_file", "succeeded", "README.md"),
+            ConversationTextDelta("done"),
+        ]
+    )
+    repl = Repl(conversation, stdout=stdout, input_func=input_sequence(["hello", "/exit"]))
+
+    assert repl.run() == 0
+    output = stdout.getvalue()
+    assert "tool: read_file ..." in output
+    assert "tool: read_file ok - README.md" in output
+    assert '{"path"' not in output
 
 
 def test_repl_provider_error_goes_to_stderr_and_continues() -> None:
@@ -145,6 +164,14 @@ def test_main_normal_path_returns_repl_exit_code(monkeypatch) -> None:
     class FakeProvider:
         pass
 
+    class FakeConversationForCli:
+        def __init__(self, provider, tools=None) -> None:
+            created["provider"] = provider
+            created["tools"] = tools
+
+        def messages(self):
+            return []
+
     class FakeRepl:
         def __init__(self, conversation) -> None:
             created["conversation"] = conversation
@@ -154,7 +181,9 @@ def test_main_normal_path_returns_repl_exit_code(monkeypatch) -> None:
 
     monkeypatch.setattr(cli, "load_active_profile", lambda: profile)
     monkeypatch.setattr(cli, "create_provider", lambda loaded: FakeProvider())
+    monkeypatch.setattr(cli, "Conversation", FakeConversationForCli)
     monkeypatch.setattr(cli, "Repl", FakeRepl)
 
     assert cli.main() == 7
     assert created["conversation"].messages() == []
+    assert created["tools"] is not None

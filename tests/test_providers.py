@@ -12,6 +12,7 @@ from mewcode.providers import (
     ConfigError,
     ProviderError,
     ProviderProfile,
+    ProviderTextDelta,
     create_provider,
 )
 from mewcode.providers.anthropic_provider import AnthropicProvider
@@ -85,7 +86,7 @@ def test_anthropic_streams_text_and_builds_request(monkeypatch: pytest.MonkeyPat
     parts = list(provider.stream_reply([ChatMessage(role="user", content="Hi")]))
 
     client = client_type.created[0]
-    assert parts == ["hel", "lo"]
+    assert parts == [ProviderTextDelta("hel"), ProviderTextDelta("lo")]
     assert client.api_key == "secret-key"
     assert client.base_url == "https://example.test"
     assert client.requests == [
@@ -113,7 +114,10 @@ def test_anthropic_thinking_uses_adaptive_omitted(monkeypatch: pytest.MonkeyPatc
     client_type = install_fake_anthropic(monkeypatch)
     provider = AnthropicProvider(profile("anthropic", thinking=True))
 
-    assert list(provider.stream_reply([ChatMessage(role="user", content="Hi")])) == ["hel", "lo"]
+    assert list(provider.stream_reply([ChatMessage(role="user", content="Hi")])) == [
+        ProviderTextDelta("hel"),
+        ProviderTextDelta("lo"),
+    ]
 
     assert client_type.created[0].requests[0]["thinking"] == {
         "type": "adaptive",
@@ -128,7 +132,10 @@ def test_anthropic_adaptive_unsupported_falls_back_to_manual(monkeypatch: pytest
         FakeAnthropicError("adaptive thinking is not supported on this model")
     )
 
-    assert list(provider.stream_reply([ChatMessage(role="user", content="Hi")])) == ["hel", "lo"]
+    assert list(provider.stream_reply([ChatMessage(role="user", content="Hi")])) == [
+        ProviderTextDelta("hel"),
+        ProviderTextDelta("lo"),
+    ]
 
     requests = client_type.created[0].requests
     assert requests[0]["thinking"] == {"type": "adaptive", "display": "omitted"}
@@ -206,7 +213,7 @@ def test_openai_streams_only_output_text_delta(monkeypatch: pytest.MonkeyPatch) 
         )
     )
 
-    assert parts == ["hel", "lo"]
+    assert parts == [ProviderTextDelta("hel"), ProviderTextDelta("lo")]
     assert client_type.created[0].requests == [
         {
             "model": "model-name",
