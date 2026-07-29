@@ -1,0 +1,5 @@
+# Local MewCode config and secrets
+/.mewcode/
+/config.yaml
+/config.yml
+/.codex

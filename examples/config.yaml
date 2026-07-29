@@ -1,0 +1,15 @@
+active: anthropic-main
+profiles:
+  - name: anthropic-main
+    protocol: anthropic
+    model: claude-sonnet-5
+    base_url: https://api.anthropic.com
+    api_key: env:ANTHROPIC_API_KEY
+    thinking: true
+
+  - name: openai-main
+    protocol: openai
+    model: gpt-5.6
+    base_url: https://api.openai.com/v1
+    api_key: env:OPENAI_API_KEY
+    thinking: false
