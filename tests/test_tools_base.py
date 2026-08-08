@@ -113,6 +113,7 @@ def test_openai_tool_format() -> None:
             "name": "echo",
             "description": "Echo text.",
             "parameters": EchoTool.parameters_schema,
+            "strict": False,
         }
     ]
 

@@ -23,6 +23,9 @@ class FakeAnthropicEventStream:
     def __exit__(self, exc_type, exc, traceback) -> None:
         return None
 
+    def __iter__(self):
+        return iter(self.events)
+
 
 class FakeAnthropicMessagesWithEvents:
     def __init__(self, owner: "FakeAnthropicClientWithEvents") -> None:
@@ -51,6 +54,50 @@ def install_fake_anthropic_events(monkeypatch) -> type[FakeAnthropicClientWithEv
         types.SimpleNamespace(Anthropic=FakeAnthropicClientWithEvents),
     )
     return FakeAnthropicClientWithEvents
+
+
+class FakeAnthropicIterableStream:
+    def __init__(self, events: list[object]) -> None:
+        self._events = events
+        self.text_stream = iter([])
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+    def __iter__(self):
+        return iter(self._events)
+
+
+class FakeAnthropicMessagesIterable:
+    def __init__(self, owner: "FakeAnthropicClientIterable") -> None:
+        self._owner = owner
+
+    def stream(self, **kwargs):
+        self._owner.requests.append(kwargs)
+        return FakeAnthropicIterableStream(self._owner.events)
+
+
+class FakeAnthropicClientIterable:
+    created: list["FakeAnthropicClientIterable"] = []
+
+    def __init__(self, api_key: str, base_url: str) -> None:
+        self.requests: list[dict] = []
+        self.events: list[object] = []
+        self.messages = FakeAnthropicMessagesIterable(self)
+        FakeAnthropicClientIterable.created.append(self)
+
+
+def install_fake_anthropic_iterable(monkeypatch) -> type[FakeAnthropicClientIterable]:
+    FakeAnthropicClientIterable.created = []
+    monkeypatch.setitem(
+        sys.modules,
+        "anthropic",
+        types.SimpleNamespace(Anthropic=FakeAnthropicClientIterable),
+    )
+    return FakeAnthropicClientIterable
 
 
 def test_anthropic_parses_text_and_tool_call_events(monkeypatch) -> None:
@@ -94,6 +141,35 @@ def test_anthropic_parses_text_and_tool_call_events(monkeypatch) -> None:
         )
     )
     assert client.requests[0]["tools"] == [{"name": "read_file", "description": "Read", "input_schema": {}}]
+
+
+def test_anthropic_parses_real_iterable_stream_tool_call(monkeypatch) -> None:
+    client_type = install_fake_anthropic_iterable(monkeypatch)
+    provider = AnthropicProvider(profile("anthropic"))
+    client_type.created[0].events = [
+        {
+            "type": "content_block_start",
+            "content_block": {"type": "tool_use", "id": "toolu_1", "name": "read_file"},
+        },
+        {
+            "type": "content_block_delta",
+            "delta": {"type": "input_json_delta", "partial_json": '{"path":"README.md"}'},
+        },
+        {"type": "content_block_stop"},
+    ]
+
+    events = list(provider.stream_reply([ChatMessage(role="user", content="read")]))
+
+    assert events == [
+        ProviderToolCall(
+            ToolCallRequest(
+                id="toolu_1",
+                name="read_file",
+                arguments={"path": "README.md"},
+                raw_arguments='{"path":"README.md"}',
+            )
+        )
+    ]
 
 
 def test_anthropic_bad_json_yields_empty_arguments_and_raw(monkeypatch) -> None:
@@ -141,8 +217,10 @@ class FakeOpenAIEvent:
     type: str
     item: object | None = None
     call_id: str = ""
+    item_id: str = ""
     delta: str = ""
     arguments: str | None = None
+    name: str = ""
 
 
 class FakeOpenAIResponsesWithToolEvents:
@@ -209,6 +287,82 @@ def test_openai_parses_text_and_tool_call_events(monkeypatch) -> None:
         )
     )
     assert client.requests[0]["tools"] == [{"type": "function", "name": "read_file", "parameters": {}}]
+
+
+def test_openai_parses_real_item_id_tool_call_events(monkeypatch) -> None:
+    client_type = install_fake_openai_tool_events(monkeypatch)
+    provider = OpenAIProvider(profile("openai"))
+    client_type.created[0].events = [
+        FakeOpenAIEvent(
+            "response.output_item.added",
+            item={
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "read_file",
+            },
+        ),
+        FakeOpenAIEvent("response.function_call_arguments.delta", item_id="fc_1", delta='{"path":'),
+        FakeOpenAIEvent(
+            "response.function_call_arguments.done",
+            item_id="fc_1",
+            name="read_file",
+            arguments='{"path":"README.md"}',
+        ),
+        FakeOpenAIEvent(
+            "response.output_item.done",
+            item={
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": '{"path":"README.md"}',
+            },
+        ),
+    ]
+
+    events = list(provider.stream_reply([ChatMessage(role="user", content="read")]))
+
+    assert events == [
+        ProviderToolCall(
+            ToolCallRequest(
+                id="call_1",
+                name="read_file",
+                arguments={"path": "README.md"},
+                raw_arguments='{"path":"README.md"}',
+            )
+        )
+    ]
+
+
+def test_openai_parses_output_item_done_without_argument_done(monkeypatch) -> None:
+    client_type = install_fake_openai_tool_events(monkeypatch)
+    provider = OpenAIProvider(profile("openai"))
+    client_type.created[0].events = [
+        FakeOpenAIEvent(
+            "response.output_item.done",
+            item={
+                "type": "function_call",
+                "id": "fc_1",
+                "call_id": "call_1",
+                "name": "read_file",
+                "arguments": '{"path":"README.md"}',
+            },
+        ),
+    ]
+
+    events = list(provider.stream_reply([ChatMessage(role="user", content="read")]))
+
+    assert events == [
+        ProviderToolCall(
+            ToolCallRequest(
+                id="call_1",
+                name="read_file",
+                arguments={"path": "README.md"},
+                raw_arguments='{"path":"README.md"}',
+            )
+        )
+    ]
 
 
 def test_openai_bad_json_yields_empty_arguments_and_raw(monkeypatch) -> None:

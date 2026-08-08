@@ -33,12 +33,22 @@ def profile(protocol: str = "anthropic", thinking: bool = False) -> ProviderProf
 class FakeAnthropicStream:
     def __init__(self, parts: list[str]) -> None:
         self.text_stream = parts
+        self._events = [
+            {
+                "type": "content_block_delta",
+                "delta": {"type": "text_delta", "text": part},
+            }
+            for part in parts
+        ]
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> None:
         return None
+
+    def __iter__(self):
+        return iter(self._events)
 
 
 class FakeAnthropicMessages:

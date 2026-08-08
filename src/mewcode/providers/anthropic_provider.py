@@ -109,11 +109,7 @@ class AnthropicProvider:
 
     def _stream_request(self, request: dict[str, Any]) -> Iterator[ProviderTextDelta | ProviderToolCall]:
         with self._client.messages.stream(**request) as stream:
-            if hasattr(stream, "events"):
-                yield from _parse_anthropic_events(stream.events)
-                return
-            for text in stream.text_stream:
-                yield ProviderTextDelta(text)
+            yield from _parse_anthropic_events(stream)
 
     def _is_adaptive_thinking_unsupported(self, exc: Exception) -> bool:
         status_code = getattr(exc, "status_code", None)

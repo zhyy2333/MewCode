@@ -47,6 +47,7 @@ class OpenAIProvider:
             request["tools"] = tools
 
         try:
+            self._tool_event_parser = _OpenAIToolEventParser()
             stream = self._client.responses.create(**request)
             for event in stream:
                 event_type = getattr(event, "type", None)
@@ -59,6 +60,7 @@ class OpenAIProvider:
                     raise ProviderError(f"OpenAI request failed: {message}")
                 elif event_type in {
                     "response.output_item.added",
+                    "response.output_item.done",
                     "response.function_call_arguments.delta",
                     "response.function_call_arguments.done",
                 }:
@@ -136,6 +138,7 @@ def _tool_result_payload(result: ToolResult) -> str:
 class _OpenAIToolEventParser:
     def __init__(self) -> None:
         self._calls: dict[str, dict[str, Any]] = {}
+        self._completed_item_ids: set[str] = set()
 
     def consume(self, event: Any) -> ProviderToolCall | None:
         event_type = _get_event_attr(event, "type")
@@ -143,23 +146,28 @@ class _OpenAIToolEventParser:
             item = _get_event_attr(event, "item") or {}
             item_type = _get_event_attr(item, "type")
             if item_type in {"function_call", "tool_call"}:
-                call_id = _get_event_attr(item, "call_id") or _get_event_attr(item, "id") or ""
+                item_id = _get_event_attr(item, "id") or _get_event_attr(item, "call_id") or ""
+                call_id = _get_event_attr(item, "call_id") or item_id
                 name = _get_event_attr(item, "name") or ""
-                self._calls[call_id] = {"name": name, "parts": []}
+                self._calls[item_id] = {"call_id": call_id, "name": name, "parts": []}
             return None
 
-        call_id = _get_event_attr(event, "call_id") or _get_event_attr(event, "item_id") or ""
+        item_id = _get_event_attr(event, "item_id") or _get_event_attr(event, "call_id") or ""
         if event_type == "response.function_call_arguments.delta":
-            if call_id not in self._calls:
-                self._calls[call_id] = {"name": "", "parts": []}
-            self._calls[call_id]["parts"].append(_get_event_attr(event, "delta") or "")
+            if item_id not in self._calls:
+                self._calls[item_id] = {"call_id": item_id, "name": "", "parts": []}
+            self._calls[item_id]["parts"].append(_get_event_attr(event, "delta") or "")
             return None
 
         if event_type == "response.function_call_arguments.done":
-            call = self._calls.pop(call_id, {"name": "", "parts": []})
+            call = self._calls.pop(item_id, {"call_id": item_id, "name": "", "parts": []})
             raw_arguments = _get_event_attr(event, "arguments")
             if raw_arguments is None:
                 raw_arguments = "".join(call["parts"])
+            if raw_arguments is None:
+                raw_arguments = ""
+            name = _get_event_attr(event, "name") or call["name"]
+            self._completed_item_ids.add(item_id)
             try:
                 arguments = json.loads(raw_arguments) if raw_arguments else {}
                 if not isinstance(arguments, dict):
@@ -168,8 +176,43 @@ class _OpenAIToolEventParser:
                 arguments = {}
             return ProviderToolCall(
                 ToolCallRequest(
-                    id=call_id,
-                    name=call["name"],
+                    id=call["call_id"],
+                    name=name,
+                    arguments=arguments,
+                    raw_arguments=raw_arguments,
+                )
+            )
+        if event_type == "response.output_item.done":
+            item = _get_event_attr(event, "item") or {}
+            item_type = _get_event_attr(item, "type")
+            if item_type not in {"function_call", "tool_call"}:
+                return None
+            item_id = _get_event_attr(item, "id") or _get_event_attr(item, "call_id") or ""
+            if item_id in self._completed_item_ids:
+                return None
+            call = self._calls.pop(item_id, None)
+            if call is None:
+                call = {
+                    "call_id": _get_event_attr(item, "call_id") or item_id,
+                    "name": _get_event_attr(item, "name") or "",
+                    "parts": [],
+                }
+            raw_arguments = _get_event_attr(item, "arguments")
+            if raw_arguments is None:
+                raw_arguments = "".join(call["parts"])
+            if raw_arguments is None:
+                raw_arguments = ""
+            self._completed_item_ids.add(item_id)
+            try:
+                arguments = json.loads(raw_arguments) if raw_arguments else {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+            except json.JSONDecodeError:
+                arguments = {}
+            return ProviderToolCall(
+                ToolCallRequest(
+                    id=call["call_id"],
+                    name=_get_event_attr(item, "name") or call["name"],
                     arguments=arguments,
                     raw_arguments=raw_arguments,
                 )
