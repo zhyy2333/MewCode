@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import sys
 import types
 from dataclasses import dataclass
@@ -13,10 +14,14 @@ from mewcode.providers import (
     ProviderError,
     ProviderProfile,
     ProviderTextDelta,
+    ProviderUsage,
+    TokenUsage,
     create_provider,
 )
 from mewcode.providers.anthropic_provider import AnthropicProvider
 from mewcode.providers.openai_provider import OpenAIProvider
+
+from tests.fakes import collect_async
 
 
 def profile(protocol: str = "anthropic", thinking: bool = False) -> ProviderProfile:
@@ -31,24 +36,23 @@ def profile(protocol: str = "anthropic", thinking: bool = False) -> ProviderProf
 
 
 class FakeAnthropicStream:
-    def __init__(self, parts: list[str]) -> None:
-        self.text_stream = parts
-        self._events = [
-            {
-                "type": "content_block_delta",
-                "delta": {"type": "text_delta", "text": part},
-            }
-            for part in parts
-        ]
+    def __init__(self, owner: "FakeAnthropicClient") -> None:
+        self._owner = owner
+        self.closed = False
 
-    def __enter__(self):
+    async def __aenter__(self):
         return self
 
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        return None
+    async def __aexit__(self, exc_type, exc, traceback) -> None:
+        self.closed = True
 
-    def __iter__(self):
-        return iter(self._events)
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for event in self._owner.events:
+            await asyncio.sleep(0)
+            yield event
 
 
 class FakeAnthropicMessages:
@@ -58,9 +62,10 @@ class FakeAnthropicMessages:
     def stream(self, **kwargs):
         self._owner.requests.append(kwargs)
         if self._owner.failures:
-            failure = self._owner.failures.pop(0)
-            raise failure
-        return FakeAnthropicStream(self._owner.parts)
+            raise self._owner.failures.pop(0)
+        stream = FakeAnthropicStream(self._owner)
+        self._owner.streams.append(stream)
+        return stream
 
 
 class FakeAnthropicClient:
@@ -69,9 +74,15 @@ class FakeAnthropicClient:
     def __init__(self, api_key: str, base_url: str) -> None:
         self.api_key = api_key
         self.base_url = base_url
-        self.parts = ["hel", "lo"]
+        self.events: list[object] = [
+            {"type": "message_start", "message": {"usage": {"input_tokens": 3}}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hel"}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "lo"}},
+            {"type": "message_delta", "usage": {"output_tokens": 2}},
+        ]
         self.failures: list[Exception] = []
         self.requests: list[dict] = []
+        self.streams: list[FakeAnthropicStream] = []
         self.messages = FakeAnthropicMessages(self)
         FakeAnthropicClient.created.append(self)
 
@@ -84,28 +95,31 @@ class FakeAnthropicError(Exception):
 
 def install_fake_anthropic(monkeypatch: pytest.MonkeyPatch) -> type[FakeAnthropicClient]:
     FakeAnthropicClient.created = []
-    module = types.SimpleNamespace(Anthropic=FakeAnthropicClient)
+    module = types.SimpleNamespace(AsyncAnthropic=FakeAnthropicClient)
     monkeypatch.setitem(sys.modules, "anthropic", module)
     return FakeAnthropicClient
 
 
-def test_anthropic_streams_text_and_builds_request(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_token_usage_adds_and_propagates_unknown() -> None:
+    assert TokenUsage(1, 2, 3).add(TokenUsage(4, 5, 9)) == TokenUsage(5, 7, 12)
+    assert TokenUsage(1, 2, 3).add(TokenUsage(None, 5, None)) == TokenUsage(None, 7, None)
+
+
+def test_anthropic_streams_text_usage_and_builds_request(monkeypatch: pytest.MonkeyPatch) -> None:
     client_type = install_fake_anthropic(monkeypatch)
     provider = AnthropicProvider(profile("anthropic"))
+    events = asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
 
-    parts = list(provider.stream_reply([ChatMessage(role="user", content="Hi")]))
-
-    client = client_type.created[0]
-    assert parts == [ProviderTextDelta("hel"), ProviderTextDelta("lo")]
-    assert client.api_key == "secret-key"
-    assert client.base_url == "https://example.test"
-    assert client.requests == [
-        {
-            "model": "model-name",
-            "max_tokens": DEFAULT_MAX_TOKENS,
-            "messages": [{"role": "user", "content": "Hi"}],
-        }
+    assert events == [
+        ProviderTextDelta("hel"), ProviderTextDelta("lo"),
+        ProviderUsage(TokenUsage(3, 2, 5)),
     ]
+    client = client_type.created[0]
+    assert client.api_key == "secret-key"
+    assert client.requests == [{
+        "model": "model-name", "max_tokens": DEFAULT_MAX_TOKENS,
+        "messages": [{"role": "user", "content": "Hi"}],
+    }]
 
 
 def test_anthropic_sdk_error_is_wrapped_and_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -114,8 +128,7 @@ def test_anthropic_sdk_error_is_wrapped_and_redacted(monkeypatch: pytest.MonkeyP
     client_type.created[0].failures.append(Exception("bad secret-key"))
 
     with pytest.raises(ProviderError) as exc_info:
-        list(provider.stream_reply([ChatMessage(role="user", content="Hi")]))
-
+        asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
     assert "Anthropic request failed" in exc_info.value.message
     assert "secret-key" not in exc_info.value.message
 
@@ -123,15 +136,9 @@ def test_anthropic_sdk_error_is_wrapped_and_redacted(monkeypatch: pytest.MonkeyP
 def test_anthropic_thinking_uses_adaptive_omitted(monkeypatch: pytest.MonkeyPatch) -> None:
     client_type = install_fake_anthropic(monkeypatch)
     provider = AnthropicProvider(profile("anthropic", thinking=True))
-
-    assert list(provider.stream_reply([ChatMessage(role="user", content="Hi")])) == [
-        ProviderTextDelta("hel"),
-        ProviderTextDelta("lo"),
-    ]
-
+    asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
     assert client_type.created[0].requests[0]["thinking"] == {
-        "type": "adaptive",
-        "display": "omitted",
+        "type": "adaptive", "display": "omitted"
     }
 
 
@@ -141,29 +148,19 @@ def test_anthropic_adaptive_unsupported_falls_back_to_manual(monkeypatch: pytest
     client_type.created[0].failures.append(
         FakeAnthropicError("adaptive thinking is not supported on this model")
     )
-
-    assert list(provider.stream_reply([ChatMessage(role="user", content="Hi")])) == [
-        ProviderTextDelta("hel"),
-        ProviderTextDelta("lo"),
+    asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
+    assert [request["thinking"] for request in client_type.created[0].requests] == [
+        {"type": "adaptive", "display": "omitted"},
+        {"type": "enabled", "budget_tokens": 1024, "display": "omitted"},
     ]
-
-    requests = client_type.created[0].requests
-    assert requests[0]["thinking"] == {"type": "adaptive", "display": "omitted"}
-    assert requests[1]["thinking"] == {
-        "type": "enabled",
-        "budget_tokens": 1024,
-        "display": "omitted",
-    }
 
 
 def test_anthropic_other_error_does_not_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     client_type = install_fake_anthropic(monkeypatch)
     provider = AnthropicProvider(profile("anthropic", thinking=True))
     client_type.created[0].failures.append(FakeAnthropicError("other bad request"))
-
     with pytest.raises(ProviderError):
-        list(provider.stream_reply([ChatMessage(role="user", content="Hi")]))
-
+        asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
     assert len(client_type.created[0].requests) == 1
 
 
@@ -172,17 +169,42 @@ class FakeOpenAIEvent:
     type: str
     delta: str = ""
     message: str = ""
+    response: object | None = None
+    item: object | None = None
+    item_id: str = ""
+    call_id: str = ""
+    arguments: str | None = None
+    name: str = ""
+
+
+class FakeOpenAIStream:
+    def __init__(self, owner: "FakeOpenAIClient") -> None:
+        self._owner = owner
+        self.closed = False
+
+    def __aiter__(self):
+        return self._iterate()
+
+    async def _iterate(self):
+        for event in self._owner.events:
+            await asyncio.sleep(0)
+            yield event
+
+    async def close(self) -> None:
+        self.closed = True
 
 
 class FakeResponses:
     def __init__(self, owner: "FakeOpenAIClient") -> None:
         self._owner = owner
 
-    def create(self, **kwargs):
+    async def create(self, **kwargs):
         self._owner.requests.append(kwargs)
         if self._owner.failure is not None:
             raise self._owner.failure
-        return iter(self._owner.events)
+        stream = FakeOpenAIStream(self._owner)
+        self._owner.streams.append(stream)
+        return stream
 
 
 class FakeOpenAIClient:
@@ -191,87 +213,78 @@ class FakeOpenAIClient:
     def __init__(self, api_key: str, base_url: str) -> None:
         self.api_key = api_key
         self.base_url = base_url
-        self.events = [
+        self.events: list[object] = [
             FakeOpenAIEvent("response.created"),
-            FakeOpenAIEvent("response.output_text.delta", "hel"),
-            FakeOpenAIEvent("response.output_text.delta", "lo"),
-            FakeOpenAIEvent("response.completed"),
+            FakeOpenAIEvent("response.output_text.delta", delta="hel"),
+            FakeOpenAIEvent("response.output_text.delta", delta="lo"),
+            FakeOpenAIEvent(
+                "response.completed",
+                response={"usage": {"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}},
+            ),
         ]
         self.failure: Exception | None = None
         self.requests: list[dict] = []
+        self.streams: list[FakeOpenAIStream] = []
         self.responses = FakeResponses(self)
         FakeOpenAIClient.created.append(self)
 
 
 def install_fake_openai(monkeypatch: pytest.MonkeyPatch) -> type[FakeOpenAIClient]:
     FakeOpenAIClient.created = []
-    module = types.SimpleNamespace(OpenAI=FakeOpenAIClient)
+    module = types.SimpleNamespace(AsyncOpenAI=FakeOpenAIClient)
     monkeypatch.setitem(sys.modules, "openai", module)
     return FakeOpenAIClient
 
 
-def test_openai_streams_only_output_text_delta(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_openai_streams_text_usage_and_builds_request(monkeypatch: pytest.MonkeyPatch) -> None:
     client_type = install_fake_openai(monkeypatch)
     provider = OpenAIProvider(profile("openai"))
+    events = asyncio.run(collect_async(provider.stream_reply([
+        ChatMessage("user", "Hi"), ChatMessage("assistant", "Hello")
+    ])))
 
-    parts = list(
-        provider.stream_reply(
-            [
-                ChatMessage(role="user", content="Hi"),
-                ChatMessage(role="assistant", content="Hello"),
-            ]
-        )
-    )
-
-    assert parts == [ProviderTextDelta("hel"), ProviderTextDelta("lo")]
-    assert client_type.created[0].requests == [
-        {
-            "model": "model-name",
-            "input": [
-                {"role": "user", "content": "Hi"},
-                {"role": "assistant", "content": "Hello"},
-            ],
-            "max_output_tokens": DEFAULT_MAX_TOKENS,
-            "stream": True,
-        }
+    assert events == [
+        ProviderTextDelta("hel"), ProviderTextDelta("lo"),
+        ProviderUsage(TokenUsage(3, 2, 5)),
     ]
+    assert client_type.created[0].requests == [{
+        "model": "model-name",
+        "input": [
+            {"role": "user", "content": "Hi"},
+            {"role": "assistant", "content": "Hello"},
+        ],
+        "max_output_tokens": DEFAULT_MAX_TOKENS,
+        "stream": True,
+    }]
+    assert client_type.created[0].streams[0].closed is True
 
 
 def test_openai_error_event_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
     client_type = install_fake_openai(monkeypatch)
     provider = OpenAIProvider(profile("openai"))
     client_type.created[0].events = [FakeOpenAIEvent("error", message="rate limited")]
-
     with pytest.raises(ProviderError, match="rate limited"):
-        list(provider.stream_reply([ChatMessage(role="user", content="Hi")]))
+        asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
 
 
 def test_openai_sdk_error_is_wrapped_and_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
     client_type = install_fake_openai(monkeypatch)
     provider = OpenAIProvider(profile("openai"))
     client_type.created[0].failure = Exception("bad secret-key")
-
     with pytest.raises(ProviderError) as exc_info:
-        list(provider.stream_reply([ChatMessage(role="user", content="Hi")]))
-
+        asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
     assert "OpenAI request failed" in exc_info.value.message
     assert "secret-key" not in exc_info.value.message
 
 
-def test_create_provider_returns_anthropic_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_create_provider_returns_anthropic_provider(monkeypatch) -> None:
     install_fake_anthropic(monkeypatch)
-
-    provider = create_provider(profile("anthropic"))
-
-    assert isinstance(provider, AnthropicProvider)
+    assert isinstance(create_provider(profile("anthropic")), AnthropicProvider)
 
 
-def test_create_provider_returns_openai_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_create_provider_returns_openai_provider(monkeypatch) -> None:
     install_fake_openai(monkeypatch)
-
-    provider = create_provider(profile("openai"))
-
-    assert isinstance(provider, OpenAIProvider)
+    assert isinstance(create_provider(profile("openai")), OpenAIProvider)
 
 
 def test_create_provider_rejects_unknown_protocol() -> None:

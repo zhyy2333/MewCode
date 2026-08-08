@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from .base import (
     DEFAULT_TOOL_CONTENT_LIMIT,
     ToolResult,
+    ToolSafety,
     truncate_text,
 )
 from .workspace import Workspace, WorkspaceError
@@ -13,6 +15,7 @@ from .workspace import Workspace, WorkspaceError
 class ReadFileTool:
     name = "read_file"
     description = "Read a UTF-8 text file inside the current workspace."
+    safety = ToolSafety.READ_ONLY
     parameters_schema = {
         "type": "object",
         "properties": {"path": {"type": "string"}},
@@ -25,7 +28,10 @@ class ReadFileTool:
         self._workspace = workspace
         self._content_limit = content_limit
 
-    def execute(self, arguments: dict[str, Any]) -> ToolResult:
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
+        return await asyncio.to_thread(self._execute_sync, arguments)
+
+    def _execute_sync(self, arguments: dict[str, Any]) -> ToolResult:
         try:
             path = self._workspace.resolve_path(arguments["path"])
             content = path.read_text(encoding="utf-8")
@@ -46,6 +52,7 @@ class ReadFileTool:
 class WriteFileTool:
     name = "write_file"
     description = "Write UTF-8 text to a file inside the current workspace."
+    safety = ToolSafety.SIDE_EFFECT
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -58,7 +65,10 @@ class WriteFileTool:
     def __init__(self, workspace: Workspace) -> None:
         self._workspace = workspace
 
-    def execute(self, arguments: dict[str, Any]) -> ToolResult:
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
+        return self._execute_sync(arguments)
+
+    def _execute_sync(self, arguments: dict[str, Any]) -> ToolResult:
         try:
             path = self._workspace.resolve_path(arguments["path"])
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -77,6 +87,7 @@ class WriteFileTool:
 class EditFileTool:
     name = "edit_file"
     description = "Replace exactly one occurrence of text in a UTF-8 file inside the workspace."
+    safety = ToolSafety.SIDE_EFFECT
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -90,7 +101,10 @@ class EditFileTool:
     def __init__(self, workspace: Workspace) -> None:
         self._workspace = workspace
 
-    def execute(self, arguments: dict[str, Any]) -> ToolResult:
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
+        return self._execute_sync(arguments)
+
+    def _execute_sync(self, arguments: dict[str, Any]) -> ToolResult:
         try:
             path = self._workspace.resolve_path(arguments["path"])
             old_text = arguments["old_text"]

@@ -1,158 +1,146 @@
 from __future__ import annotations
 
-from typing import Any
+import asyncio
 
-from mewcode.conversation import Conversation, ConversationTextDelta, ConversationToolStatus
-from mewcode.providers import ChatMessage, ProviderTextDelta, ProviderToolCall
-from mewcode.tools import ToolCallRequest, ToolRegistry, ToolResult
+from mewcode.agent import (
+    AgentStopped,
+    AgentToolResult,
+    AgentRunner,
+    StopReason,
+    ToolScheduler,
+)
+from mewcode.conversation import Conversation
+from mewcode.providers import ProviderTextDelta, ProviderToolCall
+from mewcode.tools import (
+    EditFileTool,
+    ReadFileTool,
+    RunCommandTool,
+    ToolRegistry,
+    Workspace,
+)
 
-
-class EchoTool:
-    name = "echo"
-    description = "Echo text."
-    parameters_schema = {
-        "type": "object",
-        "properties": {"text": {"type": "string"}},
-        "required": ["text"],
-    }
-
-    def __init__(self) -> None:
-        self.calls: list[dict[str, Any]] = []
-
-    def execute(self, arguments: dict[str, Any]) -> ToolResult:
-        self.calls.append(arguments)
-        return ToolResult(ok=True, tool_name=self.name, content=arguments["text"])
+from tests.fakes import ControlledTool, ScriptedAsyncProvider, collect_async, tool_call
 
 
-class ScriptedProvider:
-    def __init__(self, scripts: list[list[object]]) -> None:
-        self.scripts = scripts
-        self.calls: list[dict[str, Any]] = []
-
-    def tool_definitions(self, registry: ToolRegistry) -> list[dict[str, Any]]:
-        return registry.to_openai_tools()
-
-    def stream_reply(self, messages: list[ChatMessage], tools=None):
-        self.calls.append({"messages": list(messages), "tools": tools})
-        script = self.scripts.pop(0)
-        yield from script
-
-    def tool_call_message(self, tool_call: ToolCallRequest) -> ChatMessage:
-        return ChatMessage(role="assistant", content={"tool_call": tool_call.name})
-
-    def tool_result_message(self, tool_call: ToolCallRequest, result: ToolResult) -> ChatMessage:
-        return ChatMessage(
-            role="tool",
-            content={"tool_call_id": tool_call.id, "ok": result.ok, "error": result.error},
-        )
+def make_conversation(provider, tools: ToolRegistry) -> Conversation:
+    runner = AgentRunner(provider, ToolScheduler(), id_factory=lambda: "run")
+    return Conversation(runner, tools)
 
 
-def test_conversation_executes_one_tool_and_generates_final_reply() -> None:
-    tool = EchoTool()
-    registry = ToolRegistry([tool])
-    provider = ScriptedProvider(
+def test_react_loop_executes_two_tool_rounds_and_finishes() -> None:
+    provider = ScriptedAsyncProvider(
         [
-            [
-                ProviderToolCall(
-                    ToolCallRequest(
-                        id="call_1",
-                        name="echo",
-                        arguments={"text": "tool result"},
-                        raw_arguments='{"text":"tool result"}',
-                    )
-                )
-            ],
+            [ProviderToolCall(tool_call("call-1", "echo", value="one"))],
+            [ProviderToolCall(tool_call("call-2", "echo", value="two"))],
             [ProviderTextDelta("final answer")],
         ]
     )
-    conversation = Conversation(provider, tools=registry)
+    tool = ControlledTool("echo")
+    conversation = make_conversation(provider, ToolRegistry([tool]))
 
-    events = list(conversation.ask("use a tool"))
+    events = asyncio.run(collect_async(conversation.ask("use tools")))
 
-    assert events == [
-        ConversationToolStatus(tool_name="echo", status="started", summary="running"),
-        ConversationToolStatus(tool_name="echo", status="succeeded", summary="tool result"),
-        ConversationTextDelta("final answer"),
-    ]
-    assert tool.calls == [{"text": "tool result"}]
+    assert tool.calls == ["echo", "echo"]
+    assert len(provider.calls) == 3
+    assert [
+        event.execution.request.id
+        for event in events
+        if isinstance(event, AgentToolResult)
+    ] == ["call-1", "call-2"]
+    assert events[-1] == AgentStopped(
+        "run", 3, StopReason.COMPLETED, "final answer", events[-1].usage, None
+    )
+    assert conversation.messages()[-1].content["text"] == "final answer"
+
+
+def test_failed_unknown_tool_result_is_returned_and_loop_continues() -> None:
+    provider = ScriptedAsyncProvider(
+        [
+            [ProviderToolCall(tool_call("call-1", "missing"))],
+            [ProviderTextDelta("I recovered.")],
+        ]
+    )
+    conversation = make_conversation(provider, ToolRegistry([]))
+
+    events = asyncio.run(collect_async(conversation.ask("use missing")))
+
+    result = next(event for event in events if isinstance(event, AgentToolResult))
+    assert result.execution.result.ok is False
+    assert "Unknown tool" in (result.execution.result.error or "")
+    assert provider.calls[1]["messages"][-1].content[0]["ok"] is False
+    assert events[-1].reason is StopReason.COMPLETED
+
+
+def test_no_tool_direct_chat_preserves_multiturn_context() -> None:
+    provider = ScriptedAsyncProvider(
+        [[ProviderTextDelta("hello")], [ProviderTextDelta("again")]]
+    )
+    conversation = make_conversation(provider, ToolRegistry([ControlledTool("echo")]))
+
+    asyncio.run(collect_async(conversation.ask("first")))
+    events = asyncio.run(collect_async(conversation.ask("second")))
+
+    assert events[-1].reason is StopReason.COMPLETED
     assert provider.calls[0]["tools"][0]["name"] == "echo"
-    assert provider.calls[1]["tools"] is None
-    assert conversation.messages()[-1] == ChatMessage(role="assistant", content="final answer")
+    assert provider.calls[1]["messages"][0].content == "first"
+    assert len(conversation.messages()) == 4
 
 
-def test_conversation_returns_failed_tool_result_to_provider() -> None:
-    provider = ScriptedProvider(
+def test_end_to_end_direct_reads_edits_verifies_and_summarizes(tmp_path) -> None:
+    target = tmp_path / "sample.txt"
+    target.write_text("old", encoding="utf-8")
+    workspace = Workspace(tmp_path)
+    tools = ToolRegistry(
+        [
+            ReadFileTool(workspace),
+            EditFileTool(workspace),
+            RunCommandTool(workspace),
+        ]
+    )
+    provider = ScriptedAsyncProvider(
         [
             [
                 ProviderToolCall(
-                    ToolCallRequest(
-                        id="call_1",
-                        name="missing",
-                        arguments={},
-                        raw_arguments="{}",
-                    )
+                    tool_call("read", "read_file", path="sample.txt")
                 )
             ],
-            [ProviderTextDelta("I could not use that tool.")],
-        ]
-    )
-    conversation = Conversation(provider, tools=ToolRegistry([]))
-
-    events = list(conversation.ask("use missing"))
-
-    assert events[1].status == "failed"
-    assert "Unknown tool" in events[1].summary
-    assert provider.calls[1]["messages"][-1].content["ok"] is False
-    assert list(conversation.messages())[-1].content == "I could not use that tool."
-
-
-def test_conversation_skips_second_tool_call() -> None:
-    tool = EchoTool()
-    provider = ScriptedProvider(
-        [
             [
                 ProviderToolCall(
-                    ToolCallRequest(
-                        id="call_1",
-                        name="echo",
-                        arguments={"text": "ok"},
-                        raw_arguments='{"text":"ok"}',
+                    tool_call(
+                        "edit",
+                        "edit_file",
+                        path="sample.txt",
+                        old_text="old",
+                        new_text="new",
                     )
                 )
             ],
             [
                 ProviderToolCall(
-                    ToolCallRequest(
-                        id="call_2",
-                        name="echo",
-                        arguments={"text": "second"},
-                        raw_arguments='{"text":"second"}',
+                    tool_call(
+                        "verify",
+                        "run_command",
+                        command=(
+                            'python -c "from pathlib import Path; '
+                            "assert Path('sample.txt').read_text() == 'new'\""
+                        ),
                     )
                 )
             ],
+            [ProviderTextDelta("Updated and verified sample.txt.")],
         ]
     )
-    conversation = Conversation(provider, tools=ToolRegistry([tool]))
+    conversation = make_conversation(provider, tools)
 
-    events = list(conversation.ask("use tools"))
+    events = asyncio.run(collect_async(conversation.ask("update the file")))
 
-    assert events[-1] == ConversationToolStatus(
-        tool_name="echo",
-        status="skipped",
-        summary="tool call limit reached for this turn",
-    )
-    assert tool.calls == [{"text": "ok"}]
-
-
-def test_conversation_with_tools_preserves_no_tool_chat_behavior() -> None:
-    tool = EchoTool()
-    provider = ScriptedProvider([[ProviderTextDelta("hello"), ProviderTextDelta("!")]])
-    conversation = Conversation(provider, tools=ToolRegistry([tool]))
-
-    events = list(conversation.ask("chat"))
-
-    assert events == [ConversationTextDelta("hello"), ConversationTextDelta("!")]
-    assert conversation.messages() == [
-        ChatMessage(role="user", content="chat"),
-        ChatMessage(role="assistant", content="hello!"),
+    assert target.read_text(encoding="utf-8") == "new"
+    results = [event for event in events if isinstance(event, AgentToolResult)]
+    assert [event.execution.request.name for event in results] == [
+        "read_file",
+        "edit_file",
+        "run_command",
     ]
+    assert all(event.execution.result.ok for event in results)
+    assert events[-1].reason is StopReason.COMPLETED
+    assert events[-1].final_text == "Updated and verified sample.txt."

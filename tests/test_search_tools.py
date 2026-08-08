@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+import threading
+import time
+from typing import Any
+
+import pytest
 
 from mewcode.tools.search_tools import FindFilesTool, SearchCodeTool
 from mewcode.tools.workspace import Workspace
+
+
+def run_tool(tool, arguments: dict[str, Any]):
+    return asyncio.run(tool.execute(arguments))
 
 
 def test_find_files_returns_relative_matches(tmp_path: Path) -> None:
@@ -11,7 +21,7 @@ def test_find_files_returns_relative_matches(tmp_path: Path) -> None:
     (tmp_path / "src" / "a.py").write_text("a", encoding="utf-8")
     (tmp_path / "src" / "b.txt").write_text("b", encoding="utf-8")
 
-    result = FindFilesTool(Workspace(tmp_path)).execute({"pattern": "src/*.py"})
+    result = run_tool(FindFilesTool(Workspace(tmp_path)), {"pattern": "src/*.py"})
 
     assert result.ok is True
     assert result.content == "src/a.py"
@@ -25,7 +35,7 @@ def test_find_files_skips_hidden_and_cache_dirs(tmp_path: Path) -> None:
     (tmp_path / "__pycache__" / "x.pyc").write_text("x", encoding="utf-8")
     (tmp_path / "visible.py").write_text("x", encoding="utf-8")
 
-    result = FindFilesTool(Workspace(tmp_path)).execute({"pattern": "**/*"})
+    result = run_tool(FindFilesTool(Workspace(tmp_path)), {"pattern": "**/*"})
 
     assert result.ok is True
     assert result.content == "visible.py"
@@ -35,7 +45,7 @@ def test_find_files_truncates_output(tmp_path: Path) -> None:
     (tmp_path / "alpha.txt").write_text("x", encoding="utf-8")
     (tmp_path / "beta.txt").write_text("x", encoding="utf-8")
 
-    result = FindFilesTool(Workspace(tmp_path), content_limit=10).execute({"pattern": "*.txt"})
+    result = run_tool(FindFilesTool(Workspace(tmp_path), content_limit=10), {"pattern": "*.txt"})
 
     assert result.ok is True
     assert result.metadata["truncated"] is True
@@ -45,7 +55,7 @@ def test_search_code_returns_file_line_and_snippet(tmp_path: Path) -> None:
     path = tmp_path / "src.py"
     path.write_text("first\nneedle here\n", encoding="utf-8")
 
-    result = SearchCodeTool(Workspace(tmp_path)).execute({"query": "needle"})
+    result = run_tool(SearchCodeTool(Workspace(tmp_path)), {"query": "needle"})
 
     assert result.ok is True
     assert result.content == "src.py:2: needle here"
@@ -57,7 +67,7 @@ def test_search_code_limits_to_path(tmp_path: Path) -> None:
     (tmp_path / "src" / "a.py").write_text("needle", encoding="utf-8")
     (tmp_path / "other.py").write_text("needle", encoding="utf-8")
 
-    result = SearchCodeTool(Workspace(tmp_path)).execute({"query": "needle", "path": "src"})
+    result = run_tool(SearchCodeTool(Workspace(tmp_path)), {"query": "needle", "path": "src"})
 
     assert result.ok is True
     assert result.content == "src/a.py:1: needle"
@@ -69,7 +79,7 @@ def test_search_code_rejects_outside_path(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()
 
-    result = SearchCodeTool(Workspace(workspace_root)).execute(
+    result = run_tool(SearchCodeTool(Workspace(workspace_root)),
         {"query": "needle", "path": str(outside)}
     )
 
@@ -82,7 +92,7 @@ def test_search_code_skips_hidden_and_cache_dirs(tmp_path: Path) -> None:
     (tmp_path / ".pytest_cache" / "x.txt").write_text("needle", encoding="utf-8")
     (tmp_path / "visible.txt").write_text("needle", encoding="utf-8")
 
-    result = SearchCodeTool(Workspace(tmp_path)).execute({"query": "needle"})
+    result = run_tool(SearchCodeTool(Workspace(tmp_path)), {"query": "needle"})
 
     assert result.ok is True
     assert result.content == "visible.txt:1: needle"
@@ -92,7 +102,7 @@ def test_search_code_truncates_by_match_count(tmp_path: Path) -> None:
     path = tmp_path / "many.txt"
     path.write_text("\n".join(["needle"] * 5), encoding="utf-8")
 
-    result = SearchCodeTool(Workspace(tmp_path), max_matches=2).execute({"query": "needle"})
+    result = run_tool(SearchCodeTool(Workspace(tmp_path), max_matches=2), {"query": "needle"})
 
     assert result.ok is True
     assert result.metadata["matches"] == 5
@@ -104,7 +114,34 @@ def test_search_code_truncates_by_content_size(tmp_path: Path) -> None:
     path = tmp_path / "long.txt"
     path.write_text("needle " + "x" * 100, encoding="utf-8")
 
-    result = SearchCodeTool(Workspace(tmp_path), content_limit=20).execute({"query": "needle"})
+    result = run_tool(SearchCodeTool(Workspace(tmp_path), content_limit=20), {"query": "needle"})
 
     assert result.ok is True
     assert result.metadata["truncated"] is True
+
+
+def test_find_files_cooperatively_cancels_worker(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "file.txt").write_text("x", encoding="utf-8")
+    import mewcode.tools.search_tools as module
+
+    started = threading.Event()
+    original = module._keep_path
+
+    def wait_for_cancel(path, root, stop_requested):
+        started.set()
+        while not stop_requested.is_set():
+            time.sleep(0.005)
+        return original(path, root, stop_requested)
+
+    monkeypatch.setattr(module, "_keep_path", wait_for_cancel)
+
+    async def scenario() -> None:
+        task = asyncio.create_task(
+            FindFilesTool(Workspace(tmp_path)).execute({"pattern": "**/*"})
+        )
+        await asyncio.to_thread(started.wait)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(scenario())

@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import asyncio
 import sys
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from typing import TextIO
 
-from .conversation import Conversation, ConversationTextDelta, ConversationToolStatus
-from .providers import ProviderError
+from .agent import (
+    AgentEvent,
+    AgentProgress,
+    AgentStopped,
+    AgentTextDelta,
+    AgentTokenUsage,
+    AgentToolCall,
+    AgentToolResult,
+)
+from .conversation import Conversation, ConversationError
 
 InputFunc = Callable[[str], str]
 
@@ -25,42 +34,91 @@ class Repl:
 
     def run(self) -> int:
         self._stdout.write("MewCode\n")
-        self._stdout.write("Type /exit or /quit to exit.\n")
+        self._stdout.write(
+            "Type /exit or /quit to exit. Use /plan <task> then /do for Plan Mode.\n"
+        )
         self._stdout.flush()
 
-        while True:
-            try:
-                user_text = self._input("mew> ").strip()
-            except EOFError:
-                self._stdout.write("\n")
-                self._stdout.flush()
-                return 0
-            if not user_text:
+        with asyncio.Runner() as runner:
+            while True:
+                try:
+                    user_text = self._input("mew> ").strip()
+                except EOFError:
+                    self._stdout.write("\n")
+                    self._stdout.flush()
+                    return 0
+                if not user_text:
+                    continue
+                if user_text in {"/exit", "/quit"}:
+                    return 0
+
+                source = self._route(user_text)
+                try:
+                    runner.run(self._consume(source))
+                    self._stdout.write("\n")
+                    self._stdout.flush()
+                except KeyboardInterrupt:
+                    runner.run(self._conversation.cancel_active())
+                    self._stdout.write("\nagent: cancelled\n")
+                    self._stdout.flush()
+                except ConversationError as exc:
+                    self._stderr.write(f"Error: {exc.message}\n")
+                    self._stderr.flush()
+                except Exception as exc:
+                    runner.run(self._conversation.cancel_active())
+                    self._stderr.write(f"Error: event consumer failed: {exc}\n")
+                    self._stderr.flush()
+
+    def _route(self, user_text: str) -> AsyncIterator[AgentEvent]:
+        if user_text == "/plan":
+            return self._conversation.plan("")
+        if user_text.startswith("/plan "):
+            return self._conversation.plan(user_text[len("/plan ") :])
+        if user_text == "/do":
+            return self._conversation.execute_plan()
+        return self._conversation.ask(user_text)
+
+    async def _consume(self, source: AsyncIterator[AgentEvent]) -> None:
+        async for event in source:
+            text = _format_event(event)
+            if text is None:
                 continue
-            if user_text in {"/exit", "/quit"}:
-                return 0
-
-            try:
-                for event in self._conversation.ask(user_text):
-                    if isinstance(event, ConversationTextDelta):
-                        self._stdout.write(event.text)
-                        self._stdout.flush()
-                    elif isinstance(event, ConversationToolStatus):
-                        self._stdout.write(_format_tool_status(event))
-                        self._stdout.flush()
-                self._stdout.write("\n")
-                self._stdout.flush()
-            except ProviderError as exc:
-                self._stderr.write(f"Error: {exc.message}\n")
-                self._stderr.flush()
+            self._stdout.write(text)
+            self._stdout.flush()
 
 
-def _format_tool_status(event: ConversationToolStatus) -> str:
-    if event.status == "started":
-        return f"tool: {event.tool_name} ...\n"
-    label = {
-        "succeeded": "ok",
-        "failed": "failed",
-        "skipped": "skipped",
-    }[event.status]
-    return f"tool: {event.tool_name} {label} - {event.summary}\n"
+def _format_event(event: AgentEvent) -> str | None:
+    if isinstance(event, AgentTextDelta):
+        return event.text
+    if isinstance(event, AgentToolCall):
+        return f"tool: {event.request.name} ...\n"
+    if isinstance(event, AgentToolResult):
+        result = event.execution.result
+        label = "ok" if result.ok else "failed"
+        return f"tool: {event.execution.request.name} {label} - {result.summary()}\n"
+    if isinstance(event, AgentTokenUsage):
+        current = event.current
+        cumulative = event.cumulative
+        return (
+            "tokens: "
+            f"in={_token(current.input_tokens)} "
+            f"out={_token(current.output_tokens)} "
+            f"total={_token(current.total_tokens)} "
+            f"cumulative={_token(cumulative.total_tokens)}\n"
+        )
+    if isinstance(event, AgentProgress):
+        if event.phase == "iteration_started":
+            return f"agent: iteration {event.iteration}\n"
+        if event.phase == "tool_batch_started":
+            return f"agent: {event.message}\n"
+        return None
+    if isinstance(event, AgentStopped):
+        if event.reason.value == "completed":
+            return "agent: completed\n"
+        detail = f" - {event.error}" if event.error else ""
+        return f"agent: stopped ({event.reason.value}){detail}\n"
+    return None
+
+
+def _token(value: int | None) -> str:
+    return "n/a" if value is None else str(value)

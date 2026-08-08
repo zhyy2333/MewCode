@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Any, Iterable, Protocol
 
 ToolParameterSchema = dict[str, Any]
@@ -29,12 +30,25 @@ class ToolCallRequest:
     raw_arguments: str
 
 
+class ToolSafety(StrEnum):
+    READ_ONLY = "read_only"
+    SIDE_EFFECT = "side_effect"
+
+
+@dataclass(frozen=True)
+class ToolExecution:
+    index: int
+    request: ToolCallRequest
+    result: ToolResult
+
+
 class Tool(Protocol):
     name: str
     description: str
     parameters_schema: ToolParameterSchema
+    safety: ToolSafety
 
-    def execute(self, arguments: dict[str, Any]) -> ToolResult:
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         ...
 
 
@@ -89,7 +103,10 @@ class ToolRegistry:
     def list(self) -> list[Tool]:
         return list(self._tools.values())
 
-    def execute(self, request: ToolCallRequest) -> ToolResult:
+    def select(self, safety: set[ToolSafety]) -> ToolRegistry:
+        return ToolRegistry(tool for tool in self.list() if tool.safety in safety)
+
+    async def execute(self, request: ToolCallRequest) -> ToolResult:
         tool = self.get(request.name)
         if tool is None:
             return ToolResult(
@@ -114,7 +131,7 @@ class ToolRegistry:
             )
 
         try:
-            return tool.execute(request.arguments)
+            return await tool.execute(request.arguments)
         except Exception as exc:
             return ToolResult(
                 ok=False,
