@@ -67,7 +67,7 @@ def test_failed_unknown_tool_result_is_returned_and_loop_continues() -> None:
     result = next(event for event in events if isinstance(event, AgentToolResult))
     assert result.execution.result.ok is False
     assert "Unknown tool" in (result.execution.result.error or "")
-    assert provider.calls[1]["messages"][-1].content[0]["ok"] is False
+    assert provider.calls[1].messages[-1].content[0]["ok"] is False
     assert events[-1].reason is StopReason.COMPLETED
 
 
@@ -81,8 +81,9 @@ def test_no_tool_direct_chat_preserves_multiturn_context() -> None:
     events = asyncio.run(collect_async(conversation.ask("second")))
 
     assert events[-1].reason is StopReason.COMPLETED
-    assert provider.calls[0]["tools"][0]["name"] == "echo"
-    assert provider.calls[1]["messages"][0].content == "first"
+    assert provider.calls[0].tools is not None
+    assert [tool.name for tool in provider.calls[0].tools.list()] == ["echo"]
+    assert provider.calls[1].messages[0].content == "first"
     assert len(conversation.messages()) == 4
 
 

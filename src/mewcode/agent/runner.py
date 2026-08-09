@@ -4,13 +4,21 @@ import asyncio
 from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
+from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
+from mewcode.prompting import (
+    PromptBuilder,
+    PromptEnvironmentProvider,
+    PromptPhase,
+    PromptRunContext,
+)
 from mewcode.providers import (
     DEFAULT_MAX_TOKENS,
     ChatMessage,
     LLMProvider,
+    ModelRequest,
     ProviderError,
     ProviderFinishReason,
     TokenUsage,
@@ -28,8 +36,6 @@ from .scheduler import ToolSchedule, ToolScheduler
 from .streaming import StreamCollector
 
 PLAN_FINAL_MAX_TOKENS = 8192
-PLAN_FINAL_PROMPT = """Using the workspace evidence gathered above, output the complete implementation plan now.
-Do not call tools. Return only the final plan, with concrete steps and verification."""
 
 
 class AgentRunStateError(RuntimeError):
@@ -87,6 +93,8 @@ class AgentRun:
         history: Sequence[ChatMessage],
         user_text: str,
         tools: ToolRegistry,
+        prompt_builder: PromptBuilder,
+        prompt_context: PromptRunContext,
     ) -> None:
         self._run_id = run_id
         self._mode = mode
@@ -96,6 +104,8 @@ class AgentRun:
         self._history = list(history)
         self._user_message = ChatMessage(role="user", content=user_text)
         self._tools = tools
+        self._prompt_builder = prompt_builder
+        self._prompt_context = prompt_context
         self._state = _State.NEW
         self._outcome: AgentRunOutcome | None = None
         self._cancel_requested = asyncio.Event()
@@ -124,8 +134,6 @@ class AgentRun:
                 phase="run_started",
                 message=f"{self._mode.value} run started",
             )
-            tool_definitions = self._provider.tool_definitions(self._tools)
-
             loop_limit = (
                 self._config.plan_max_investigation_iterations + 1
                 if self._mode is AgentMode.PLAN
@@ -150,16 +158,30 @@ class AgentRun:
                 )
                 collector = StreamCollector(self._run_id, iteration)
                 try:
-                    request_tools = None if plan_finalizing else tool_definitions
+                    request_tools = None if plan_finalizing else self._tools
                     max_output_tokens = (
                         self._config.plan_final_max_tokens
                         if plan_finalizing
                         else DEFAULT_MAX_TOKENS
                     )
+                    phase = (
+                        PromptPhase.PLAN_FINALIZATION
+                        if plan_finalizing
+                        else PromptPhase.ACTIVE
+                    )
+                    prompt = self._prompt_builder.build(
+                        self._prompt_context,
+                        self._mode.value,
+                        phase,
+                        iteration,
+                    )
                     source = self._provider.stream_reply(
-                        list(working_messages),
-                        tools=request_tools,
-                        max_output_tokens=max_output_tokens,
+                        ModelRequest(
+                            prompt=prompt,
+                            messages=tuple(working_messages),
+                            tools=request_tools,
+                            max_output_tokens=max_output_tokens,
+                        )
                     )
                     async for event in collector.events(source, cumulative_usage):
                         yield event
@@ -243,10 +265,6 @@ class AgentRun:
                             new_messages.append(self._user_message)
                             user_committed = True
                         new_messages.extend(assistant_messages)
-                        working_messages.extend(assistant_messages)
-                        final_prompt = ChatMessage(role="user", content=PLAN_FINAL_PROMPT)
-                        new_messages.append(final_prompt)
-                        working_messages.append(final_prompt)
                         plan_finalizing = True
                         continue
                     if not response.text.strip():
@@ -358,9 +376,6 @@ class AgentRun:
                     and iteration
                     == self._config.plan_max_investigation_iterations
                 ):
-                    final_prompt = ChatMessage(role="user", content=PLAN_FINAL_PROMPT)
-                    new_messages.append(final_prompt)
-                    working_messages.append(final_prompt)
                     plan_finalizing = True
 
             raise AgentRunStateError("Agent loop ended without a stop reason.")
@@ -443,11 +458,15 @@ class AgentRunner:
         scheduler: ToolScheduler,
         config: AgentRunConfig = AgentRunConfig(),
         *,
+        prompt_builder: PromptBuilder | None = None,
         id_factory: Callable[[], str] | None = None,
     ) -> None:
         self._provider = provider
         self._scheduler = scheduler
         self._config = config
+        self._prompt_builder = prompt_builder or PromptBuilder(
+            PromptEnvironmentProvider(Path.cwd())
+        )
         self._id_factory = id_factory or (lambda: str(uuid4()))
 
     def start(
@@ -456,6 +475,7 @@ class AgentRunner:
         user_text: str,
         tools: ToolRegistry,
         mode: AgentMode = AgentMode.DIRECT,
+        prompt_context: PromptRunContext | None = None,
     ) -> AgentRun:
         return AgentRun(
             run_id=self._id_factory(),
@@ -466,4 +486,6 @@ class AgentRunner:
             history=history,
             user_text=user_text,
             tools=tools,
+            prompt_builder=self._prompt_builder,
+            prompt_context=prompt_context or PromptRunContext(task=user_text),
         )

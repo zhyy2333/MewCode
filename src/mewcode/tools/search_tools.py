@@ -14,7 +14,7 @@ MAX_SEARCH_MATCHES = 100
 
 class FindFilesTool:
     name = "find_files"
-    description = "Find files inside the workspace using a glob pattern."
+    description = "Find files inside the workspace using a glob pattern. Prefer this dedicated tool over a general command for file discovery."
     safety = ToolSafety.READ_ONLY
     parameters_schema = {
         "type": "object",
@@ -57,7 +57,7 @@ class FindFilesTool:
 
 class SearchCodeTool:
     name = "search_code"
-    description = "Search UTF-8 text files inside the workspace for a query string."
+    description = "Search UTF-8 text files inside the workspace for a query string. Prefer this dedicated tool over a general command for code search."
     safety = ToolSafety.READ_ONLY
     parameters_schema = {
         "type": "object",

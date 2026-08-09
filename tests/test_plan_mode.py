@@ -57,14 +57,16 @@ def test_plan_uses_readonly_tools_and_saves_text() -> None:
     session = conversation(provider)
     asyncio.run(collect_async(session.plan("build it")))
 
-    assert [tool["name"] for tool in provider.calls[0]["tools"]] == [
+    assert provider.calls[0].tools is not None
+    assert [tool.name for tool in provider.calls[0].tools.list()] == [
         "read_file", "find_files", "search_code"
     ]
-    assert provider.calls[0]["max_output_tokens"] == 4096
-    assert provider.calls[1]["tools"] is None
-    assert provider.calls[1]["max_output_tokens"] == 8192
+    assert provider.calls[0].max_output_tokens == 4096
+    assert provider.calls[1].tools is None
+    assert provider.calls[1].max_output_tokens == 8192
     assert session.pending_plan() == PendingPlan("build it", "the plan")
-    assert "Do not make changes" in provider.calls[0]["messages"][-1].content
+    assert provider.calls[0].messages[-1].content == "build it"
+    assert "read-only" in provider.calls[0].prompt.dynamic_system.casefold()
 
 
 def test_new_successful_plan_replaces_old_plan() -> None:
@@ -111,8 +113,10 @@ def test_execute_completed_uses_all_tools_and_clears_plan() -> None:
     events = asyncio.run(collect_async(session.execute_plan()))
 
     assert events[-1].reason is StopReason.COMPLETED
-    assert [tool["name"] for tool in provider.calls[2]["tools"]] == TOOL_NAMES
-    assert "Approved plan:\nthe plan" in provider.calls[2]["messages"][-1].content
+    assert provider.calls[2].tools is not None
+    assert [tool.name for tool in provider.calls[2].tools.list()] == TOOL_NAMES
+    assert provider.calls[2].messages[-1].content == "/do"
+    assert "Approved plan: the plan" in provider.calls[2].prompt.dynamic_system
     assert session.pending_plan() is None
 
 
@@ -190,14 +194,16 @@ def test_end_to_end_plan_then_do_reads_writes_verifies_and_clears(tmp_path) -> N
     execute_events = asyncio.run(collect_async(session.execute_plan()))
 
     assert plan_events[-1].reason is StopReason.COMPLETED
-    assert [tool["name"] for tool in provider.calls[0]["tools"]] == [
+    assert provider.calls[0].tools is not None
+    assert [tool.name for tool in provider.calls[0].tools.list()] == [
         "read_file",
         "find_files",
         "search_code",
     ]
-    assert provider.calls[2]["tools"] is None
-    assert provider.calls[2]["max_output_tokens"] == 8192
-    assert [tool["name"] for tool in provider.calls[3]["tools"]] == TOOL_NAMES
+    assert provider.calls[2].tools is None
+    assert provider.calls[2].max_output_tokens == 8192
+    assert provider.calls[3].tools is not None
+    assert [tool.name for tool in provider.calls[3].tools.list()] == TOOL_NAMES
     assert (tmp_path / "output.txt").read_text(encoding="utf-8") == "complete"
     assert execute_events[-1].reason is StopReason.COMPLETED
     assert session.pending_plan() is None
@@ -225,9 +231,9 @@ def test_plan_executes_sixth_investigation_then_finalizes_once() -> None:
 
     assert events[-1].reason is StopReason.COMPLETED
     assert len(provider.calls) == 7
-    assert all(call["tools"] is not None for call in provider.calls[:6])
-    assert provider.calls[6]["tools"] is None
-    assert provider.calls[6]["max_output_tokens"] == 8192
+    assert all(call.tools is not None for call in provider.calls[:6])
+    assert provider.calls[6].tools is None
+    assert provider.calls[6].max_output_tokens == 8192
     read_tool = tools.get("read_file")
     assert read_tool is not None
     assert read_tool.calls == ["read_file"] * 6
@@ -355,3 +361,52 @@ def test_plan_two_stages_share_run_and_accumulate_usage() -> None:
     assert [event.run_id for event in usage_events] == ["run", "run"]
     assert usage_events[-1].cumulative == TokenUsage(9, 14, 23)
     assert events[-1].usage == TokenUsage(9, 14, 23)
+
+
+def test_finalization_system_has_no_synthetic_user_or_assistant_prefill() -> None:
+    provider = ScriptedAsyncProvider(
+        [[ProviderTextDelta("investigation notes")], [ProviderTextDelta("final plan")]]
+    )
+    session = conversation(provider)
+    asyncio.run(collect_async(session.plan("build it")))
+
+    assert provider.calls[1].tools is None
+    assert "Mode: Plan finalization" in provider.calls[1].prompt.dynamic_system
+    assert provider.calls[1].messages == (provider.calls[0].messages[-1],)
+    assert provider.calls[1].messages[-1] == provider.calls[0].messages[-1]
+    assert [message.content for message in session.messages() if message.role == "user"] == [
+        "build it"
+    ]
+
+
+def test_plan_history_and_reminder_use_real_task() -> None:
+    provider = ScriptedAsyncProvider(
+        [[ProviderTextDelta("notes")], [ProviderTextDelta("plan")]]
+    )
+    session = conversation(provider)
+    asyncio.run(collect_async(session.plan("build it")))
+    assert provider.calls[0].messages[-1].content == "build it"
+    assert "Task: build it" in provider.calls[0].prompt.dynamic_system
+    assert session.pending_plan() == PendingPlan("build it", "plan")
+
+
+def test_execute_history_and_reminder_use_real_do_action() -> None:
+    provider = ScriptedAsyncProvider(
+        [
+            [ProviderTextDelta("notes")],
+            [ProviderTextDelta("approved")],
+            [ProviderTextDelta("done")],
+        ]
+    )
+    session = conversation(provider)
+    asyncio.run(collect_async(session.plan("build it")))
+    asyncio.run(collect_async(session.execute_plan()))
+
+    execute_request = provider.calls[2]
+    assert execute_request.messages[-1].content == "/do"
+    assert "Original task: build it" in execute_request.prompt.dynamic_system
+    assert "Approved plan: approved" in execute_request.prompt.dynamic_system
+    assert [message.content for message in session.messages() if message.role == "user"] == [
+        "build it",
+        "/do",
+    ]

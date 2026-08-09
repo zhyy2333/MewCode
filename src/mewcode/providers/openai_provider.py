@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
+from urllib.parse import urlparse
 
-from mewcode.tools import ToolCallRequest, ToolExecution, ToolRegistry, ToolResult
+from mewcode.tools import Tool, ToolCallRequest, ToolExecution, ToolRegistry, ToolResult
 
 from .base import (
-    DEFAULT_MAX_TOKENS,
     ChatMessage,
+    ModelRequest,
     ModelResponse,
     ProviderError,
     ProviderEvent,
@@ -38,28 +40,31 @@ class OpenAIProvider:
             base_url=profile.base_url,
         )
 
-    def tool_definitions(self, registry: ToolRegistry) -> list[dict[str, Any]]:
-        return registry.to_openai_tools()
-
     async def stream_reply(
         self,
-        messages: list[ChatMessage],
-        tools: list[dict[str, Any]] | None = None,
-        *,
-        max_output_tokens: int = DEFAULT_MAX_TOKENS,
+        model_request: ModelRequest,
     ) -> AsyncIterator[ProviderEvent]:
         request: dict[str, Any] = {
             "model": self._profile.model,
-            "input": self._build_input(messages),
-            "max_output_tokens": max_output_tokens,
+            "input": self._build_input(model_request),
+            "max_output_tokens": model_request.max_output_tokens,
             "stream": True,
         }
         if self._profile.thinking is ThinkingMode.ENABLED:
             request["reasoning"] = {"effort": "medium"}
         elif self._profile.thinking is ThinkingMode.DISABLED:
             request["reasoning"] = {"effort": "none"}
-        if tools:
-            request["tools"] = tools
+        if model_request.tools is not None:
+            tools = _openai_tools(model_request.tools)
+            if tools:
+                request["tools"] = tools
+        if _supports_explicit_prompt_cache(self._profile):
+            request["prompt_cache_options"] = {"mode": "explicit"}
+            request["prompt_cache_key"] = _prompt_cache_key(
+                self._profile.model,
+                model_request.prompt.stable_system,
+                request.get("tools", []),
+            )
 
         stream: Any = None
         terminal_emitted = False
@@ -126,9 +131,29 @@ class OpenAIProvider:
                     if hasattr(result, "__await__"):
                         await result
 
-    def _build_input(self, messages: list[ChatMessage]) -> list[dict[str, Any]]:
-        inputs: list[dict[str, Any]] = []
-        for message in messages:
+    def _build_input(self, model_request: ModelRequest) -> list[dict[str, Any]]:
+        stable_block: dict[str, Any] = {
+            "type": "input_text",
+            "text": model_request.prompt.stable_system,
+        }
+        if _supports_explicit_prompt_cache(self._profile):
+            stable_block["prompt_cache_breakpoint"] = {"mode": "explicit"}
+        inputs: list[dict[str, Any]] = [
+            {"role": "system", "content": [stable_block]}
+        ]
+        if model_request.prompt.dynamic_system:
+            inputs.append(
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "input_text",
+                            "text": model_request.prompt.dynamic_system,
+                        }
+                    ],
+                }
+            )
+        for message in model_request.messages:
             if isinstance(message.content, dict) and message.content.get("type") in {
                 "function_call",
                 "function_call_output",
@@ -196,6 +221,46 @@ def _tool_result_payload(result: ToolResult) -> str:
         },
         ensure_ascii=False,
     )
+
+
+def _openai_tools(registry: ToolRegistry) -> list[dict[str, Any]]:
+    return [_openai_tool(tool) for tool in sorted(registry.list(), key=lambda item: item.name)]
+
+
+def _openai_tool(tool: Tool) -> dict[str, Any]:
+    return {
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.parameters_schema,
+        "strict": False,
+    }
+
+
+def _supports_explicit_prompt_cache(profile: ProviderProfile) -> bool:
+    hostname = (urlparse(profile.base_url).hostname or "").casefold()
+    return hostname == "api.openai.com" and profile.model.casefold().startswith(
+        "gpt-5.6"
+    )
+
+
+def _prompt_cache_key(
+    model: str,
+    stable_system: str,
+    tools: Sequence[dict[str, Any]],
+) -> str:
+    payload = json.dumps(
+        {
+            "model": model,
+            "stable_system": stable_system,
+            "tools": list(tools),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    return f"mewcode:{digest}"
 
 
 class _OpenAIToolEventParser:
@@ -284,10 +349,15 @@ def _build_tool_call(call_id: str, name: str, raw_arguments: str) -> ToolCallReq
 def _openai_usage(usage: Any) -> TokenUsage:
     if usage is None:
         return TokenUsage()
+    details = _get_event_attr(usage, "input_tokens_details") or {}
     return TokenUsage(
         input_tokens=_optional_int(_get_event_attr(usage, "input_tokens")),
         output_tokens=_optional_int(_get_event_attr(usage, "output_tokens")),
         total_tokens=_optional_int(_get_event_attr(usage, "total_tokens")),
+        cache_read_tokens=_optional_int(_get_event_attr(details, "cached_tokens")),
+        cache_write_tokens=_optional_int(
+            _get_event_attr(details, "cache_write_tokens")
+        ),
     )
 
 

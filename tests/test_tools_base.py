@@ -102,30 +102,16 @@ def test_registry_wraps_unexpected_tool_error() -> None:
     assert "unexpected error" in (result.error or "")
 
 
-def test_anthropic_tool_format() -> None:
+def test_registry_does_not_expose_anthropic_tool_format() -> None:
     registry = ToolRegistry([EchoTool()])
 
-    assert registry.to_anthropic_tools() == [
-        {
-            "name": "echo",
-            "description": "Echo text.",
-            "input_schema": EchoTool.parameters_schema,
-        }
-    ]
+    assert not hasattr(registry, "to_anthropic_tools")
 
 
-def test_openai_tool_format() -> None:
+def test_registry_does_not_expose_openai_tool_format() -> None:
     registry = ToolRegistry([EchoTool()])
 
-    assert registry.to_openai_tools() == [
-        {
-            "type": "function",
-            "name": "echo",
-            "description": "Echo text.",
-            "parameters": EchoTool.parameters_schema,
-            "strict": False,
-        }
-    ]
+    assert not hasattr(registry, "to_openai_tools")
 
 
 def test_truncate_text_marks_truncated_content() -> None:
@@ -157,18 +143,10 @@ def test_builtin_registry_contains_six_core_tools(tmp_path) -> None:
         assert registry.get(name) is not None
 
 
-def test_builtin_registry_exports_all_tools_for_providers(tmp_path) -> None:
+def test_builtin_registry_exposes_all_tool_objects_for_providers(tmp_path) -> None:
     registry = create_builtin_registry(Workspace(tmp_path))
 
-    assert [tool["name"] for tool in registry.to_anthropic_tools()] == [
-        "read_file",
-        "write_file",
-        "edit_file",
-        "run_command",
-        "find_files",
-        "search_code",
-    ]
-    assert [tool["name"] for tool in registry.to_openai_tools()] == [
+    assert [tool.name for tool in registry.list()] == [
         "read_file",
         "write_file",
         "edit_file",
@@ -212,3 +190,15 @@ def test_builtin_registry_has_three_tools_in_each_safety_class(tmp_path) -> None
     assert [tool.name for tool in side_effect.list()] == [
         "write_file", "edit_file", "run_command"
     ]
+
+
+def test_tool_rules_descriptions_reinforce_dedicated_tools_and_read_before_edit(
+    tmp_path,
+) -> None:
+    registry = create_builtin_registry(Workspace(tmp_path))
+    descriptions = {tool.name: tool.description.casefold() for tool in registry.list()}
+    assert "read" in descriptions["write_file"] and "existing" in descriptions["write_file"]
+    assert "read" in descriptions["edit_file"] and "existing" in descriptions["edit_file"]
+    assert "dedicated tool" in descriptions["find_files"]
+    assert "dedicated tool" in descriptions["search_code"]
+    assert "dedicated" in descriptions["run_command"] and "only when" in descriptions["run_command"]

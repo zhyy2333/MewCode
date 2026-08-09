@@ -140,25 +140,3 @@ class ToolRegistry:
                 error=f"Tool raised an unexpected error: {exc}",
                 metadata={"tool_call_id": request.id},
             )
-
-    def to_anthropic_tools(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "name": tool.name,
-                "description": tool.description,
-                "input_schema": tool.parameters_schema,
-            }
-            for tool in self.list()
-        ]
-
-    def to_openai_tools(self) -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "function",
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": tool.parameters_schema,
-                "strict": False,
-            }
-            for tool in self.list()
-        ]

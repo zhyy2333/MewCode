@@ -6,6 +6,7 @@ from pathlib import Path
 from .agent import AgentRunner, ToolScheduler
 from .config import load_active_profile
 from .conversation import Conversation
+from .prompting import PromptBuilder, PromptEnvironmentProvider
 from .providers import ConfigError, ProviderError, create_provider
 from .repl import Repl
 from .tools import Workspace, create_builtin_registry
@@ -18,7 +19,12 @@ def main(argv: list[str] | None = None) -> int:
         workspace = Workspace(Path.cwd())
         registry = create_builtin_registry(workspace)
         scheduler = ToolScheduler()
-        agent_runner = AgentRunner(provider, scheduler)
+        prompt_builder = PromptBuilder(PromptEnvironmentProvider(workspace.root))
+        agent_runner = AgentRunner(
+            provider,
+            scheduler,
+            prompt_builder=prompt_builder,
+        )
         conversation = Conversation(agent_runner, registry)
         return Repl(conversation).run()
     except (ConfigError, ProviderError) as exc:

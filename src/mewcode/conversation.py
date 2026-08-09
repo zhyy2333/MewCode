@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
+from .prompting import PromptAdditions, PromptRunContext
 from .agent import (
     AgentEvent,
     AgentMode,
@@ -13,22 +14,6 @@ from .agent import (
 )
 from .providers import ChatMessage
 from .tools import ToolRegistry, ToolSafety
-
-PLAN_PROMPT = """Create a concrete implementation plan for the task below.
-Inspect the workspace with the available read-only tools. Do not make changes.
-Your final response must be the complete plan.
-
-Task:
-{task}"""
-
-EXECUTE_PROMPT = """Execute the approved plan below with the available tools.
-Verify the completed work and finish with a concise summary.
-
-Original task:
-{task}
-
-Approved plan:
-{plan}"""
 
 
 class ConversationError(RuntimeError):
@@ -44,9 +29,15 @@ class PendingPlan:
 
 
 class Conversation:
-    def __init__(self, runner: AgentRunner, tools: ToolRegistry) -> None:
+    def __init__(
+        self,
+        runner: AgentRunner,
+        tools: ToolRegistry,
+        prompt_additions: PromptAdditions = PromptAdditions(),
+    ) -> None:
         self._runner = runner
         self._tools = tools
+        self._prompt_additions = prompt_additions
         self._messages: list[ChatMessage] = []
         self._pending_plan: PendingPlan | None = None
         self._active_run: AgentRun | None = None
@@ -62,7 +53,10 @@ class Conversation:
         text = user_text.strip()
         if not text:
             raise ConversationError("Message must not be empty.")
-        async for event in self._run(text, self._tools, AgentMode.DIRECT):
+        context = PromptRunContext(task=text, additions=self._prompt_additions)
+        async for event in self._run(
+            text, self._tools, AgentMode.DIRECT, context
+        ):
             yield event
 
     async def plan(self, task: str) -> AsyncIterator[AgentEvent]:
@@ -70,9 +64,11 @@ class Conversation:
         if not clean_task:
             raise ConversationError("Usage: /plan <task>")
         readonly = self._tools.select({ToolSafety.READ_ONLY})
-        async for event in self._run(
-            PLAN_PROMPT.format(task=clean_task), readonly, AgentMode.PLAN
-        ):
+        context = PromptRunContext(
+            task=clean_task,
+            additions=self._prompt_additions,
+        )
+        async for event in self._run(clean_task, readonly, AgentMode.PLAN, context):
             yield event
         outcome = self._last_outcome
         if (
@@ -86,8 +82,12 @@ class Conversation:
         plan = self._pending_plan
         if plan is None:
             raise ConversationError("No pending plan. Use /plan <task> first.")
-        prompt = EXECUTE_PROMPT.format(task=plan.task, plan=plan.text)
-        async for event in self._run(prompt, self._tools, AgentMode.EXECUTE):
+        context = PromptRunContext(
+            task=plan.task,
+            approved_plan=plan.text,
+            additions=self._prompt_additions,
+        )
+        async for event in self._run("/do", self._tools, AgentMode.EXECUTE, context):
             yield event
         outcome = self._last_outcome
         if outcome is not None and outcome.completed:
@@ -102,10 +102,17 @@ class Conversation:
         user_text: str,
         tools: ToolRegistry,
         mode: AgentMode,
+        prompt_context: PromptRunContext,
     ) -> AsyncIterator[AgentEvent]:
         if self._active_run is not None:
             raise ConversationError("Another agent run is already active.")
-        run = self._runner.start(self._messages, user_text, tools, mode)
+        run = self._runner.start(
+            self._messages,
+            user_text,
+            tools,
+            mode,
+            prompt_context,
+        )
         self._active_run = run
         self._last_outcome = None
         try:

@@ -5,8 +5,8 @@ from collections.abc import AsyncIterator, Iterable, Sequence
 from typing import Any, TypeVar
 
 from mewcode.providers import (
-    DEFAULT_MAX_TOKENS,
     ChatMessage,
+    ModelRequest,
     ModelResponse,
     ProviderEvent,
     ProviderFinished,
@@ -31,25 +31,13 @@ async def collect_async(source: AsyncIterator[T]) -> list[T]:
 class ScriptedAsyncProvider:
     def __init__(self, scripts: Iterable[Iterable[ProviderEvent] | BaseException]) -> None:
         self.scripts = list(scripts)
-        self.calls: list[dict[str, Any]] = []
-
-    def tool_definitions(self, registry: ToolRegistry) -> list[dict[str, Any]]:
-        return registry.to_openai_tools()
+        self.calls: list[ModelRequest] = []
 
     async def stream_reply(
         self,
-        messages: list[ChatMessage],
-        tools: list[dict[str, Any]] | None = None,
-        *,
-        max_output_tokens: int = DEFAULT_MAX_TOKENS,
+        request: ModelRequest,
     ) -> AsyncIterator[ProviderEvent]:
-        self.calls.append(
-            {
-                "messages": list(messages),
-                "tools": tools,
-                "max_output_tokens": max_output_tokens,
-            }
-        )
+        self.calls.append(request)
         script = self.scripts.pop(0)
         if isinstance(script, BaseException):
             raise script

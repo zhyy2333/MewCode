@@ -145,7 +145,11 @@ def _format_event(event: AgentEvent) -> str | None:
             f"in={_token(current.input_tokens)} "
             f"out={_token(current.output_tokens)} "
             f"total={_token(current.total_tokens)} "
-            f"cumulative={_token(cumulative.total_tokens)}\n"
+            f"cache-read={_token(current.cache_read_tokens)} "
+            f"cache-write={_token(current.cache_write_tokens)} "
+            f"cumulative={_token(cumulative.total_tokens)} "
+            f"cumulative-cache-read={_token(cumulative.cache_read_tokens)} "
+            f"cumulative-cache-write={_token(cumulative.cache_write_tokens)}\n"
         )
     if isinstance(event, AgentProgress):
         if event.phase == "iteration_started":

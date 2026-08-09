@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 import pytest
 
 from mewcode.agent import (
+    AgentMode,
     AgentProgress,
     AgentRunConfig,
     AgentRunStateError,
@@ -18,6 +19,7 @@ from mewcode.agent import (
     StopReason,
     ToolScheduler,
 )
+from mewcode.prompting import PromptAdditions, PromptRunContext
 from mewcode.providers import (
     ChatMessage,
     ModelResponse,
@@ -25,6 +27,7 @@ from mewcode.providers import (
     ProviderEvent,
     ProviderFinished,
     ProviderFinishReason,
+    ModelRequest,
     ProviderTextDelta,
     ProviderToolCall,
     ProviderUsage,
@@ -58,7 +61,7 @@ def test_completed_without_tools() -> None:
     assert run.outcome.completed is True
     assert run.outcome.new_messages[0] == ChatMessage("user", "Hi")
     assert run.outcome.final_text == "hello"
-    assert provider.calls[0]["max_output_tokens"] == 4096
+    assert provider.calls[0].max_output_tokens == 4096
 
 
 def test_output_limit_is_not_completed_or_committed() -> None:
@@ -105,8 +108,8 @@ def test_react_loop_uses_complete_prior_results() -> None:
 
     assert tool.calls == ["echo", "echo"]
     assert len(provider.calls) == 3
-    assert len(provider.calls[1]["messages"]) == 3
-    assert len(provider.calls[2]["messages"]) == 5
+    assert len(provider.calls[1].messages) == 3
+    assert len(provider.calls[2].messages) == 5
     assert events[-1].reason is StopReason.COMPLETED
     assert run.outcome.usage == TokenUsage(9, 3, 12)
     assert len([event for event in events if isinstance(event, AgentToolCall)]) == 2
@@ -129,7 +132,7 @@ def test_multiple_tool_calls_execute_once_and_write_back_as_one_batch() -> None:
 
     assert sorted(call_log) == ["first", "second"]
     assert len(call_log) == 2
-    result_message = provider.calls[1]["messages"][-1]
+    result_message = provider.calls[1].messages[-1]
     assert [item["id"] for item in result_message.content] == ["call-1", "call-2"]
     assert len([event for event in events if isinstance(event, AgentToolCall)]) == 2
     assert len([event for event in events if isinstance(event, AgentToolResult)]) == 2
@@ -151,7 +154,7 @@ def test_tool_failure_is_paired_and_loop_continues() -> None:
 
     assert run.outcome.reason is StopReason.COMPLETED
     assert len(run.outcome.new_messages) == 4
-    tool_message = provider.calls[1]["messages"][-1]
+    tool_message = provider.calls[1].messages[-1]
     assert tool_message.role == "tool"
     assert tool_message.content[0]["error"] == "bad arguments"
 
@@ -234,18 +237,9 @@ class BlockingProvider(ScriptedAsyncProvider):
 
     async def stream_reply(
         self,
-        messages: list[ChatMessage],
-        tools=None,
-        *,
-        max_output_tokens=4096,
+        request: ModelRequest,
     ) -> AsyncIterator[ProviderEvent]:
-        self.calls.append(
-            {
-                "messages": list(messages),
-                "tools": tools,
-                "max_output_tokens": max_output_tokens,
-            }
-        )
+        self.calls.append(request)
         self.started.set()
         await asyncio.Event().wait()
         if False:
@@ -401,3 +395,81 @@ def test_run_is_single_use_and_outcome_requires_completion() -> None:
     assert run.outcome.reason is StopReason.COMPLETED
     with pytest.raises(AgentRunStateError):
         asyncio.run(collect_async(run.events()))
+
+
+def test_prompt_context_is_sent_in_each_model_request() -> None:
+    provider = ScriptedAsyncProvider([[ProviderTextDelta("done")]])
+    context = PromptRunContext(
+        "task",
+        approved_plan="plan",
+        additions=PromptAdditions(custom_instructions="custom"),
+    )
+    run = _runner(provider).start(
+        [], "real user action", ToolRegistry([]), AgentMode.EXECUTE, context
+    )
+    asyncio.run(collect_async(run.events()))
+
+    request = provider.calls[0]
+    assert request.messages == (ChatMessage("user", "real user action"),)
+    assert "## Custom Instructions\ncustom" in request.prompt.dynamic_system
+    assert "Approved plan: plan" in request.prompt.dynamic_system
+
+
+def test_stable_prefix_is_shared_across_tool_loop() -> None:
+    provider = ScriptedAsyncProvider(
+        [
+            [ProviderToolCall(tool_call("1", "echo"))],
+            [ProviderTextDelta("done")],
+        ]
+    )
+    run = _runner(provider).start(
+        [], "work", ToolRegistry([ControlledTool("echo")])
+    )
+    asyncio.run(collect_async(run.events()))
+
+    assert (
+        provider.calls[0].prompt.stable_system
+        == provider.calls[1].prompt.stable_system
+    )
+    assert provider.calls[0].messages != provider.calls[1].messages
+
+
+def test_prompt_cadence_and_new_run_reset() -> None:
+    scripts = [
+        [ProviderToolCall(tool_call(str(index), "echo"))]
+        for index in range(1, 9)
+    ] + [[ProviderTextDelta("done")]]
+    provider = ScriptedAsyncProvider(scripts + [[ProviderTextDelta("again")]])
+    runner = _runner(provider)
+    tools = ToolRegistry([ControlledTool("echo")])
+    first = runner.start([], "/do", tools, AgentMode.EXECUTE, PromptRunContext("task", "plan"))
+    asyncio.run(collect_async(first.events()))
+    second = runner.start([], "/do", tools, AgentMode.EXECUTE, PromptRunContext("task", "plan"))
+    asyncio.run(collect_async(second.events()))
+
+    first_run_reminders = [request.prompt.dynamic_system for request in provider.calls[:9]]
+    assert [index for index, text in enumerate(first_run_reminders, 1) if "Goal:" in text] == [1, 5, 9]
+    assert "Goal:" in provider.calls[9].prompt.dynamic_system
+
+
+def test_direct_prompt_has_no_mode_reminder() -> None:
+    provider = ScriptedAsyncProvider([[ProviderTextDelta("done")]])
+    run = _runner(provider).start([], "question", ToolRegistry([]))
+    asyncio.run(collect_async(run.events()))
+    assert "## Environment" in provider.calls[0].prompt.dynamic_system
+    assert "<system-reminder>" not in provider.calls[0].prompt.dynamic_system
+
+
+def test_cache_usage_reaches_current_cumulative_and_outcome() -> None:
+    provider = ScriptedAsyncProvider(
+        [
+            [ProviderToolCall(tool_call("1", "echo")), ProviderUsage(TokenUsage(1, 2, 3, 4, 5))],
+            [ProviderTextDelta("done"), ProviderUsage(TokenUsage(6, 7, 13, 8, 9))],
+        ]
+    )
+    run = _runner(provider).start([], "work", ToolRegistry([ControlledTool("echo")]))
+    events = asyncio.run(collect_async(run.events()))
+    usage_events = [event for event in events if isinstance(event, AgentTokenUsage)]
+    assert usage_events[0].current == TokenUsage(1, 2, 3, 4, 5)
+    assert usage_events[-1].cumulative == TokenUsage(7, 9, 16, 12, 14)
+    assert run.outcome.usage == TokenUsage(7, 9, 16, 12, 14)

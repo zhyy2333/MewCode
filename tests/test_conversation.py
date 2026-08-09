@@ -7,7 +7,8 @@ import pytest
 
 from mewcode.agent import AgentRunner, StopReason, ToolScheduler
 from mewcode.conversation import Conversation, ConversationError
-from mewcode.providers import ChatMessage, ModelResponse, ProviderError, ProviderEvent, ProviderTextDelta
+from mewcode.providers import ChatMessage, ModelRequest, ModelResponse, ProviderError, ProviderEvent, ProviderTextDelta
+from mewcode.prompting import PromptAdditions
 from mewcode.tools import ToolExecution, ToolRegistry
 
 from tests.fakes import ScriptedAsyncProvider, collect_async
@@ -39,7 +40,7 @@ def test_messages_returns_copy() -> None:
     assert len(conversation.messages()) == 2
 
 
-def test_second_turn_includes_previous_context() -> None:
+def test_stable_prefix_second_turn_includes_previous_context() -> None:
     provider = ScriptedAsyncProvider(
         [[ProviderTextDelta("first")], [ProviderTextDelta("second")]]
     )
@@ -47,8 +48,12 @@ def test_second_turn_includes_previous_context() -> None:
     asyncio.run(collect_async(conversation.ask("one")))
     asyncio.run(collect_async(conversation.ask("two")))
 
-    assert len(provider.calls[1]["messages"]) == 3
-    assert provider.calls[1]["messages"][0] == ChatMessage("user", "one")
+    assert len(provider.calls[1].messages) == 3
+    assert provider.calls[1].messages[0] == ChatMessage("user", "one")
+    assert (
+        provider.calls[0].prompt.stable_system
+        == provider.calls[1].prompt.stable_system
+    )
 
 
 def test_provider_error_does_not_append_partial_history() -> None:
@@ -69,18 +74,9 @@ class BlockingProvider(ScriptedAsyncProvider):
 
     async def stream_reply(
         self,
-        messages: list[ChatMessage],
-        tools=None,
-        *,
-        max_output_tokens=4096,
+        request: ModelRequest,
     ) -> AsyncIterator[ProviderEvent]:
-        self.calls.append(
-            {
-                "messages": list(messages),
-                "tools": tools,
-                "max_output_tokens": max_output_tokens,
-            }
-        )
+        self.calls.append(request)
         self.started.set()
         await asyncio.Event().wait()
         if False:
@@ -108,3 +104,20 @@ def test_empty_direct_message_is_rejected() -> None:
     conversation = make_conversation(ScriptedAsyncProvider([]))
     with pytest.raises(ConversationError, match="empty"):
         asyncio.run(collect_async(conversation.ask("  ")))
+
+
+def test_prompt_additions_are_system_context_with_real_user_history() -> None:
+    provider = ScriptedAsyncProvider([[ProviderTextDelta("done")]])
+    runner = AgentRunner(provider, ToolScheduler(), id_factory=lambda: "run")
+    conversation = Conversation(
+        runner,
+        ToolRegistry([]),
+        PromptAdditions("custom", "skill", "memory"),
+    )
+    asyncio.run(collect_async(conversation.ask("real question")))
+
+    dynamic = provider.calls[0].prompt.dynamic_system
+    assert dynamic.index("custom") < dynamic.index("skill") < dynamic.index("memory")
+    assert [message.content for message in conversation.messages() if message.role == "user"] == [
+        "real question"
+    ]

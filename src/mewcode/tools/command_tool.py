@@ -29,7 +29,7 @@ DANGEROUS_COMMAND_PATTERNS = [
 
 class RunCommandTool:
     name = "run_command"
-    description = "Run a command in the current workspace with timeout and safety checks."
+    description = "Run a command in the current workspace with timeout and safety checks. Use only when the dedicated read, find, search, write, or edit tools cannot complete the operation."
     safety = ToolSafety.SIDE_EFFECT
     parameters_schema = {
         "type": "object",

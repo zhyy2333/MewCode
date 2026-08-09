@@ -5,6 +5,7 @@ import json
 
 from mewcode.providers import (
     ChatMessage,
+    ModelRequest,
     ModelResponse,
     ProviderFinished,
     ProviderFinishReason,
@@ -14,9 +15,10 @@ from mewcode.providers import (
     ProviderUsage,
     TokenUsage,
 )
-from mewcode.providers.anthropic_provider import AnthropicProvider
-from mewcode.providers.openai_provider import OpenAIProvider
-from mewcode.tools import ToolCallRequest, ToolExecution, ToolResult
+from mewcode.prompting import PromptPackage
+from mewcode.providers.anthropic_provider import AnthropicProvider, _anthropic_tools
+from mewcode.providers.openai_provider import OpenAIProvider, _openai_tools
+from mewcode.tools import ToolCallRequest, ToolExecution, ToolRegistry, ToolResult, ToolSafety
 
 from tests.fakes import collect_async
 from tests.test_providers import (
@@ -25,6 +27,69 @@ from tests.test_providers import (
     install_fake_openai,
     profile,
 )
+
+
+class _NamedTool:
+    description = "test"
+    parameters_schema = {"type": "object", "properties": {}}
+    safety = ToolSafety.READ_ONLY
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+    async def execute(self, arguments):
+        return ToolResult(True, self.name, "ok")
+
+
+def test_tool_serialization_is_provider_specific_and_deterministic() -> None:
+    first = ToolRegistry([_NamedTool("zeta"), _NamedTool("alpha")])
+    second = ToolRegistry([_NamedTool("alpha"), _NamedTool("zeta")])
+    assert _anthropic_tools(first) == _anthropic_tools(second)
+    assert _openai_tools(first) == _openai_tools(second)
+    assert [tool["name"] for tool in _anthropic_tools(first)] == ["alpha", "zeta"]
+    assert [tool["name"] for tool in _openai_tools(first)] == ["alpha", "zeta"]
+    assert "input_schema" in _anthropic_tools(first)[0]
+    assert _openai_tools(first)[0]["type"] == "function"
+
+
+def test_provider_end_to_end_prompt_parity_keeps_system_history_and_tools_equivalent(
+    monkeypatch,
+) -> None:
+    registry = ToolRegistry([_NamedTool("zeta"), _NamedTool("alpha")])
+    model_request = ModelRequest(
+        PromptPackage("stable", "dynamic"),
+        (ChatMessage("user", "question"),),
+        registry,
+    )
+
+    anthropic_type = install_fake_anthropic(monkeypatch)
+    anthropic = AnthropicProvider(
+        profile("anthropic", base_url="https://api.anthropic.com/v1")
+    )
+    asyncio.run(collect_async(anthropic.stream_reply(model_request)))
+    anthropic_request = anthropic_type.created[0].requests[0]
+
+    openai_type = install_fake_openai(monkeypatch)
+    openai = OpenAIProvider(
+        profile(
+            "openai",
+            model="gpt-5.6",
+            base_url="https://api.openai.com/v1",
+        )
+    )
+    asyncio.run(collect_async(openai.stream_reply(model_request)))
+    openai_request = openai_type.created[0].requests[0]
+
+    assert [block["text"] for block in anthropic_request["system"]] == [
+        openai_request["input"][0]["content"][0]["text"],
+        openai_request["input"][1]["content"][0]["text"],
+    ] == ["stable", "dynamic"]
+    assert anthropic_request["messages"] == [
+        {"role": "user", "content": "question"}
+    ]
+    assert openai_request["input"][2] == {"role": "user", "content": "question"}
+    assert [tool["name"] for tool in anthropic_request["tools"]] == ["alpha", "zeta"]
+    assert [tool["name"] for tool in openai_request["tools"]] == ["alpha", "zeta"]
 
 
 def test_anthropic_multiple_tool_calls_and_bad_json(monkeypatch) -> None:
@@ -40,7 +105,13 @@ def test_anthropic_multiple_tool_calls_and_bad_json(monkeypatch) -> None:
         {"type": "content_block_stop", "index": 2},
         {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
     ]
-    events = asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "read")])))
+    events = asyncio.run(
+        collect_async(
+            provider.stream_reply(
+                ModelRequest(PromptPackage("stable", ""), (ChatMessage("user", "read"),))
+            )
+        )
+    )
 
     assert events[0] == ProviderTextDelta("checking")
     calls = [event.request for event in events if isinstance(event, ProviderToolCall)]
@@ -85,7 +156,13 @@ def test_openai_multiple_calls_item_done_deduplicates_and_bad_json(monkeypatch) 
         FakeOpenAIEvent("response.output_item.done", item={"type": "function_call", "id": "fc-2", "call_id": "call-2", "name": "find_files", "arguments": '{"pattern":'}),
         FakeOpenAIEvent("response.completed", response={"usage": {}}),
     ]
-    events = asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "read")])))
+    events = asyncio.run(
+        collect_async(
+            provider.stream_reply(
+                ModelRequest(PromptPackage("stable", ""), (ChatMessage("user", "read"),))
+            )
+        )
+    )
     calls = [event.request for event in events if isinstance(event, ProviderToolCall)]
 
     assert len(calls) == 2
@@ -130,7 +207,13 @@ def test_provider_parity_and_hidden_reasoning_is_ignored(monkeypatch) -> None:
         {"type": "content_block_stop", "index": 2},
         {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
     ]
-    anthropic_events = asyncio.run(collect_async(anthropic.stream_reply([ChatMessage("user", "x")])))
+    anthropic_events = asyncio.run(
+        collect_async(
+            anthropic.stream_reply(
+                ModelRequest(PromptPackage("stable", ""), (ChatMessage("user", "x"),))
+            )
+        )
+    )
 
     openai_type = install_fake_openai(monkeypatch)
     openai = OpenAIProvider(profile("openai"))
@@ -141,7 +224,13 @@ def test_provider_parity_and_hidden_reasoning_is_ignored(monkeypatch) -> None:
         FakeOpenAIEvent("response.output_item.done", item={"type": "function_call", "id": "fc-1", "call_id": "call-1", "name": "read_file", "arguments": '{"path":"a"}'}),
         FakeOpenAIEvent("response.completed", response={"usage": {}}),
     ]
-    openai_events = asyncio.run(collect_async(openai.stream_reply([ChatMessage("user", "x")])))
+    openai_events = asyncio.run(
+        collect_async(
+            openai.stream_reply(
+                ModelRequest(PromptPackage("stable", ""), (ChatMessage("user", "x"),))
+            )
+        )
+    )
 
     assert [
         event
@@ -188,4 +277,5 @@ def test_provider_parity_and_hidden_reasoning_is_ignored(monkeypatch) -> None:
     )
     messages = openai.assistant_messages(openai_response)
     assert messages[0].content["type"] == "reasoning"
-    assert openai._build_input(messages)[0]["type"] == "reasoning"
+    request = ModelRequest(PromptPackage("stable", ""), tuple(messages))
+    assert openai._build_input(request)[1]["type"] == "reasoning"

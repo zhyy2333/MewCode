@@ -5,6 +5,7 @@ from collections.abc import AsyncIterator, Sequence
 from enum import StrEnum
 from typing import Any, Literal, Protocol as TypingProtocol
 
+from mewcode.prompting import PromptPackage
 from mewcode.tools import ToolCallRequest, ToolExecution, ToolRegistry
 
 Protocol = Literal["anthropic", "openai"]
@@ -70,29 +71,45 @@ class TokenUsage:
     input_tokens: int | None = None
     output_tokens: int | None = None
     total_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
 
     @classmethod
     def zero(cls) -> TokenUsage:
-        return cls(input_tokens=0, output_tokens=0, total_tokens=0)
+        return cls(
+            input_tokens=0,
+            output_tokens=0,
+            total_tokens=0,
+            cache_read_tokens=0,
+            cache_write_tokens=0,
+        )
 
     def add(self, other: TokenUsage) -> TokenUsage:
         return TokenUsage(
             input_tokens=_add_optional(self.input_tokens, other.input_tokens),
             output_tokens=_add_optional(self.output_tokens, other.output_tokens),
             total_tokens=_add_optional(self.total_tokens, other.total_tokens),
+            cache_read_tokens=_add_optional(
+                self.cache_read_tokens, other.cache_read_tokens
+            ),
+            cache_write_tokens=_add_optional(
+                self.cache_write_tokens, other.cache_write_tokens
+            ),
         )
 
 
-class LLMProvider(TypingProtocol):
-    def tool_definitions(self, registry: ToolRegistry) -> list[dict[str, Any]]:
-        ...
+@dataclass(frozen=True)
+class ModelRequest:
+    prompt: PromptPackage
+    messages: tuple[ChatMessage, ...]
+    tools: ToolRegistry | None = None
+    max_output_tokens: int = DEFAULT_MAX_TOKENS
 
+
+class LLMProvider(TypingProtocol):
     def stream_reply(
         self,
-        messages: list[ChatMessage],
-        tools: list[dict[str, Any]] | None = None,
-        *,
-        max_output_tokens: int = DEFAULT_MAX_TOKENS,
+        request: ModelRequest,
     ) -> AsyncIterator[ProviderEvent]:
         ...
 

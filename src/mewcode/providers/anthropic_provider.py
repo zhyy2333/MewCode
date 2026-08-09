@@ -4,12 +4,13 @@ import asyncio
 import json
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
+from urllib.parse import urlparse
 
-from mewcode.tools import ToolCallRequest, ToolExecution, ToolRegistry, ToolResult
+from mewcode.tools import Tool, ToolCallRequest, ToolExecution, ToolRegistry, ToolResult
 
 from .base import (
-    DEFAULT_MAX_TOKENS,
     ChatMessage,
+    ModelRequest,
     ModelResponse,
     ProviderError,
     ProviderEvent,
@@ -42,17 +43,11 @@ class AnthropicProvider:
             base_url=profile.base_url,
         )
 
-    def tool_definitions(self, registry: ToolRegistry) -> list[dict[str, Any]]:
-        return registry.to_anthropic_tools()
-
     async def stream_reply(
         self,
-        messages: list[ChatMessage],
-        tools: list[dict[str, Any]] | None = None,
-        *,
-        max_output_tokens: int = DEFAULT_MAX_TOKENS,
+        model_request: ModelRequest,
     ) -> AsyncIterator[ProviderEvent]:
-        request = self._build_request(messages, tools, max_output_tokens)
+        request = self._build_request(model_request)
         if self._profile.thinking is ThinkingMode.AUTO:
             try:
                 async for event in self._stream_request(request):
@@ -136,19 +131,35 @@ class AnthropicProvider:
 
     def _build_request(
         self,
-        messages: list[ChatMessage],
-        tools: list[dict[str, Any]] | None,
-        max_output_tokens: int,
+        model_request: ModelRequest,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self._profile.model,
-            "max_tokens": max_output_tokens,
+            "max_tokens": model_request.max_output_tokens,
             "messages": [
-                {"role": message.role, "content": message.content} for message in messages
+                {"role": message.role, "content": message.content}
+                for message in model_request.messages
             ],
         }
-        if tools:
-            request["tools"] = tools
+        stable_system = model_request.prompt.stable_system
+        dynamic_system = model_request.prompt.dynamic_system
+        if _is_official_anthropic_host(self._profile.base_url):
+            system: list[dict[str, Any]] = [
+                {
+                    "type": "text",
+                    "text": stable_system,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
+            if dynamic_system:
+                system.append({"type": "text", "text": dynamic_system})
+            request["system"] = system
+        else:
+            request["system"] = _join_system(stable_system, dynamic_system)
+        if model_request.tools is not None:
+            tools = _anthropic_tools(model_request.tools)
+            if tools:
+                request["tools"] = tools
         return request
 
     async def _stream_request(
@@ -186,11 +197,35 @@ def _tool_result_payload(result: ToolResult) -> str:
     )
 
 
+def _anthropic_tools(registry: ToolRegistry) -> list[dict[str, Any]]:
+    return [_anthropic_tool(tool) for tool in sorted(registry.list(), key=lambda item: item.name)]
+
+
+def _anthropic_tool(tool: Tool) -> dict[str, Any]:
+    return {
+        "name": tool.name,
+        "description": tool.description,
+        "input_schema": tool.parameters_schema,
+    }
+
+
+def _is_official_anthropic_host(base_url: str) -> bool:
+    return (urlparse(base_url).hostname or "").casefold() == "api.anthropic.com"
+
+
+def _join_system(stable_system: str, dynamic_system: str) -> str:
+    if not dynamic_system:
+        return stable_system
+    return f"{stable_system}\n\n{dynamic_system}"
+
+
 async def _parse_anthropic_events(events: Any) -> AsyncIterator[ProviderEvent]:
     calls: dict[int, dict[str, Any]] = {}
     internal_blocks: dict[int, dict[str, Any]] = {}
     input_tokens: int | None = None
     output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
     finish_reason: ProviderFinishReason | None = None
     emitted_tool_call = False
 
@@ -200,6 +235,12 @@ async def _parse_anthropic_events(events: Any) -> AsyncIterator[ProviderEvent]:
             message = _get_event_attr(event, "message") or {}
             usage = _get_event_attr(message, "usage") or {}
             input_tokens = _optional_int(_get_event_attr(usage, "input_tokens"))
+            cache_read_tokens = _optional_int(
+                _get_event_attr(usage, "cache_read_input_tokens")
+            )
+            cache_write_tokens = _optional_int(
+                _get_event_attr(usage, "cache_creation_input_tokens")
+            )
         elif event_type == "message_delta":
             delta = _get_event_attr(event, "delta") or {}
             stop_reason = _get_event_attr(delta, "stop_reason") or _get_event_attr(
@@ -263,7 +304,15 @@ async def _parse_anthropic_events(events: Any) -> AsyncIterator[ProviderEvent]:
         if input_tokens is not None and output_tokens is not None
         else None
     )
-    yield ProviderUsage(TokenUsage(input_tokens, output_tokens, total_tokens))
+    yield ProviderUsage(
+        TokenUsage(
+            input_tokens,
+            output_tokens,
+            total_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+        )
+    )
     if finish_reason is None:
         finish_reason = (
             ProviderFinishReason.TOOL_CALLS

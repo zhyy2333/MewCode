@@ -14,7 +14,7 @@ from .workspace import Workspace, WorkspaceError
 
 class ReadFileTool:
     name = "read_file"
-    description = "Read a UTF-8 text file inside the current workspace."
+    description = "Read a UTF-8 text file inside the current workspace. Use this before editing or overwriting an existing file."
     safety = ToolSafety.READ_ONLY
     parameters_schema = {
         "type": "object",
@@ -51,7 +51,7 @@ class ReadFileTool:
 
 class WriteFileTool:
     name = "write_file"
-    description = "Write UTF-8 text to a file inside the current workspace."
+    description = "Write UTF-8 text to a file inside the current workspace. Read an existing target first; a new file does not require a pre-read."
     safety = ToolSafety.SIDE_EFFECT
     parameters_schema = {
         "type": "object",
@@ -86,7 +86,7 @@ class WriteFileTool:
 
 class EditFileTool:
     name = "edit_file"
-    description = "Replace exactly one occurrence of text in a UTF-8 file inside the workspace."
+    description = "Replace exactly one occurrence of text in a UTF-8 file inside the workspace. Read the relevant existing content first, and prefer this tool over a general command."
     safety = ToolSafety.SIDE_EFFECT
     parameters_schema = {
         "type": "object",

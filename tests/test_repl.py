@@ -123,7 +123,7 @@ def test_repl_event_indent_and_output_hides_json_arguments() -> None:
     assert "checking" in output
     assert "  tool: read_file ..." in output
     assert "  tool: read_file ok - README.md" in output
-    assert "  tokens: in=3 out=2 total=5 cumulative=5" in output
+    assert "  tokens: in=3 out=2 total=5 cache-read=n/a cache-write=n/a cumulative=5 cumulative-cache-read=n/a cumulative-cache-write=n/a" in output
     assert "  agent: running 1 tool call(s)" in output
     assert "secret.json" not in output
 
@@ -150,7 +150,7 @@ def test_event_indent_keeps_primary_output_unindented() -> None:
         "  tool: read_file ...\n"
         "  agent: running 1 tool call(s)\n"
         "  tool: read_file ok - README.md\n"
-        "  tokens: in=3 out=2 total=5 cumulative=5\n"
+        "  tokens: in=3 out=2 total=5 cache-read=n/a cache-write=n/a cumulative=5 cumulative-cache-read=n/a cumulative-cache-write=n/a\n"
         "answer\n"
         "agent: completed\n"
     )
@@ -178,7 +178,7 @@ def test_iteration_spacing_has_exactly_one_blank_line() -> None:
         "  tool: read_file ...\n"
         "\n"
         "agent: iteration 2\n"
-        "  tokens: in=1 out=1 total=2 cumulative=2\n"
+        "  tokens: in=1 out=1 total=2 cache-read=n/a cache-write=n/a cumulative=2 cumulative-cache-read=n/a cumulative-cache-write=n/a\n"
     )
 
 
@@ -231,7 +231,7 @@ def test_incomplete_model_response_has_explicit_stop_reason(
     assert output == f"agent: stopped ({reason.value})\n"
 
 
-def test_streaming_writes_each_text_delta_immediately() -> None:
+def test_immediate_text_streaming_writes_each_delta() -> None:
     class RecordingStream(io.StringIO):
         def __init__(self) -> None:
             super().__init__()
@@ -320,7 +320,7 @@ def test_end_to_end_hierarchy_matches_approved_layout() -> None:
         "  tool: find_files ...\n"
         "  agent: running 1 tool call(s)\n"
         "  tool: find_files ok - .gitignore\n"
-        "  tokens: in=4 out=2 total=6 cumulative=6\n"
+        "  tokens: in=4 out=2 total=6 cache-read=n/a cache-write=n/a cumulative=6 cumulative-cache-read=n/a cumulative-cache-write=n/a\n"
         "\n"
         "agent: iteration 2\n"
         "Final answer.\n"
@@ -440,7 +440,7 @@ def test_main_keyboard_interrupt_returns_130(monkeypatch) -> None:
     assert cli.main() == 130
 
 
-def test_main_normal_path_wires_agent_components(monkeypatch) -> None:
+def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> None:
     profile = ProviderProfile("main", "openai", "model", "https://example.test", "secret")
     created = {}
 
@@ -451,9 +451,10 @@ def test_main_normal_path_wires_agent_components(monkeypatch) -> None:
         pass
 
     class FakeRunner:
-        def __init__(self, provider, scheduler):
+        def __init__(self, provider, scheduler, *, prompt_builder):
             created["provider"] = provider
             created["scheduler"] = scheduler
+            created["prompt_builder"] = prompt_builder
 
     class FakeSession:
         def __init__(self, runner, tools):
@@ -477,4 +478,22 @@ def test_main_normal_path_wires_agent_components(monkeypatch) -> None:
     assert cli.main() == 7
     assert isinstance(created["provider"], FakeProvider)
     assert isinstance(created["scheduler"], FakeScheduler)
+    assert created["prompt_builder"] is not None
     assert created["tools"] is not None
+
+
+def test_token_output_shows_cache_tokens_and_unknowns() -> None:
+    output = render_events(
+        [
+            AgentTokenUsage(
+                "run",
+                1,
+                TokenUsage(10, 2, 12, 7, 3),
+                TokenUsage(20, 4, 24, None, 0),
+            )
+        ]
+    )
+    assert output == (
+        "  tokens: in=10 out=2 total=12 cache-read=7 cache-write=3 "
+        "cumulative=24 cumulative-cache-read=n/a cumulative-cache-write=0\n"
+    )
