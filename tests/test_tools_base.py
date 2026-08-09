@@ -4,11 +4,14 @@ import asyncio
 from typing import Any
 
 from mewcode.tools import (
+    PermissionTargetKind,
     ToolCallRequest,
     ToolExecution,
     ToolRegistry,
     ToolResult,
     ToolSafety,
+    ToolPermissionSpec,
+    ValidatedToolCall,
     truncate_text,
 )
 from mewcode.tools import create_builtin_registry
@@ -19,6 +22,7 @@ class EchoTool:
     name = "echo"
     description = "Echo text."
     safety = ToolSafety.READ_ONLY
+    permission_spec = ToolPermissionSpec("text", PermissionTargetKind.COMMAND)
     parameters_schema = {
         "type": "object",
         "properties": {"text": {"type": "string"}},
@@ -33,6 +37,9 @@ class RaisingTool:
     name = "raising"
     description = "Raise."
     safety = ToolSafety.SIDE_EFFECT
+    permission_spec = ToolPermissionSpec(
+        "value", PermissionTargetKind.COMMAND, default="raising"
+    )
     parameters_schema = {"type": "object", "properties": {}, "required": []}
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
@@ -58,6 +65,24 @@ def test_registry_executes_tool() -> None:
         )
     ))
 
+    assert result.ok is True
+    assert result.content == "hello"
+
+
+def test_registry_validates_then_executes_tool() -> None:
+    registry = ToolRegistry([EchoTool()])
+    request = ToolCallRequest(
+        id="call_1",
+        name="echo",
+        arguments={"text": "hello"},
+        raw_arguments='{"text":"hello"}',
+    )
+
+    validated = registry.validate_call(request)
+
+    assert isinstance(validated, ValidatedToolCall)
+    assert validated.request is request
+    result = asyncio.run(registry.execute_validated(validated))
     assert result.ok is True
     assert result.content == "hello"
 
@@ -141,6 +166,24 @@ def test_builtin_registry_contains_six_core_tools(tmp_path) -> None:
     ]
     for name in ["read_file", "write_file", "edit_file", "run_command", "find_files", "search_code"]:
         assert registry.get(name) is not None
+
+
+def test_builtin_registry_declares_permission_targets(tmp_path) -> None:
+    registry = create_builtin_registry(Workspace(tmp_path))
+
+    specs = {tool.name: tool.permission_spec for tool in registry.list()}
+    assert specs["run_command"] == ToolPermissionSpec(
+        "command", PermissionTargetKind.COMMAND
+    )
+    assert specs["read_file"] == ToolPermissionSpec("path", PermissionTargetKind.PATH)
+    assert specs["write_file"] == ToolPermissionSpec("path", PermissionTargetKind.PATH)
+    assert specs["edit_file"] == ToolPermissionSpec("path", PermissionTargetKind.PATH)
+    assert specs["find_files"] == ToolPermissionSpec(
+        "pattern", PermissionTargetKind.PATH_GLOB
+    )
+    assert specs["search_code"] == ToolPermissionSpec(
+        "path", PermissionTargetKind.PATH, default="."
+    )
 
 
 def test_builtin_registry_exposes_all_tool_objects_for_providers(tmp_path) -> None:

@@ -35,6 +35,19 @@ class ToolSafety(StrEnum):
     SIDE_EFFECT = "side_effect"
 
 
+class PermissionTargetKind(StrEnum):
+    COMMAND = "command"
+    PATH = "path"
+    PATH_GLOB = "path_glob"
+
+
+@dataclass(frozen=True)
+class ToolPermissionSpec:
+    argument: str
+    kind: PermissionTargetKind
+    default: str | None = None
+
+
 @dataclass(frozen=True)
 class ToolExecution:
     index: int
@@ -47,9 +60,16 @@ class Tool(Protocol):
     description: str
     parameters_schema: ToolParameterSchema
     safety: ToolSafety
+    permission_spec: ToolPermissionSpec
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         ...
+
+
+@dataclass(frozen=True)
+class ValidatedToolCall:
+    request: ToolCallRequest
+    tool: Tool
 
 
 def truncate_text(
@@ -106,7 +126,7 @@ class ToolRegistry:
     def select(self, safety: set[ToolSafety]) -> ToolRegistry:
         return ToolRegistry(tool for tool in self.list() if tool.safety in safety)
 
-    async def execute(self, request: ToolCallRequest) -> ToolResult:
+    def validate_call(self, request: ToolCallRequest) -> ValidatedToolCall | ToolResult:
         tool = self.get(request.name)
         if tool is None:
             return ToolResult(
@@ -130,13 +150,22 @@ class ToolRegistry:
                 },
             )
 
+        return ValidatedToolCall(request=request, tool=tool)
+
+    async def execute_validated(self, call: ValidatedToolCall) -> ToolResult:
         try:
-            return await tool.execute(request.arguments)
+            return await call.tool.execute(call.request.arguments)
         except Exception as exc:
             return ToolResult(
                 ok=False,
-                tool_name=tool.name,
+                tool_name=call.tool.name,
                 content="",
                 error=f"Tool raised an unexpected error: {exc}",
-                metadata={"tool_call_id": request.id},
+                metadata={"tool_call_id": call.request.id},
             )
+
+    async def execute(self, request: ToolCallRequest) -> ToolResult:
+        validated = self.validate_call(request)
+        if isinstance(validated, ToolResult):
+            return validated
+        return await self.execute_validated(validated)

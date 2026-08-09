@@ -63,6 +63,44 @@ def test_run_command_blocks_dangerous_command(tmp_path: Path) -> None:
     assert result.metadata["blocked"] is True
 
 
+@pytest.mark.parametrize(
+    "command",
+    [
+        "RM -RF /",
+        "del /s /q C:\\",
+        "format C:",
+        "shutdown /s /t 0",
+        "reboot",
+        "chmod -R 777 /",
+        "chown -R root /",
+        "mkfs.ext4 /dev/sda1",
+        "diskpart",
+        "dd if=/dev/zero of=/dev/sda",
+        "Remove-Item C:\\ -Recurse -Force",
+    ],
+)
+def test_run_command_blocks_dangerous_command_variants(
+    tmp_path: Path, command: str
+) -> None:
+    result = run_tool(RunCommandTool(Workspace(tmp_path)), {"command": command})
+
+    assert result.ok is False
+    assert result.metadata["blocked"] is True
+    assert result.metadata["category"]
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["rm -rf build", "echo shutdown plan", "git format-patch -1"],
+)
+def test_run_command_does_not_block_safe_adjacent_text(
+    tmp_path: Path, command: str
+) -> None:
+    from mewcode.tools import check_dangerous_command
+
+    assert check_dangerous_command(command) is None
+
+
 def test_run_command_rejects_invalid_timeout(tmp_path: Path) -> None:
     result = run_tool(RunCommandTool(Workspace(tmp_path)),
         {"command": "echo hi", "timeout_seconds": 0}

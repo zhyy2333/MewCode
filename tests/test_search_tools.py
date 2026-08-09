@@ -51,6 +51,13 @@ def test_find_files_truncates_output(tmp_path: Path) -> None:
     assert result.metadata["truncated"] is True
 
 
+def test_find_files_rejects_parent_traversal(tmp_path: Path) -> None:
+    result = run_tool(FindFilesTool(Workspace(tmp_path)), {"pattern": "../*.txt"})
+
+    assert result.ok is False
+    assert "outside" in (result.error or "")
+
+
 def test_search_code_returns_file_line_and_snippet(tmp_path: Path) -> None:
     path = tmp_path / "src.py"
     path.write_text("first\nneedle here\n", encoding="utf-8")

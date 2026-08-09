@@ -86,3 +86,34 @@ def test_rejects_symlink_escape(tmp_path: Path) -> None:
 
     with pytest.raises(WorkspaceError, match="outside"):
         workspace.resolve_path("link.txt")
+
+
+def test_normalize_glob_returns_portable_relative_pattern(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path)
+
+    assert workspace.normalize_glob("./src/**/*.py") == "src/**/*.py"
+
+
+@pytest.mark.parametrize("pattern", ["../*.py", "src/../../*.py"])
+def test_normalize_glob_rejects_parent_traversal(
+    tmp_path: Path, pattern: str
+) -> None:
+    workspace = Workspace(tmp_path)
+
+    with pytest.raises(WorkspaceError, match="outside"):
+        workspace.normalize_glob(pattern)
+
+
+def test_normalize_glob_rejects_absolute_pattern(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path)
+    absolute = (tmp_path / "*.py").as_posix()
+
+    with pytest.raises(WorkspaceError, match="outside"):
+        workspace.normalize_glob(absolute)
+
+
+def test_normalize_glob_rejects_windows_absolute_pattern(tmp_path: Path) -> None:
+    workspace = Workspace(tmp_path)
+
+    with pytest.raises(WorkspaceError, match="outside"):
+        workspace.normalize_glob("C:/Windows/*.dll")

@@ -5,7 +5,14 @@ from pathlib import Path
 import threading
 from typing import Any
 
-from .base import DEFAULT_TOOL_CONTENT_LIMIT, ToolResult, ToolSafety, truncate_text
+from .base import (
+    DEFAULT_TOOL_CONTENT_LIMIT,
+    PermissionTargetKind,
+    ToolPermissionSpec,
+    ToolResult,
+    ToolSafety,
+    truncate_text,
+)
 from .workspace import Workspace, WorkspaceError
 
 SKIP_DIRS = {".git", ".pytest_cache", "__pycache__"}
@@ -16,6 +23,7 @@ class FindFilesTool:
     name = "find_files"
     description = "Find files inside the workspace using a glob pattern. Prefer this dedicated tool over a general command for file discovery."
     safety = ToolSafety.READ_ONLY
+    permission_spec = ToolPermissionSpec("pattern", PermissionTargetKind.PATH_GLOB)
     parameters_schema = {
         "type": "object",
         "properties": {"pattern": {"type": "string"}},
@@ -34,15 +42,12 @@ class FindFilesTool:
     def _execute_sync(
         self, arguments: dict[str, Any], stop_requested: threading.Event
     ) -> ToolResult:
-        pattern = arguments["pattern"]
-        if not pattern.strip():
-            return ToolResult(ok=False, tool_name=self.name, content="", error="pattern must not be empty.")
-
         try:
+            pattern = self._workspace.normalize_glob(arguments["pattern"])
             matches = sorted(
                 self._workspace.relative_path(path)
                 for path in self._workspace.root.glob(pattern)
-                if _keep_path(path, self._workspace.root, stop_requested)
+                if _keep_path(path, self._workspace, stop_requested)
             )
             content, truncated = truncate_text("\n".join(matches), self._content_limit)
             return ToolResult(
@@ -59,6 +64,9 @@ class SearchCodeTool:
     name = "search_code"
     description = "Search UTF-8 text files inside the workspace for a query string. Prefer this dedicated tool over a general command for code search."
     safety = ToolSafety.READ_ONLY
+    permission_spec = ToolPermissionSpec(
+        "path", PermissionTargetKind.PATH, default="."
+    )
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -102,7 +110,7 @@ class SearchCodeTool:
 
             results: list[str] = []
             total_matches = 0
-            for file_path in _iter_files(search_root, self._workspace.root, stop_requested):
+            for file_path in _iter_files(search_root, self._workspace, stop_requested):
                 _raise_if_cancelled(stop_requested)
                 try:
                     lines = file_path.read_text(encoding="utf-8").splitlines()
@@ -136,25 +144,28 @@ class SearchCodeTool:
 
 
 def _iter_files(
-    root: Path, workspace_root: Path, stop_requested: threading.Event
+    root: Path, workspace: Workspace, stop_requested: threading.Event
 ):
     _raise_if_cancelled(stop_requested)
+    workspace.validate_match(root)
     if root.is_file():
-        if not _is_skipped(root, workspace_root):
+        if not _is_skipped(root, workspace.root):
             yield root
         return
 
     for path in root.rglob("*"):
         _raise_if_cancelled(stop_requested)
-        if path.is_file() and not _is_skipped(path, workspace_root):
+        workspace.validate_match(path)
+        if path.is_file() and not _is_skipped(path, workspace.root):
             yield path
 
 
 def _keep_path(
-    path: Path, workspace_root: Path, stop_requested: threading.Event
+    path: Path, workspace: Workspace, stop_requested: threading.Event
 ) -> bool:
     _raise_if_cancelled(stop_requested)
-    return path.is_file() and not _is_skipped(path, workspace_root)
+    workspace.validate_match(path)
+    return path.is_file() and not _is_skipped(path, workspace.root)
 
 
 def _is_skipped(path: Path, workspace_root: Path) -> bool:

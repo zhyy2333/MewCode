@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
+import os
+from pathlib import Path, PurePosixPath, PureWindowsPath
+
+
+GLOB_META = "*?["
 
 
 class WorkspaceError(Exception):
@@ -33,6 +37,37 @@ class Workspace:
         if not _is_relative_to(resolved, self.root):
             raise WorkspaceError(f"Path is outside the workspace: {path}")
         return resolved.relative_to(self.root).as_posix()
+
+    def normalize_glob(self, pattern: str) -> str:
+        if not isinstance(pattern, str) or not pattern.strip():
+            raise WorkspaceError("Pattern must be a non-empty string.")
+
+        normalized = pattern.strip()
+        if os.name == "nt":
+            normalized = normalized.replace("\\", "/")
+        if PurePosixPath(normalized).is_absolute() or PureWindowsPath(
+            normalized
+        ).is_absolute():
+            raise WorkspaceError(f"Glob pattern is outside the workspace: {pattern}")
+
+        parts = normalized.split("/")
+        if any(part == ".." for part in parts):
+            raise WorkspaceError(f"Glob pattern is outside the workspace: {pattern}")
+        clean_parts = [part for part in parts if part not in {"", "."}]
+        if not clean_parts:
+            raise WorkspaceError("Pattern must be a non-empty string.")
+
+        fixed_parts: list[str] = []
+        for part in clean_parts:
+            if any(character in part for character in GLOB_META):
+                break
+            fixed_parts.append(part)
+        fixed_prefix = "/".join(fixed_parts) if fixed_parts else "."
+        self.resolve_path(fixed_prefix)
+        return "/".join(clean_parts)
+
+    def validate_match(self, path: Path) -> str:
+        return self.relative_path(path)
 
 
 def _is_relative_to(path: Path, root: Path) -> bool:

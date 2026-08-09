@@ -2,35 +2,30 @@ from __future__ import annotations
 
 import asyncio
 import os
-import re
 import signal
 import subprocess
 from typing import Any
 
-from .base import DEFAULT_TOOL_CONTENT_LIMIT, ToolResult, ToolSafety, truncate_text
+from .base import (
+    DEFAULT_TOOL_CONTENT_LIMIT,
+    PermissionTargetKind,
+    ToolPermissionSpec,
+    ToolResult,
+    ToolSafety,
+    truncate_text,
+)
+from .safety import check_dangerous_command
 from .workspace import Workspace
 
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
 MAX_COMMAND_TIMEOUT_SECONDS = 120
 PROCESS_STOP_TIMEOUT_SECONDS = 1.0
 
-DANGEROUS_COMMAND_PATTERNS = [
-    r"\brm\s+(-[^\s]*[rf][^\s]*|-r|-f)\s+[/\\]?",
-    r"\bdel\s+/(s|q)\b",
-    r"\bformat\b",
-    r"\bshutdown\b",
-    r"\breboot\b",
-    r"\bchmod\s+(-[^\s]*R[^\s]*|777)\b",
-    r"\bchown\s+-R\b",
-    r"\bmkfs\b",
-    r"\bdiskpart\b",
-]
-
-
 class RunCommandTool:
     name = "run_command"
     description = "Run a command in the current workspace with timeout and safety checks. Use only when the dedicated read, find, search, write, or edit tools cannot complete the operation."
     safety = ToolSafety.SIDE_EFFECT
+    permission_spec = ToolPermissionSpec("command", PermissionTargetKind.COMMAND)
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -69,13 +64,17 @@ class RunCommandTool:
                 "",
                 f"timeout_seconds must not exceed {self._max_timeout_seconds}.",
             )
-        if _is_dangerous(command):
+        dangerous = check_dangerous_command(command)
+        if dangerous is not None:
             return ToolResult(
                 False,
                 self.name,
                 "",
                 "Command rejected by safety policy.",
-                {"blocked": True},
+                {
+                    "blocked": True,
+                    "category": dangerous.category,
+                },
             )
 
         try:
@@ -198,11 +197,6 @@ def _close_process_transport(process: asyncio.subprocess.Process) -> None:
     transport = getattr(process, "_transport", None)
     if transport is not None:
         transport.close()
-
-
-def _is_dangerous(command: str) -> bool:
-    normalized = command.lower()
-    return any(re.search(pattern, normalized) for pattern in DANGEROUS_COMMAND_PATTERNS)
 
 
 def _decode_output(value: bytes | None) -> str:

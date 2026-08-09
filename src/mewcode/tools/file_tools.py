@@ -5,6 +5,8 @@ from typing import Any
 
 from .base import (
     DEFAULT_TOOL_CONTENT_LIMIT,
+    PermissionTargetKind,
+    ToolPermissionSpec,
     ToolResult,
     ToolSafety,
     truncate_text,
@@ -16,6 +18,7 @@ class ReadFileTool:
     name = "read_file"
     description = "Read a UTF-8 text file inside the current workspace. Use this before editing or overwriting an existing file."
     safety = ToolSafety.READ_ONLY
+    permission_spec = ToolPermissionSpec("path", PermissionTargetKind.PATH)
     parameters_schema = {
         "type": "object",
         "properties": {"path": {"type": "string"}},
@@ -53,6 +56,7 @@ class WriteFileTool:
     name = "write_file"
     description = "Write UTF-8 text to a file inside the current workspace. Read an existing target first; a new file does not require a pre-read."
     safety = ToolSafety.SIDE_EFFECT
+    permission_spec = ToolPermissionSpec("path", PermissionTargetKind.PATH)
     parameters_schema = {
         "type": "object",
         "properties": {
@@ -88,6 +92,7 @@ class EditFileTool:
     name = "edit_file"
     description = "Replace exactly one occurrence of text in a UTF-8 file inside the workspace. Read the relevant existing content first, and prefer this tool over a general command."
     safety = ToolSafety.SIDE_EFFECT
+    permission_spec = ToolPermissionSpec("path", PermissionTargetKind.PATH)
     parameters_schema = {
         "type": "object",
         "properties": {

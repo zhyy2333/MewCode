@@ -14,11 +14,13 @@ from mewcode.providers import (
     ProviderToolCall,
 )
 from mewcode.tools import (
+    PermissionTargetKind,
     ToolCallRequest,
     ToolExecution,
     ToolRegistry,
     ToolResult,
     ToolSafety,
+    ToolPermissionSpec,
 )
 
 T = TypeVar("T")
@@ -104,6 +106,9 @@ class ControlledTool:
         "properties": {"value": {"type": "string"}},
         "required": [],
     }
+    permission_spec = ToolPermissionSpec(
+        "value", PermissionTargetKind.COMMAND, default="test"
+    )
 
     def __init__(
         self,
