@@ -4,6 +4,7 @@ from .config import (
     PermissionConfigWriter,
     PermissionPaths,
 )
+from .controller import PermissionController
 from .models import (
     PermissionChallenge,
     PermissionChoice,
@@ -27,6 +28,7 @@ from .rules import (
     parse_permission_rule,
     rule_matches,
 )
+from .targets import PermissionTargetBuilder
 
 __all__ = [
     "LocalRuleWriter",
@@ -35,6 +37,7 @@ __all__ = [
     "PermissionConfigError",
     "PermissionConfigLoader",
     "PermissionConfigWriter",
+    "PermissionController",
     "PermissionDecision",
     "PermissionEffect",
     "PermissionMatch",
@@ -48,6 +51,7 @@ __all__ = [
     "PermissionRuleStore",
     "PermissionSource",
     "PermissionTarget",
+    "PermissionTargetBuilder",
     "RuleScope",
     "escape_exact_pattern",
     "parse_permission_rule",
