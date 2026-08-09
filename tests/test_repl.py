@@ -7,6 +7,7 @@ import pytest
 
 from mewcode import cli, repl as repl_module
 from mewcode.agent import (
+    AgentPermissionDecision,
     AgentProgress,
     AgentStopped,
     AgentTextDelta,
@@ -16,6 +17,14 @@ from mewcode.agent import (
     StopReason,
 )
 from mewcode.conversation import ConversationError
+from mewcode.permissions import (
+    PermissionChallenge,
+    PermissionChoice,
+    PermissionConfigError,
+    PermissionMode,
+    PermissionOutcome,
+    PermissionSource,
+)
 from mewcode.providers import ConfigError, ProviderError, ProviderProfile, TokenUsage
 from mewcode.repl import Repl
 from mewcode.tools import ToolCallRequest, ToolExecution, ToolResult
@@ -415,11 +424,98 @@ def test_render_error_cancels_current_run_and_continues(monkeypatch) -> None:
     assert "recovered" in stdout.getvalue()
 
 
+class FakePermissionController:
+    def __init__(self, mode: PermissionMode = PermissionMode.DEFAULT) -> None:
+        self.mode = mode
+
+    def set_mode(self, mode: PermissionMode) -> None:
+        self.mode = mode
+
+
+def test_permission_decision_render_is_indented_and_desensitized() -> None:
+    event = AgentPermissionDecision(
+        "run",
+        1,
+        "call",
+        "write_file",
+        "src/a.py",
+        PermissionOutcome.DENY,
+        PermissionSource.PROJECT_RULE,
+        "A permission rule denied this tool call.",
+    )
+    output = render_events([event])
+    assert "  permission: write_file(src/a.py) deny [project_rule]" in output
+    assert "file contents are secret" not in output
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("d", PermissionChoice.DENY),
+        ("once", PermissionChoice.ONCE),
+        ("s", PermissionChoice.SESSION),
+        ("permanent", PermissionChoice.PERMANENT),
+    ],
+)
+def test_permission_confirmation_choices(raw: str, expected: PermissionChoice) -> None:
+    async def scenario() -> None:
+        challenge = PermissionChallenge("p", "c", "read_file", "src/a.py")
+        repl = Repl(
+            FakeConversation(),
+            stdout=io.StringIO(),
+            stderr=io.StringIO(),
+            input_func=input_sequence(["invalid", raw]),
+        )
+        event = repl_module.AgentPermissionRequest("run", 1, challenge)
+        repl._handle_permission_request(event)
+        assert await challenge.wait() == expected
+
+    asyncio.run(scenario())
+
+
+def test_permission_confirmation_eof_denies() -> None:
+    async def scenario() -> None:
+        challenge = PermissionChallenge("p", "c", "read_file", "src/a.py")
+
+        def eof(prompt: str) -> str:
+            raise EOFError
+
+        repl = Repl(FakeConversation(), stdout=io.StringIO(), input_func=eof)
+        repl._handle_permission_request(
+            repl_module.AgentPermissionRequest("run", 1, challenge)
+        )
+        assert await challenge.wait() == PermissionChoice.DENY
+
+    asyncio.run(scenario())
+
+
+def test_permissions_command_queries_switches_and_rejects_invalid() -> None:
+    controller = FakePermissionController()
+    conversation = FakeConversation()
+    stdout = io.StringIO()
+    stderr = io.StringIO()
+    result = Repl(
+        conversation,
+        stdout=stdout,
+        stderr=stderr,
+        input_func=input_sequence(
+            ["/permissions", "/permissions strict", "/permissions unsafe", "/exit"]
+        ),
+        permission_controller=controller,
+    ).run()
+    assert result == 0
+    assert controller.mode == PermissionMode.STRICT
+    assert "permission mode: default" in stdout.getvalue()
+    assert "permission mode: strict" in stdout.getvalue()
+    assert "Usage: /permissions [strict|default|allow]" in stderr.getvalue()
+    assert conversation.routes == []
+
+
 def test_main_config_error_returns_one(monkeypatch) -> None:
     monkeypatch.setattr(cli, "load_active_profile", lambda: (_ for _ in ()).throw(ConfigError("bad config")))
     stderr = io.StringIO()
     monkeypatch.setattr(cli.sys, "stderr", stderr)
-    assert cli.main() == 1
+    assert cli.main([]) == 1
     assert "Error: bad config" in stderr.getvalue()
 
 
@@ -429,7 +525,7 @@ def test_main_provider_startup_error_returns_one(monkeypatch) -> None:
     monkeypatch.setattr(cli, "create_provider", lambda loaded: (_ for _ in ()).throw(ProviderError("provider missing")))
     stderr = io.StringIO()
     monkeypatch.setattr(cli.sys, "stderr", stderr)
-    assert cli.main() == 1
+    assert cli.main([]) == 1
     assert "Error: provider missing" in stderr.getvalue()
 
 
@@ -437,7 +533,7 @@ def test_main_keyboard_interrupt_returns_130(monkeypatch) -> None:
     monkeypatch.setattr(cli, "load_active_profile", lambda: (_ for _ in ()).throw(KeyboardInterrupt()))
     stderr = io.StringIO()
     monkeypatch.setattr(cli.sys, "stderr", stderr)
-    assert cli.main() == 130
+    assert cli.main([]) == 130
 
 
 def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> None:
@@ -448,7 +544,8 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
         pass
 
     class FakeScheduler:
-        pass
+        def __init__(self, controller):
+            created["controller"] = controller
 
     class FakeRunner:
         def __init__(self, provider, scheduler, *, prompt_builder):
@@ -462,8 +559,9 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
             created["tools"] = tools
 
     class FakeRepl:
-        def __init__(self, session):
+        def __init__(self, session, *, permission_controller):
             created["session"] = session
+            assert permission_controller is created["controller"]
 
         def run(self) -> int:
             return 7
@@ -475,11 +573,30 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
     monkeypatch.setattr(cli, "Conversation", FakeSession)
     monkeypatch.setattr(cli, "Repl", FakeRepl)
 
-    assert cli.main() == 7
+    assert cli.main(["--permission-mode", "strict"]) == 7
     assert isinstance(created["provider"], FakeProvider)
     assert isinstance(created["scheduler"], FakeScheduler)
     assert created["prompt_builder"] is not None
     assert created["tools"] is not None
+    assert created["controller"].mode == PermissionMode.STRICT
+
+
+def test_main_permission_config_error_returns_one(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli.PermissionConfigLoader,
+        "load",
+        lambda *args: (_ for _ in ()).throw(PermissionConfigError("bad permissions")),
+    )
+    stderr = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+    assert cli.main([]) == 1
+    assert "bad permissions" in stderr.getvalue()
+
+
+def test_cli_rejects_invalid_permission_mode() -> None:
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(["--permission-mode", "unsafe"])
+    assert exc_info.value.code == 2
 
 
 def test_token_output_shows_cache_tokens_and_unknowns() -> None:

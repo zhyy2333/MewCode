@@ -1,0 +1,15 @@
+rules:
+  - rule: "run_command(git status)"
+    result: allow
+
+  - rule: "run_command(git *)"
+    result: allow
+
+  - rule: "run_command(git push *)"
+    result: deny
+
+  - rule: "read_file(src/**)"
+    result: allow
+
+  - rule: "write_file(src/generated/**)"
+    result: deny

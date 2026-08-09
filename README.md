@@ -43,13 +43,21 @@ profiles:
 mewcode
 ```
 
+可用启动参数切换权限模式：
+
+```powershell
+mewcode --permission-mode strict
+mewcode --permission-mode default
+mewcode --permission-mode allow
+```
+
 也可以使用：
 
 ```powershell
 python -m mewcode
 ```
 
-进入 REPL 后，输入 `/exit` 或 `/quit` 退出。对话历史只保存在当前进程内，程序退出后不会保存。
+进入 REPL 后，输入 `/exit` 或 `/quit` 退出。使用 `/permissions` 查询当前权限模式，或用 `/permissions strict|default|allow` 在会话中切换。对话历史只保存在当前进程内，程序退出后不会保存。
 
 ## Agent Loop
 
@@ -97,7 +105,39 @@ agent: completed
 
 `/plan <任务>` 只向模型开放 `read_file`、`find_files` 和 `search_code`，并保存最近一次成功生成的计划。`/do` 恢复全部工具执行该计划；成功后清除计划，失败或取消时保留计划以便重试。
 
-当前阶段不包含权限系统、上下文压缩、交互式工具确认和自动化质量评估。
+当前阶段不包含网络请求限制、资源配额、审计日志、上下文压缩和自动化质量评估。
+
+## 权限系统
+
+每个有效工具调用在执行前都会经过危险命令黑名单、内置文件工具路径沙箱、分层规则、权限模式与人工确认。黑名单和路径沙箱是不可绕过的安全上限；即使使用 `allow` 模式或显式 allow 规则，危险命令和越界文件路径仍会被拒绝。权限拒绝会作为工具失败返回模型，Agent Loop 可以改用更安全的策略继续工作。
+
+三档模式的含义如下：
+
+- `strict`：deny 直接拒绝；本会话已确认的精确 allow 自动执行；持久 allow 与未匹配调用仍需首次确认。
+- `default`：采用明确的 allow/deny，未匹配调用需要确认。
+- `allow`：deny 仍然生效，其余调用自动执行。
+
+规则按会话、项目本地、项目共享、用户全局的顺序解析。持久化文件位置为：
+
+- 用户全局：`~/.mewcode/permissions.yaml`
+- 项目共享：`<workspace>/.mewcode/permissions.yaml`
+- 项目本地：`<workspace>/.mewcode/permissions.local.yaml`
+
+三个 YAML 文件格式相同：
+
+```yaml
+rules:
+  - rule: "run_command(git *)"
+    result: allow
+  - rule: "write_file(src/generated/**)"
+    result: deny
+```
+
+规则使用实际工具名和主要参数，支持精确与 glob 匹配。同层中精确规则优先于 glob，固定文本更多者优先，具体度并列时 deny 获胜。命令 glob 的 `*` 可匹配空格；路径 glob 的 `*` 不跨 `/`，`**` 可递归跨目录。用 `\\`、`\*`、`\?`、`\[`、`\]` 表示字面量反斜杠或 glob 字符。
+
+需要确认时可选择拒绝、仅本次、本会话或永久。永久放行只把当前调用的精确 allow 写入项目本地 `permissions.local.yaml`；该文件默认不提交，项目共享 `permissions.yaml` 可以提交。
+
+路径沙箱仅约束 MewCode 内置的读取、写入、编辑、查找和搜索工具。`run_command` 子进程从工作区启动，但本阶段没有操作系统级文件隔离；它仍受危险命令黑名单、权限规则、模式与人工确认保护。
 
 ## 工具系统
 
