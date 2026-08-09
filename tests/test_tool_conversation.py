@@ -19,11 +19,21 @@ from mewcode.tools import (
     Workspace,
 )
 
-from tests.fakes import ControlledTool, ScriptedAsyncProvider, collect_async, tool_call
+from tests.fakes import (
+    AllowAllPermissionController,
+    ControlledTool,
+    ScriptedAsyncProvider,
+    collect_async,
+    tool_call,
+)
 
 
 def make_conversation(provider, tools: ToolRegistry) -> Conversation:
-    runner = AgentRunner(provider, ToolScheduler(), id_factory=lambda: "run")
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run",
+    )
     return Conversation(runner, tools)
 
 

@@ -18,6 +18,7 @@ from mewcode.providers import (
 from mewcode.tools import ToolRegistry, ToolSafety, Workspace, create_builtin_registry
 
 from tests.fakes import (
+    AllowAllPermissionController,
     ControlledTool,
     ScriptedAsyncProvider,
     collect_async,
@@ -45,7 +46,11 @@ def registry() -> ToolRegistry:
 
 def conversation(provider) -> Conversation:
     return Conversation(
-        AgentRunner(provider, ToolScheduler(), id_factory=lambda: "run"),
+        AgentRunner(
+            provider,
+            ToolScheduler(AllowAllPermissionController()),
+            id_factory=lambda: "run",
+        ),
         registry(),
     )
 
@@ -187,7 +192,11 @@ def test_end_to_end_plan_then_do_reads_writes_verifies_and_clears(tmp_path) -> N
     )
     tools = create_builtin_registry(Workspace(tmp_path))
     session = Conversation(
-        AgentRunner(provider, ToolScheduler(), id_factory=lambda: "run"), tools
+        AgentRunner(
+            provider,
+            ToolScheduler(AllowAllPermissionController()),
+            id_factory=lambda: "run",
+        ), tools
     )
 
     plan_events = asyncio.run(collect_async(session.plan("produce the output")))
@@ -224,7 +233,11 @@ def test_plan_executes_sixth_investigation_then_finalizes_once() -> None:
     )
     tools = registry()
     session = Conversation(
-        AgentRunner(provider, ToolScheduler(), id_factory=lambda: "run"), tools
+        AgentRunner(
+            provider,
+            ToolScheduler(AllowAllPermissionController()),
+            id_factory=lambda: "run",
+        ), tools
     )
 
     events = asyncio.run(collect_async(session.plan("build it")))
@@ -309,7 +322,11 @@ def test_finalization_tool_call_is_not_executed() -> None:
     )
     tools = registry()
     session = Conversation(
-        AgentRunner(provider, ToolScheduler(), id_factory=lambda: "run"), tools
+        AgentRunner(
+            provider,
+            ToolScheduler(AllowAllPermissionController()),
+            id_factory=lambda: "run",
+        ), tools
     )
 
     events = asyncio.run(collect_async(session.plan("build it")))

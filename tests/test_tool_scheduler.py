@@ -6,7 +6,12 @@ from typing import Any
 from mewcode.agent import AgentProgress, AgentToolResult, ToolScheduler
 from mewcode.tools import ToolRegistry, ToolResult, ToolSafety
 
-from tests.fakes import ControlledTool, collect_async, tool_call
+from tests.fakes import (
+    AllowAllPermissionController,
+    ControlledTool,
+    collect_async,
+    tool_call,
+)
 
 
 class Activity:
@@ -49,7 +54,7 @@ def test_partition_mixed_batches_via_progress() -> None:
             ControlledTool("read-c"),
         ]
     )
-    schedule = ToolScheduler().schedule(
+    schedule = ToolScheduler(AllowAllPermissionController()).schedule(
         "run", 1,
         [
             tool_call("1", "read-a"),
@@ -75,7 +80,9 @@ def test_read_concurrency_is_bounded_and_results_stream_by_completion() -> None:
         ActivityTool(f"read-{index}", activity, ToolSafety.READ_ONLY, 0.01 * (6 - index))
         for index in range(6)
     ]
-    schedule = ToolScheduler(max_read_concurrency=4).schedule(
+    schedule = ToolScheduler(
+        AllowAllPermissionController(), max_read_concurrency=4
+    ).schedule(
         "run", 1,
         [tool_call(str(index), tool.name) for index, tool in enumerate(tools)],
         ToolRegistry(tools),
@@ -101,7 +108,7 @@ def test_side_effect_is_an_exclusive_barrier_and_unknown_is_structured() -> None
         ActivityTool("write", activity, ToolSafety.SIDE_EFFECT, 0.01),
         ActivityTool("read-b", activity, ToolSafety.READ_ONLY, 0.01),
     ]
-    schedule = ToolScheduler().schedule(
+    schedule = ToolScheduler(AllowAllPermissionController()).schedule(
         "run", 1,
         [
             tool_call("1", "read-a"),
@@ -130,7 +137,9 @@ def test_cancel_marks_active_and_unstarted_calls() -> None:
         release = asyncio.Event()
         first = ControlledTool("first", started=started, release=release)
         second = ControlledTool("second", ToolSafety.SIDE_EFFECT)
-        schedule = ToolScheduler(max_read_concurrency=1).schedule(
+        schedule = ToolScheduler(
+            AllowAllPermissionController(), max_read_concurrency=1
+        ).schedule(
             "run", 1,
             [tool_call("1", "first"), tool_call("2", "second")],
             ToolRegistry([first, second]),
@@ -159,7 +168,7 @@ def test_cancel_interrupts_active_side_effect_and_skips_following_call() -> None
             release=release,
         )
         following = ControlledTool("read")
-        schedule = ToolScheduler().schedule(
+        schedule = ToolScheduler(AllowAllPermissionController()).schedule(
             "run",
             1,
             [tool_call("1", "write"), tool_call("2", "read")],

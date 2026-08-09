@@ -35,13 +35,19 @@ from mewcode.providers import (
 )
 from mewcode.tools import ToolExecution, ToolRegistry, ToolResult, ToolSafety
 
-from tests.fakes import ControlledTool, ScriptedAsyncProvider, collect_async, tool_call
+from tests.fakes import (
+    AllowAllPermissionController,
+    ControlledTool,
+    ScriptedAsyncProvider,
+    collect_async,
+    tool_call,
+)
 
 
 def _runner(provider, *, max_iterations: int = 20, unknown_limit: int = 3):
     return AgentRunner(
         provider,
-        ToolScheduler(),
+        ToolScheduler(AllowAllPermissionController()),
         AgentRunConfig(max_iterations, unknown_limit),
         id_factory=lambda: "run-1",
     )

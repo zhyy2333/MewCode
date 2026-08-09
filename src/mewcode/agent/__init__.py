@@ -1,6 +1,8 @@
 from .events import (
     AgentEvent,
     AgentMode,
+    AgentPermissionDecision,
+    AgentPermissionRequest,
     AgentProgress,
     AgentStopped,
     AgentTextDelta,
@@ -22,6 +24,8 @@ from .runner import (
 __all__ = [
     "AgentEvent",
     "AgentMode",
+    "AgentPermissionDecision",
+    "AgentPermissionRequest",
     "AgentProgress",
     "AgentRun",
     "AgentRunConfig",

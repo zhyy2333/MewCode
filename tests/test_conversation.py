@@ -11,11 +11,15 @@ from mewcode.providers import ChatMessage, ModelRequest, ModelResponse, Provider
 from mewcode.prompting import PromptAdditions
 from mewcode.tools import ToolExecution, ToolRegistry
 
-from tests.fakes import ScriptedAsyncProvider, collect_async
+from tests.fakes import AllowAllPermissionController, ScriptedAsyncProvider, collect_async
 
 
 def make_conversation(provider, tools: ToolRegistry | None = None) -> Conversation:
-    runner = AgentRunner(provider, ToolScheduler(), id_factory=lambda: "run")
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run",
+    )
     return Conversation(runner, tools or ToolRegistry([]))
 
 
@@ -108,7 +112,11 @@ def test_empty_direct_message_is_rejected() -> None:
 
 def test_prompt_additions_are_system_context_with_real_user_history() -> None:
     provider = ScriptedAsyncProvider([[ProviderTextDelta("done")]])
-    runner = AgentRunner(provider, ToolScheduler(), id_factory=lambda: "run")
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run",
+    )
     conversation = Conversation(
         runner,
         ToolRegistry([]),

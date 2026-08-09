@@ -13,6 +13,12 @@ from mewcode.providers import (
     ProviderFinishReason,
     ProviderToolCall,
 )
+from mewcode.permissions import (
+    PermissionDecision,
+    PermissionOutcome,
+    PermissionSource,
+    PermissionTarget,
+)
 from mewcode.tools import (
     PermissionTargetKind,
     ToolCallRequest,
@@ -24,6 +30,22 @@ from mewcode.tools import (
 )
 
 T = TypeVar("T")
+
+
+class AllowAllPermissionController:
+    def evaluate(self, call) -> PermissionDecision:
+        spec = call.tool.permission_spec
+        value = call.request.arguments.get(spec.argument, spec.default)
+        target = PermissionTarget(call.tool.name, str(value), spec.kind)
+        return PermissionDecision(
+            PermissionOutcome.ALLOW,
+            target,
+            PermissionSource.MODE,
+            "allowed by test controller",
+        )
+
+    async def apply_choice(self, decision, choice):
+        raise AssertionError("The allow-all test controller never asks.")
 
 
 async def collect_async(source: AsyncIterator[T]) -> list[T]:

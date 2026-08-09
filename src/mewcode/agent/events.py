@@ -5,6 +5,11 @@ from enum import StrEnum
 from typing import Literal
 
 from mewcode.providers import TokenUsage
+from mewcode.permissions import (
+    PermissionChallenge,
+    PermissionOutcome,
+    PermissionSource,
+)
 from mewcode.tools import ToolCallRequest, ToolExecution
 
 
@@ -44,6 +49,25 @@ class AgentToolResult:
     run_id: str
     iteration: int
     execution: ToolExecution
+
+
+@dataclass(frozen=True)
+class AgentPermissionRequest:
+    run_id: str
+    iteration: int
+    challenge: PermissionChallenge
+
+
+@dataclass(frozen=True)
+class AgentPermissionDecision:
+    run_id: str
+    iteration: int
+    tool_call_id: str
+    tool_name: str
+    target: str | None
+    outcome: PermissionOutcome
+    source: PermissionSource
+    reason: str
 
 
 @dataclass(frozen=True)
@@ -87,6 +111,8 @@ AgentEvent = (
     AgentTextDelta
     | AgentToolCall
     | AgentToolResult
+    | AgentPermissionRequest
+    | AgentPermissionDecision
     | AgentTokenUsage
     | AgentProgress
     | AgentStopped
