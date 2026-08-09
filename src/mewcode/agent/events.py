@@ -16,6 +16,8 @@ class AgentMode(StrEnum):
 
 class StopReason(StrEnum):
     COMPLETED = "completed"
+    OUTPUT_LIMIT = "output_limit"
+    EMPTY_RESPONSE = "empty_response"
     ITERATION_LIMIT = "iteration_limit"
     CANCELLED = "cancelled"
     UNKNOWN_TOOL_LIMIT = "unknown_tool_limit"

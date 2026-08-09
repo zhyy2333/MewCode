@@ -13,11 +13,15 @@ from .base import (
     ModelResponse,
     ProviderError,
     ProviderEvent,
+    ProviderFinished,
+    ProviderFinishReason,
+    ProviderInternalPart,
     ProviderProfile,
     ProviderTextDelta,
     ProviderToolCall,
     ProviderUsage,
     TokenUsage,
+    ThinkingMode,
 )
 
 
@@ -41,18 +45,25 @@ class OpenAIProvider:
         self,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
+        *,
+        max_output_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> AsyncIterator[ProviderEvent]:
         request: dict[str, Any] = {
             "model": self._profile.model,
             "input": self._build_input(messages),
-            "max_output_tokens": DEFAULT_MAX_TOKENS,
+            "max_output_tokens": max_output_tokens,
             "stream": True,
         }
+        if self._profile.thinking is ThinkingMode.ENABLED:
+            request["reasoning"] = {"effort": "medium"}
+        elif self._profile.thinking is ThinkingMode.DISABLED:
+            request["reasoning"] = {"effort": "none"}
         if tools:
             request["tools"] = tools
 
         stream: Any = None
-        usage_emitted = False
+        terminal_emitted = False
+        saw_tool_call = False
         try:
             parser = _OpenAIToolEventParser()
             stream = await self._client.responses.create(**request)
@@ -73,13 +84,36 @@ class OpenAIProvider:
                 }:
                     tool_event = parser.consume(event)
                     if tool_event is not None:
+                        if isinstance(tool_event, ProviderToolCall):
+                            saw_tool_call = True
                         yield tool_event
                 elif event_type == "response.completed":
                     response = _get_event_attr(event, "response") or {}
                     yield ProviderUsage(_openai_usage(_get_event_attr(response, "usage")))
-                    usage_emitted = True
-            if not usage_emitted:
-                yield ProviderUsage(TokenUsage())
+                    yield ProviderFinished(
+                        ProviderFinishReason.TOOL_CALLS
+                        if saw_tool_call
+                        else ProviderFinishReason.NATURAL
+                    )
+                    terminal_emitted = True
+                elif event_type == "response.incomplete":
+                    response = _get_event_attr(event, "response") or {}
+                    details = _get_event_attr(response, "incomplete_details") or {}
+                    reason = _get_event_attr(details, "reason")
+                    if reason != "max_output_tokens":
+                        raise ProviderError(
+                            f"OpenAI request failed: incomplete response ({reason or 'unknown'})."
+                        )
+                    yield ProviderUsage(_openai_usage(_get_event_attr(response, "usage")))
+                    yield ProviderFinished(ProviderFinishReason.OUTPUT_LIMIT)
+                    terminal_emitted = True
+                elif event_type == "response.failed":
+                    response = _get_event_attr(event, "response") or {}
+                    error = _get_event_attr(response, "error") or {}
+                    message = _get_event_attr(error, "message") or "response failed"
+                    raise ProviderError(f"OpenAI request failed: {message}")
+            if not terminal_emitted:
+                raise ProviderError("OpenAI request failed: stream ended without a terminal response.")
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -98,6 +132,7 @@ class OpenAIProvider:
             if isinstance(message.content, dict) and message.content.get("type") in {
                 "function_call",
                 "function_call_output",
+                "reasoning",
             }:
                 inputs.append(message.content)
             else:
@@ -105,7 +140,10 @@ class OpenAIProvider:
         return inputs
 
     def assistant_messages(self, response: ModelResponse) -> list[ChatMessage]:
-        messages: list[ChatMessage] = []
+        messages: list[ChatMessage] = [
+            ChatMessage(role="assistant", content=part.data)
+            for part in response.internal_parts
+        ]
         if response.text or not response.tool_calls:
             messages.append(ChatMessage(role="assistant", content=response.text))
         messages.extend(
@@ -165,7 +203,7 @@ class _OpenAIToolEventParser:
         self._calls: dict[str, dict[str, Any]] = {}
         self._completed_item_ids: set[str] = set()
 
-    def consume(self, event: Any) -> ProviderToolCall | None:
+    def consume(self, event: Any) -> ProviderToolCall | ProviderInternalPart | None:
         event_type = _get_event_attr(event, "type")
         if event_type == "response.output_item.added":
             item = _get_event_attr(event, "item") or {}
@@ -199,6 +237,8 @@ class _OpenAIToolEventParser:
 
         if event_type == "response.output_item.done":
             item = _get_event_attr(event, "item") or {}
+            if _get_event_attr(item, "type") == "reasoning":
+                return ProviderInternalPart(_plain_data(item))
             if _get_event_attr(item, "type") not in {"function_call", "tool_call"}:
                 return None
             item_id = _get_event_attr(item, "id") or _get_event_attr(item, "call_id") or ""
@@ -249,6 +289,22 @@ def _openai_usage(usage: Any) -> TokenUsage:
         output_tokens=_optional_int(_get_event_attr(usage, "output_tokens")),
         total_tokens=_optional_int(_get_event_attr(usage, "total_tokens")),
     )
+
+
+def _plain_data(value: Any) -> Any:
+    if isinstance(value, (dict, list, str, int, float, bool)) or value is None:
+        return value
+    dump = getattr(value, "model_dump", None)
+    if callable(dump):
+        return dump()
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return to_dict()
+    return {
+        key: item
+        for key, item in vars(value).items()
+        if not key.startswith("_")
+    }
 
 
 def _optional_int(value: Any) -> int | None:

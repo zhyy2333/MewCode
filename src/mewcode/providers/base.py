@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import AsyncIterator, Sequence
+from enum import StrEnum
 from typing import Any, Literal, Protocol as TypingProtocol
 
 from mewcode.tools import ToolCallRequest, ToolExecution, ToolRegistry
@@ -10,6 +11,12 @@ Protocol = Literal["anthropic", "openai"]
 ChatRole = str
 
 DEFAULT_MAX_TOKENS = 4096
+
+
+class ThinkingMode(StrEnum):
+    AUTO = "auto"
+    ENABLED = "enabled"
+    DISABLED = "disabled"
 
 
 @dataclass(frozen=True)
@@ -25,7 +32,7 @@ class RawProviderProfile:
     model: str
     base_url: str
     api_key: str
-    thinking: bool = False
+    thinking: bool | str | None = None
 
 
 @dataclass(frozen=True)
@@ -35,7 +42,7 @@ class ProviderProfile:
     model: str
     base_url: str
     api_key: str
-    thinking: bool = False
+    thinking: ThinkingMode = ThinkingMode.AUTO
 
 
 @dataclass(frozen=True)
@@ -84,6 +91,8 @@ class LLMProvider(TypingProtocol):
         self,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
+        *,
+        max_output_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> AsyncIterator[ProviderEvent]:
         ...
 
@@ -111,7 +120,29 @@ class ProviderUsage:
     usage: TokenUsage
 
 
-ProviderEvent = ProviderTextDelta | ProviderToolCall | ProviderUsage
+class ProviderFinishReason(StrEnum):
+    NATURAL = "natural"
+    TOOL_CALLS = "tool_calls"
+    OUTPUT_LIMIT = "output_limit"
+
+
+@dataclass(frozen=True)
+class ProviderFinished:
+    reason: ProviderFinishReason
+
+
+@dataclass(frozen=True)
+class ProviderInternalPart:
+    data: Any = field(repr=False)
+
+
+ProviderEvent = (
+    ProviderTextDelta
+    | ProviderToolCall
+    | ProviderUsage
+    | ProviderFinished
+    | ProviderInternalPart
+)
 
 
 @dataclass(frozen=True)
@@ -119,6 +150,8 @@ class ModelResponse:
     text: str
     tool_calls: tuple[ToolCallRequest, ...]
     usage: TokenUsage
+    finish_reason: ProviderFinishReason
+    internal_parts: tuple[ProviderInternalPart, ...] = ()
 
 
 def _add_optional(left: int | None, right: int | None) -> int | None:

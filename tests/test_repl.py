@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import io
 
+import pytest
+
 from mewcode import cli, repl as repl_module
 from mewcode.agent import (
     AgentProgress,
@@ -65,6 +67,15 @@ def stop_event() -> AgentStopped:
     return AgentStopped("run", 1, StopReason.COMPLETED, "done", TokenUsage.zero())
 
 
+def render_events(events: list[object]) -> str:
+    renderer = repl_module._EventRenderer()
+    return "".join(
+        text
+        for event in events
+        if (text := renderer.render(event)) is not None
+    )
+
+
 def test_repl_exit_command_returns_zero() -> None:
     stdout = io.StringIO()
     repl = Repl(FakeConversation(), stdout=stdout, input_func=input_sequence(["/exit"]))
@@ -93,7 +104,7 @@ def test_repl_ignores_empty_input_and_routes_direct_message() -> None:
     assert conversation.routes == [("ask", "hello")]
 
 
-def test_repl_streams_event_output_and_hides_json_arguments() -> None:
+def test_repl_event_indent_and_output_hides_json_arguments() -> None:
     request = ToolCallRequest("call", "read_file", {"path": "secret.json"}, '{"path":"secret.json"}')
     result = ToolResult(True, "read_file", "README.md")
     stdout = io.StringIO()
@@ -110,10 +121,212 @@ def test_repl_streams_event_output_and_hides_json_arguments() -> None:
 
     output = stdout.getvalue()
     assert "checking" in output
-    assert "tool: read_file ..." in output
-    assert "tool: read_file ok - README.md" in output
-    assert "tokens: in=3 out=2 total=5 cumulative=5" in output
+    assert "  tool: read_file ..." in output
+    assert "  tool: read_file ok - README.md" in output
+    assert "  tokens: in=3 out=2 total=5 cumulative=5" in output
+    assert "  agent: running 1 tool call(s)" in output
     assert "secret.json" not in output
+
+
+def test_event_indent_keeps_primary_output_unindented() -> None:
+    request = ToolCallRequest("call", "read_file", {}, "{}")
+    result = ToolResult(True, "read_file", "README.md")
+    output = render_events([
+        AgentProgress("run", 1, "iteration_started"),
+        AgentToolCall("run", 1, request),
+        AgentProgress(
+            "run", 1, "tool_batch_started", 0, 1, "running 1 tool call(s)"
+        ),
+        AgentToolResult("run", 1, ToolExecution(0, request, result)),
+        AgentTokenUsage(
+            "run", 1, TokenUsage(3, 2, 5), TokenUsage(3, 2, 5)
+        ),
+        AgentTextDelta("run", 1, "answer"),
+        stop_event(),
+    ])
+
+    assert output == (
+        "agent: iteration 1\n"
+        "  tool: read_file ...\n"
+        "  agent: running 1 tool call(s)\n"
+        "  tool: read_file ok - README.md\n"
+        "  tokens: in=3 out=2 total=5 cumulative=5\n"
+        "answer\n"
+        "agent: completed\n"
+    )
+
+
+def test_first_iteration_has_no_leading_blank_line() -> None:
+    output = render_events([AgentProgress("run", 1, "iteration_started")])
+
+    assert output == "agent: iteration 1\n"
+
+
+def test_iteration_spacing_has_exactly_one_blank_line() -> None:
+    request = ToolCallRequest("call", "read_file", {}, "{}")
+    output = render_events([
+        AgentProgress("run", 1, "iteration_started"),
+        AgentToolCall("run", 1, request),
+        AgentProgress("run", 2, "iteration_started"),
+        AgentTokenUsage(
+            "run", 2, TokenUsage(1, 1, 2), TokenUsage(1, 1, 2)
+        ),
+    ])
+
+    assert output == (
+        "agent: iteration 1\n"
+        "  tool: read_file ...\n"
+        "\n"
+        "agent: iteration 2\n"
+        "  tokens: in=1 out=1 total=2 cumulative=2\n"
+    )
+
+
+def test_line_boundary_after_unterminated_streaming_text() -> None:
+    request = ToolCallRequest("call", "read_file", {}, "{}")
+    output = render_events([
+        AgentTextDelta("run", 1, "thinking"),
+        AgentToolCall("run", 1, request),
+    ])
+
+    assert output == "thinking\n  tool: read_file ...\n"
+
+
+def test_line_boundary_does_not_duplicate_existing_newline() -> None:
+    request = ToolCallRequest("call", "read_file", {}, "{}")
+    output = render_events([
+        AgentTextDelta("run", 1, "thinking\n"),
+        AgentToolCall("run", 1, request),
+    ])
+
+    assert output == "thinking\n  tool: read_file ...\n"
+
+
+def test_stopped_error_is_primary_output() -> None:
+    output = render_events([
+        AgentStopped(
+            "run",
+            1,
+            StopReason.STREAM_ERROR,
+            "",
+            TokenUsage.zero(),
+            "provider failed",
+        )
+    ])
+
+    assert output == "agent: stopped (stream_error) - provider failed\n"
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [StopReason.OUTPUT_LIMIT, StopReason.EMPTY_RESPONSE],
+)
+def test_incomplete_model_response_has_explicit_stop_reason(
+    reason: StopReason,
+) -> None:
+    output = render_events(
+        [AgentStopped("run", 1, reason, "", TokenUsage.zero())]
+    )
+
+    assert output == f"agent: stopped ({reason.value})\n"
+
+
+def test_streaming_writes_each_text_delta_immediately() -> None:
+    class RecordingStream(io.StringIO):
+        def __init__(self) -> None:
+            super().__init__()
+            self.writes: list[str] = []
+            self.flush_count = 0
+
+        def write(self, text: str) -> int:
+            self.writes.append(text)
+            return super().write(text)
+
+        def flush(self) -> None:
+            self.flush_count += 1
+            super().flush()
+
+    stdout = RecordingStream()
+    conversation = FakeConversation([
+        AgentTextDelta("run", 1, "first"),
+        AgentTextDelta("run", 1, " second"),
+        stop_event(),
+    ])
+
+    Repl(
+        conversation,
+        stdout=stdout,
+        input_func=input_sequence(["hello", "/exit"]),
+    ).run()
+
+    first_index = stdout.writes.index("first")
+    second_index = stdout.writes.index(" second")
+    assert second_index == first_index + 1
+    assert stdout.flush_count >= len(conversation.events)
+
+
+def test_renderer_reset_between_user_tasks() -> None:
+    stdout = io.StringIO()
+    conversation = FakeConversation([
+        AgentProgress("run", 1, "iteration_started"),
+        stop_event(),
+    ])
+
+    Repl(
+        conversation,
+        stdout=stdout,
+        input_func=input_sequence(["first", "second", "/exit"]),
+    ).run()
+
+    task_output = (
+        "agent: iteration 1\n"
+        "agent: completed\n"
+        "\n"
+        "agent: iteration 1\n"
+        "agent: completed\n"
+        "\n"
+    )
+    assert stdout.getvalue().endswith(task_output)
+    assert "\n\n\nagent: iteration 1" not in stdout.getvalue()
+
+
+def test_end_to_end_hierarchy_matches_approved_layout() -> None:
+    request = ToolCallRequest("call", "find_files", {}, "{}")
+    result = ToolResult(True, "find_files", ".gitignore")
+    stdout = io.StringIO()
+    conversation = FakeConversation([
+        AgentProgress("run", 1, "iteration_started"),
+        AgentToolCall("run", 1, request),
+        AgentProgress(
+            "run", 1, "tool_batch_started", 0, 1, "running 1 tool call(s)"
+        ),
+        AgentToolResult("run", 1, ToolExecution(0, request, result)),
+        AgentTokenUsage(
+            "run", 1, TokenUsage(4, 2, 6), TokenUsage(4, 2, 6)
+        ),
+        AgentProgress("run", 2, "iteration_started"),
+        AgentTextDelta("run", 2, "Final answer."),
+        stop_event(),
+    ])
+
+    Repl(
+        conversation,
+        stdout=stdout,
+        input_func=input_sequence(["work", "/exit"]),
+    ).run()
+
+    assert stdout.getvalue().endswith(
+        "agent: iteration 1\n"
+        "  tool: find_files ...\n"
+        "  agent: running 1 tool call(s)\n"
+        "  tool: find_files ok - .gitignore\n"
+        "  tokens: in=4 out=2 total=6 cumulative=6\n"
+        "\n"
+        "agent: iteration 2\n"
+        "Final answer.\n"
+        "agent: completed\n"
+        "\n"
+    )
 
 
 def test_plan_command_do_command_and_routing() -> None:

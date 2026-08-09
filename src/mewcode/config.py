@@ -6,7 +6,7 @@ from typing import Any, cast
 
 import yaml
 
-from .providers import ConfigError, ProviderProfile
+from .providers import ConfigError, ProviderProfile, ThinkingMode
 
 DEFAULT_CONFIG_PATH = Path.home() / ".mewcode" / "config.yaml"
 SUPPORTED_PROTOCOLS = {"anthropic", "openai"}
@@ -60,9 +60,7 @@ def _parse_profile(raw: dict[str, Any]) -> ProviderProfile:
     if protocol not in SUPPORTED_PROTOCOLS:
         raise ConfigError(f"Unsupported protocol '{protocol}'. Use 'anthropic' or 'openai'.")
 
-    thinking = raw.get("thinking", False)
-    if not isinstance(thinking, bool):
-        raise ConfigError("Profile field 'thinking' must be a boolean when provided.")
+    thinking = _parse_thinking_mode(raw)
 
     api_key = _resolve_api_key(api_key_ref)
     return ProviderProfile(
@@ -72,6 +70,24 @@ def _parse_profile(raw: dict[str, Any]) -> ProviderProfile:
         base_url=base_url,
         api_key=api_key,
         thinking=thinking,
+    )
+
+
+def _parse_thinking_mode(raw: dict[str, Any]) -> ThinkingMode:
+    if "thinking" not in raw:
+        return ThinkingMode.AUTO
+
+    value = raw["thinking"]
+    if isinstance(value, bool):
+        return ThinkingMode.ENABLED if value else ThinkingMode.DISABLED
+    if isinstance(value, str):
+        try:
+            return ThinkingMode(value)
+        except ValueError:
+            pass
+    raise ConfigError(
+        "Profile field 'thinking' must be 'auto', 'enabled', 'disabled', "
+        "true, or false when provided."
     )
 
 

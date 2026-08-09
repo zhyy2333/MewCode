@@ -23,6 +23,8 @@ from mewcode.providers import (
     ModelResponse,
     ProviderError,
     ProviderEvent,
+    ProviderFinished,
+    ProviderFinishReason,
     ProviderTextDelta,
     ProviderToolCall,
     ProviderUsage,
@@ -56,6 +58,35 @@ def test_completed_without_tools() -> None:
     assert run.outcome.completed is True
     assert run.outcome.new_messages[0] == ChatMessage("user", "Hi")
     assert run.outcome.final_text == "hello"
+    assert provider.calls[0]["max_output_tokens"] == 4096
+
+
+def test_output_limit_is_not_completed_or_committed() -> None:
+    provider = ScriptedAsyncProvider(
+        [[
+            ProviderTextDelta("partial"),
+            ProviderUsage(TokenUsage(3, 4096, 4099)),
+            ProviderFinished(ProviderFinishReason.OUTPUT_LIMIT),
+        ]]
+    )
+    run = _runner(provider).start([], "Hi", ToolRegistry([]))
+    events = asyncio.run(collect_async(run.events()))
+
+    assert events[-1].reason is StopReason.OUTPUT_LIMIT
+    assert run.outcome.completed is False
+    assert run.outcome.new_messages == ()
+    assert run.outcome.final_text == "partial"
+
+
+@pytest.mark.parametrize("text", ["", "  \n\t"])
+def test_natural_empty_response_is_not_completed_or_committed(text: str) -> None:
+    provider = ScriptedAsyncProvider([[ProviderTextDelta(text)]])
+    run = _runner(provider).start([], "Hi", ToolRegistry([]))
+    events = asyncio.run(collect_async(run.events()))
+
+    assert events[-1].reason is StopReason.EMPTY_RESPONSE
+    assert run.outcome.completed is False
+    assert run.outcome.new_messages == ()
 
 
 def test_react_loop_uses_complete_prior_results() -> None:
@@ -205,8 +236,16 @@ class BlockingProvider(ScriptedAsyncProvider):
         self,
         messages: list[ChatMessage],
         tools=None,
+        *,
+        max_output_tokens=4096,
     ) -> AsyncIterator[ProviderEvent]:
-        self.calls.append({"messages": list(messages), "tools": tools})
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "tools": tools,
+                "max_output_tokens": max_output_tokens,
+            }
+        )
         self.started.set()
         await asyncio.Event().wait()
         if False:

@@ -68,9 +68,19 @@ class BlockingProvider(ScriptedAsyncProvider):
         self.started = started
 
     async def stream_reply(
-        self, messages: list[ChatMessage], tools=None
+        self,
+        messages: list[ChatMessage],
+        tools=None,
+        *,
+        max_output_tokens=4096,
     ) -> AsyncIterator[ProviderEvent]:
-        self.calls.append({"messages": list(messages), "tools": tools})
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "tools": tools,
+                "max_output_tokens": max_output_tokens,
+            }
+        )
         self.started.set()
         await asyncio.Event().wait()
         if False:

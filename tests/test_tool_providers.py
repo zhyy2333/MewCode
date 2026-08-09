@@ -6,6 +6,9 @@ import json
 from mewcode.providers import (
     ChatMessage,
     ModelResponse,
+    ProviderFinished,
+    ProviderFinishReason,
+    ProviderInternalPart,
     ProviderTextDelta,
     ProviderToolCall,
     ProviderUsage,
@@ -35,6 +38,7 @@ def test_anthropic_multiple_tool_calls_and_bad_json(monkeypatch) -> None:
         {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": '{"pattern":'}},
         {"type": "content_block_stop", "index": 1},
         {"type": "content_block_stop", "index": 2},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
     ]
     events = asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "read")])))
 
@@ -43,7 +47,8 @@ def test_anthropic_multiple_tool_calls_and_bad_json(monkeypatch) -> None:
     assert calls[0].arguments == {"path": "README.md"}
     assert calls[1].arguments == {}
     assert calls[1].raw_arguments == '{"pattern":'
-    assert isinstance(events[-1], ProviderUsage)
+    assert isinstance(events[-2], ProviderUsage)
+    assert events[-1] == ProviderFinished(ProviderFinishReason.TOOL_CALLS)
 
 
 def test_anthropic_usage_and_batch_messages(monkeypatch) -> None:
@@ -53,7 +58,9 @@ def test_anthropic_usage_and_batch_messages(monkeypatch) -> None:
         ToolCallRequest("tool-1", "read_file", {"path": "a"}, '{"path":"a"}'),
         ToolCallRequest("tool-2", "find_files", {"pattern": "*"}, '{"pattern":"*"}'),
     )
-    response = ModelResponse("checking", calls, TokenUsage(2, 3, 5))
+    response = ModelResponse(
+        "checking", calls, TokenUsage(2, 3, 5), ProviderFinishReason.TOOL_CALLS
+    )
     assistant = provider.assistant_messages(response)
     assert [block["type"] for block in assistant[0].content] == ["text", "tool_use", "tool_use"]
 
@@ -76,6 +83,7 @@ def test_openai_multiple_calls_item_done_deduplicates_and_bad_json(monkeypatch) 
         FakeOpenAIEvent("response.function_call_arguments.done", item_id="fc-1", arguments='{"path":"README.md"}'),
         FakeOpenAIEvent("response.output_item.done", item={"type": "function_call", "id": "fc-1", "call_id": "call-1", "name": "read_file", "arguments": '{"path":"README.md"}'}),
         FakeOpenAIEvent("response.output_item.done", item={"type": "function_call", "id": "fc-2", "call_id": "call-2", "name": "find_files", "arguments": '{"pattern":'}),
+        FakeOpenAIEvent("response.completed", response={"usage": {}}),
     ]
     events = asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "read")])))
     calls = [event.request for event in events if isinstance(event, ProviderToolCall)]
@@ -92,7 +100,9 @@ def test_openai_usage_and_batch_messages(monkeypatch) -> None:
         ToolCallRequest("call-1", "read_file", {"path": "a"}, '{"path":"a"}'),
         ToolCallRequest("call-2", "find_files", {"pattern": "*"}, '{"pattern":"*"}'),
     )
-    response = ModelResponse("checking", calls, TokenUsage(2, 3, 5))
+    response = ModelResponse(
+        "checking", calls, TokenUsage(2, 3, 5), ProviderFinishReason.TOOL_CALLS
+    )
     assistant = provider.assistant_messages(response)
     assert assistant[0] == ChatMessage("assistant", "checking")
     assert [message.content["call_id"] for message in assistant[1:]] == ["call-1", "call-2"]
@@ -110,11 +120,15 @@ def test_provider_parity_and_hidden_reasoning_is_ignored(monkeypatch) -> None:
     anthropic_type = install_fake_anthropic(monkeypatch)
     anthropic = AnthropicProvider(profile("anthropic"))
     anthropic_type.created[0].events = [
+        {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}},
         {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "hidden"}},
+        {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "signed"}},
+        {"type": "content_block_stop", "index": 0},
         {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "hello"}},
         {"type": "content_block_start", "index": 2, "content_block": {"type": "tool_use", "id": "call-1", "name": "read_file"}},
         {"type": "content_block_delta", "index": 2, "delta": {"type": "input_json_delta", "partial_json": '{"path":"a"}'}},
         {"type": "content_block_stop", "index": 2},
+        {"type": "message_delta", "delta": {"stop_reason": "tool_use"}},
     ]
     anthropic_events = asyncio.run(collect_async(anthropic.stream_reply([ChatMessage("user", "x")])))
 
@@ -122,16 +136,56 @@ def test_provider_parity_and_hidden_reasoning_is_ignored(monkeypatch) -> None:
     openai = OpenAIProvider(profile("openai"))
     openai_type.created[0].events = [
         FakeOpenAIEvent("response.reasoning_summary_text.delta", delta="hidden"),
+        FakeOpenAIEvent("response.output_item.done", item={"type": "reasoning", "id": "rs-1", "summary": []}),
         FakeOpenAIEvent("response.output_text.delta", delta="hello"),
         FakeOpenAIEvent("response.output_item.done", item={"type": "function_call", "id": "fc-1", "call_id": "call-1", "name": "read_file", "arguments": '{"path":"a"}'}),
+        FakeOpenAIEvent("response.completed", response={"usage": {}}),
     ]
     openai_events = asyncio.run(collect_async(openai.stream_reply([ChatMessage("user", "x")])))
 
-    assert [event for event in anthropic_events if not isinstance(event, ProviderUsage)] == [
+    assert [
+        event
+        for event in anthropic_events
+        if not isinstance(event, (ProviderUsage, ProviderInternalPart, ProviderFinished))
+    ] == [
         ProviderTextDelta("hello"),
         ProviderToolCall(ToolCallRequest("call-1", "read_file", {"path": "a"}, '{"path":"a"}')),
     ]
-    assert [event for event in openai_events if not isinstance(event, ProviderUsage)] == [
+    assert [
+        event
+        for event in openai_events
+        if not isinstance(event, (ProviderUsage, ProviderInternalPart, ProviderFinished))
+    ] == [
         ProviderTextDelta("hello"),
         ProviderToolCall(ToolCallRequest("call-1", "read_file", {"path": "a"}, '{"path":"a"}')),
     ]
+
+    anthropic_internal = next(
+        event for event in anthropic_events if isinstance(event, ProviderInternalPart)
+    )
+    anthropic_response = ModelResponse(
+        "hello",
+        (ToolCallRequest("call-1", "read_file", {"path": "a"}, '{"path":"a"}'),),
+        TokenUsage(),
+        ProviderFinishReason.TOOL_CALLS,
+        (anthropic_internal,),
+    )
+    assert anthropic.assistant_messages(anthropic_response)[0].content[0] == {
+        "type": "thinking",
+        "thinking": "hidden",
+        "signature": "signed",
+    }
+
+    openai_internal = next(
+        event for event in openai_events if isinstance(event, ProviderInternalPart)
+    )
+    openai_response = ModelResponse(
+        "hello",
+        (ToolCallRequest("call-1", "read_file", {"path": "a"}, '{"path":"a"}'),),
+        TokenUsage(),
+        ProviderFinishReason.TOOL_CALLS,
+        (openai_internal,),
+    )
+    messages = openai.assistant_messages(openai_response)
+    assert messages[0].content["type"] == "reasoning"
+    assert openai._build_input(messages)[0]["type"] == "reasoning"

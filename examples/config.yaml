@@ -5,11 +5,13 @@ profiles:
     model: claude-sonnet-5
     base_url: https://api.anthropic.com
     api_key: env:ANTHROPIC_API_KEY
-    thinking: true
+    thinking: enabled
 
   - name: openai-main
     protocol: openai
     model: gpt-5.6
     base_url: https://api.openai.com/v1
     api_key: env:OPENAI_API_KEY
-    thinking: false
+    thinking: disabled
+
+# thinking also accepts "auto". Existing true/false values remain compatible.

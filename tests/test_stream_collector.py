@@ -13,6 +13,9 @@ from mewcode.agent import (
 )
 from mewcode.providers import (
     ProviderError,
+    ProviderFinished,
+    ProviderFinishReason,
+    ProviderInternalPart,
     ProviderTextDelta,
     ProviderToolCall,
     ProviderUsage,
@@ -35,7 +38,11 @@ def test_text_is_streamed_and_collected() -> None:
     events = asyncio.run(
         collect_async(
             collector.events(
-                _events(ProviderTextDelta("hel"), ProviderTextDelta("lo")),
+                _events(
+                    ProviderTextDelta("hel"),
+                    ProviderTextDelta("lo"),
+                    ProviderFinished(ProviderFinishReason.NATURAL),
+                ),
                 TokenUsage.zero(),
             )
         )
@@ -48,6 +55,7 @@ def test_text_is_streamed_and_collected() -> None:
     assert collector.response.text == "hello"
     assert collector.response.tool_calls == ()
     assert collector.response.usage == TokenUsage()
+    assert collector.response.finish_reason is ProviderFinishReason.NATURAL
 
 
 def test_tool_calls_and_usage_are_collected_once() -> None:
@@ -61,6 +69,7 @@ def test_tool_calls_and_usage_are_collected_once() -> None:
                     ProviderToolCall(first),
                     ProviderToolCall(second),
                     ProviderUsage(TokenUsage(10, 4, 14)),
+                    ProviderFinished(ProviderFinishReason.TOOL_CALLS),
                 ),
                 TokenUsage(20, 5, 25),
             )
@@ -82,7 +91,10 @@ def test_unknown_usage_stays_unknown() -> None:
     events = asyncio.run(
         collect_async(
             collector.events(
-                _events(ProviderUsage(TokenUsage(None, 2, None))),
+                _events(
+                    ProviderUsage(TokenUsage(None, 2, None)),
+                    ProviderFinished(ProviderFinishReason.NATURAL),
+                ),
                 TokenUsage(10, 3, 13),
             )
         )
@@ -115,6 +127,61 @@ def test_response_before_completion_and_second_consumption_fail() -> None:
     with pytest.raises(StreamStateError):
         _ = collector.response
 
-    asyncio.run(collect_async(collector.events(_events(), TokenUsage.zero())))
+    asyncio.run(
+        collect_async(
+            collector.events(
+                _events(ProviderFinished(ProviderFinishReason.NATURAL)),
+                TokenUsage.zero(),
+            )
+        )
+    )
     with pytest.raises(StreamStateError):
         asyncio.run(collect_async(collector.events(_events(), TokenUsage.zero())))
+
+
+def test_internal_parts_are_collected_without_public_events() -> None:
+    collector = StreamCollector("run-1", 1)
+    hidden = ProviderInternalPart({"type": "thinking", "thinking": "secret"})
+
+    events = asyncio.run(
+        collect_async(
+            collector.events(
+                _events(
+                    hidden,
+                    ProviderTextDelta("answer"),
+                    ProviderFinished(ProviderFinishReason.NATURAL),
+                ),
+                TokenUsage.zero(),
+            )
+        )
+    )
+
+    assert events == [AgentTextDelta("run-1", 1, "answer")]
+    assert collector.response.internal_parts == (hidden,)
+    assert "secret" not in repr(hidden)
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        (),
+        (
+            ProviderFinished(ProviderFinishReason.NATURAL),
+            ProviderFinished(ProviderFinishReason.NATURAL),
+        ),
+        (
+            ProviderToolCall(tool_call("call-1", "read_file")),
+            ProviderFinished(ProviderFinishReason.NATURAL),
+        ),
+        (ProviderFinished(ProviderFinishReason.TOOL_CALLS),),
+    ],
+)
+def test_invalid_finish_sequences_fail(items) -> None:
+    collector = StreamCollector("run-1", 1)
+
+    with pytest.raises(StreamStateError):
+        asyncio.run(
+            collect_async(collector.events(_events(*items), TokenUsage.zero()))
+        )
+    with pytest.raises(StreamStateError):
+        _ = collector.response

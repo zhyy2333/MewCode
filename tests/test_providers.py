@@ -12,10 +12,13 @@ from mewcode.providers import (
     ChatMessage,
     ConfigError,
     ProviderError,
+    ProviderFinished,
+    ProviderFinishReason,
     ProviderProfile,
     ProviderTextDelta,
     ProviderUsage,
     TokenUsage,
+    ThinkingMode,
     create_provider,
 )
 from mewcode.providers.anthropic_provider import AnthropicProvider
@@ -24,7 +27,10 @@ from mewcode.providers.openai_provider import OpenAIProvider
 from tests.fakes import collect_async
 
 
-def profile(protocol: str = "anthropic", thinking: bool = False) -> ProviderProfile:
+def profile(
+    protocol: str = "anthropic",
+    thinking: ThinkingMode = ThinkingMode.AUTO,
+) -> ProviderProfile:
     return ProviderProfile(
         name="main",
         protocol=protocol,  # type: ignore[arg-type]
@@ -78,7 +84,11 @@ class FakeAnthropicClient:
             {"type": "message_start", "message": {"usage": {"input_tokens": 3}}},
             {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "hel"}},
             {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "lo"}},
-            {"type": "message_delta", "usage": {"output_tokens": 2}},
+            {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn"},
+                "usage": {"output_tokens": 2},
+            },
         ]
         self.failures: list[Exception] = []
         self.requests: list[dict] = []
@@ -113,6 +123,7 @@ def test_anthropic_streams_text_usage_and_builds_request(monkeypatch: pytest.Mon
     assert events == [
         ProviderTextDelta("hel"), ProviderTextDelta("lo"),
         ProviderUsage(TokenUsage(3, 2, 5)),
+        ProviderFinished(ProviderFinishReason.NATURAL),
     ]
     client = client_type.created[0]
     assert client.api_key == "secret-key"
@@ -120,6 +131,21 @@ def test_anthropic_streams_text_usage_and_builds_request(monkeypatch: pytest.Mon
         "model": "model-name", "max_tokens": DEFAULT_MAX_TOKENS,
         "messages": [{"role": "user", "content": "Hi"}],
     }]
+
+
+def test_anthropic_uses_per_call_output_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    client_type = install_fake_anthropic(monkeypatch)
+    provider = AnthropicProvider(profile("anthropic"))
+
+    asyncio.run(
+        collect_async(
+            provider.stream_reply(
+                [ChatMessage("user", "Hi")], max_output_tokens=8192
+            )
+        )
+    )
+
+    assert client_type.created[0].requests[0]["max_tokens"] == 8192
 
 
 def test_anthropic_sdk_error_is_wrapped_and_redacted(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -135,7 +161,7 @@ def test_anthropic_sdk_error_is_wrapped_and_redacted(monkeypatch: pytest.MonkeyP
 
 def test_anthropic_thinking_uses_adaptive_omitted(monkeypatch: pytest.MonkeyPatch) -> None:
     client_type = install_fake_anthropic(monkeypatch)
-    provider = AnthropicProvider(profile("anthropic", thinking=True))
+    provider = AnthropicProvider(profile("anthropic", ThinkingMode.ENABLED))
     asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
     assert client_type.created[0].requests[0]["thinking"] == {
         "type": "adaptive", "display": "omitted"
@@ -144,7 +170,7 @@ def test_anthropic_thinking_uses_adaptive_omitted(monkeypatch: pytest.MonkeyPatc
 
 def test_anthropic_adaptive_unsupported_falls_back_to_manual(monkeypatch: pytest.MonkeyPatch) -> None:
     client_type = install_fake_anthropic(monkeypatch)
-    provider = AnthropicProvider(profile("anthropic", thinking=True))
+    provider = AnthropicProvider(profile("anthropic", ThinkingMode.ENABLED))
     client_type.created[0].failures.append(
         FakeAnthropicError("adaptive thinking is not supported on this model")
     )
@@ -157,11 +183,42 @@ def test_anthropic_adaptive_unsupported_falls_back_to_manual(monkeypatch: pytest
 
 def test_anthropic_other_error_does_not_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     client_type = install_fake_anthropic(monkeypatch)
-    provider = AnthropicProvider(profile("anthropic", thinking=True))
+    provider = AnthropicProvider(profile("anthropic", ThinkingMode.ENABLED))
     client_type.created[0].failures.append(FakeAnthropicError("other bad request"))
     with pytest.raises(ProviderError):
         asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
     assert len(client_type.created[0].requests) == 1
+
+
+def test_anthropic_thinking_disabled_is_explicit(monkeypatch: pytest.MonkeyPatch) -> None:
+    client_type = install_fake_anthropic(monkeypatch)
+    provider = AnthropicProvider(profile("anthropic", ThinkingMode.DISABLED))
+    asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
+    assert client_type.created[0].requests[0]["thinking"] == {"type": "disabled"}
+
+
+@pytest.mark.parametrize(
+    ("stop_reason", "expected"),
+    [
+        ("end_turn", ProviderFinishReason.NATURAL),
+        ("stop_sequence", ProviderFinishReason.NATURAL),
+        ("tool_use", ProviderFinishReason.TOOL_CALLS),
+        ("max_tokens", ProviderFinishReason.OUTPUT_LIMIT),
+    ],
+)
+def test_anthropic_finish_reason_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    stop_reason: str,
+    expected: ProviderFinishReason,
+) -> None:
+    client_type = install_fake_anthropic(monkeypatch)
+    provider = AnthropicProvider(profile("anthropic"))
+    client_type.created[0].events = [
+        {"type": "message_delta", "delta": {"stop_reason": stop_reason}}
+    ]
+
+    events = asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
+    assert events[-1] == ProviderFinished(expected)
 
 
 @dataclass
@@ -246,6 +303,7 @@ def test_openai_streams_text_usage_and_builds_request(monkeypatch: pytest.Monkey
     assert events == [
         ProviderTextDelta("hel"), ProviderTextDelta("lo"),
         ProviderUsage(TokenUsage(3, 2, 5)),
+        ProviderFinished(ProviderFinishReason.NATURAL),
     ]
     assert client_type.created[0].requests == [{
         "model": "model-name",
@@ -257,6 +315,80 @@ def test_openai_streams_text_usage_and_builds_request(monkeypatch: pytest.Monkey
         "stream": True,
     }]
     assert client_type.created[0].streams[0].closed is True
+
+
+def test_openai_uses_per_call_output_limit(monkeypatch: pytest.MonkeyPatch) -> None:
+    client_type = install_fake_openai(monkeypatch)
+    provider = OpenAIProvider(profile("openai"))
+
+    asyncio.run(
+        collect_async(
+            provider.stream_reply(
+                [ChatMessage("user", "Hi")], max_output_tokens=8192
+            )
+        )
+    )
+
+    assert client_type.created[0].requests[0]["max_output_tokens"] == 8192
+
+
+@pytest.mark.parametrize(
+    ("thinking", "reasoning"),
+    [
+        (ThinkingMode.AUTO, None),
+        (ThinkingMode.ENABLED, {"effort": "medium"}),
+        (ThinkingMode.DISABLED, {"effort": "none"}),
+    ],
+)
+def test_openai_thinking_mode_mapping(
+    monkeypatch: pytest.MonkeyPatch,
+    thinking: ThinkingMode,
+    reasoning: dict | None,
+) -> None:
+    client_type = install_fake_openai(monkeypatch)
+    provider = OpenAIProvider(profile("openai", thinking))
+    asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
+    request = client_type.created[0].requests[0]
+    if reasoning is None:
+        assert "reasoning" not in request
+    else:
+        assert request["reasoning"] == reasoning
+
+
+def test_openai_incomplete_max_output_is_normalized(monkeypatch: pytest.MonkeyPatch) -> None:
+    client_type = install_fake_openai(monkeypatch)
+    provider = OpenAIProvider(profile("openai"))
+    client_type.created[0].events = [
+        FakeOpenAIEvent(
+            "response.incomplete",
+            response={
+                "incomplete_details": {"reason": "max_output_tokens"},
+                "usage": {"input_tokens": 4, "output_tokens": 9, "total_tokens": 13},
+            },
+        )
+    ]
+
+    events = asyncio.run(collect_async(provider.stream_reply([ChatMessage("user", "Hi")])))
+    assert events == [
+        ProviderUsage(TokenUsage(4, 9, 13)),
+        ProviderFinished(ProviderFinishReason.OUTPUT_LIMIT),
+    ]
+
+
+def test_openai_failed_response_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:
+    client_type = install_fake_openai(monkeypatch)
+    provider = OpenAIProvider(profile("openai"))
+    client_type.created[0].events = [
+        FakeOpenAIEvent(
+            "response.failed",
+            response={"error": {"message": "generation failed"}},
+        )
+    ]
+
+    with pytest.raises(ProviderError, match="generation failed"):
+        asyncio.run(
+            collect_async(provider.stream_reply([ChatMessage("user", "Hi")]))
+        )
 
 
 def test_openai_error_event_is_wrapped(monkeypatch: pytest.MonkeyPatch) -> None:

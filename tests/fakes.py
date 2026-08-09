@@ -4,7 +4,15 @@ import asyncio
 from collections.abc import AsyncIterator, Iterable, Sequence
 from typing import Any, TypeVar
 
-from mewcode.providers import ChatMessage, ModelResponse, ProviderEvent
+from mewcode.providers import (
+    DEFAULT_MAX_TOKENS,
+    ChatMessage,
+    ModelResponse,
+    ProviderEvent,
+    ProviderFinished,
+    ProviderFinishReason,
+    ProviderToolCall,
+)
 from mewcode.tools import (
     ToolCallRequest,
     ToolExecution,
@@ -32,16 +40,37 @@ class ScriptedAsyncProvider:
         self,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
+        *,
+        max_output_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> AsyncIterator[ProviderEvent]:
-        self.calls.append({"messages": list(messages), "tools": tools})
+        self.calls.append(
+            {
+                "messages": list(messages),
+                "tools": tools,
+                "max_output_tokens": max_output_tokens,
+            }
+        )
         script = self.scripts.pop(0)
         if isinstance(script, BaseException):
             raise script
+        saw_finish = False
+        saw_tool_call = False
         for event in script:
             if isinstance(event, BaseException):
                 raise event
+            if isinstance(event, ProviderFinished):
+                saw_finish = True
+            elif isinstance(event, ProviderToolCall):
+                saw_tool_call = True
             await asyncio.sleep(0)
             yield event
+        if not saw_finish:
+            reason = (
+                ProviderFinishReason.TOOL_CALLS
+                if saw_tool_call
+                else ProviderFinishReason.NATURAL
+            )
+            yield ProviderFinished(reason)
 
     def assistant_messages(self, response: ModelResponse) -> list[ChatMessage]:
         return [

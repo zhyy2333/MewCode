@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from mewcode.config import load_active_profile
-from mewcode.providers import ConfigError, ProviderProfile
+from mewcode.providers import ConfigError, ProviderProfile, ThinkingMode
 
 
 def write_config(path: Path, text: str) -> None:
@@ -42,8 +42,69 @@ profiles:
         model="gpt-5.6",
         base_url="https://api.openai.com/v1",
         api_key="openai-secret",
-        thinking=False,
+        thinking=ThinkingMode.AUTO,
     )
+
+
+@pytest.mark.parametrize(
+    ("yaml_value", "expected"),
+    [
+        ("auto", ThinkingMode.AUTO),
+        ("enabled", ThinkingMode.ENABLED),
+        ("disabled", ThinkingMode.DISABLED),
+        ("true", ThinkingMode.ENABLED),
+        ("false", ThinkingMode.DISABLED),
+    ],
+)
+def test_thinking_modes_and_boolean_compatibility(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    yaml_value: str,
+    expected: ThinkingMode,
+) -> None:
+    monkeypatch.setenv("API_KEY", "secret")
+    config_path = tmp_path / "config.yaml"
+    write_config(
+        config_path,
+        f"""
+active: main
+profiles:
+  - name: main
+    protocol: anthropic
+    model: model
+    base_url: https://example.test
+    api_key: env:API_KEY
+    thinking: {yaml_value}
+""",
+    )
+
+    assert load_active_profile(config_path).thinking is expected
+
+
+@pytest.mark.parametrize("yaml_value", ["sometimes", "42", "null", "[]"])
+def test_invalid_thinking_value_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    yaml_value: str,
+) -> None:
+    monkeypatch.setenv("API_KEY", "secret")
+    config_path = tmp_path / "config.yaml"
+    write_config(
+        config_path,
+        f"""
+active: main
+profiles:
+  - name: main
+    protocol: anthropic
+    model: model
+    base_url: https://example.test
+    api_key: env:API_KEY
+    thinking: {yaml_value}
+""",
+    )
+
+    with pytest.raises(ConfigError, match="auto.*enabled.*disabled"):
+        load_active_profile(config_path)
 
 
 def test_missing_config_file_reports_path(tmp_path: Path) -> None:

@@ -79,12 +79,53 @@ class Repl:
         return self._conversation.ask(user_text)
 
     async def _consume(self, source: AsyncIterator[AgentEvent]) -> None:
+        renderer = _EventRenderer()
         async for event in source:
-            text = _format_event(event)
+            text = renderer.render(event)
             if text is None:
                 continue
             self._stdout.write(text)
             self._stdout.flush()
+
+
+class _EventRenderer:
+    def __init__(self) -> None:
+        self._seen_iteration = False
+        self._at_line_start = True
+
+    def render(self, event: AgentEvent) -> str | None:
+        text = _format_event(event)
+        if text is None:
+            return None
+
+        if isinstance(event, AgentTextDelta):
+            self._update_line_state(text)
+            return text
+
+        prefix = self._line_prefix(event)
+        if _is_secondary_event(event):
+            text = _indent_lines(text)
+        rendered = prefix + text
+        self._update_line_state(rendered)
+        return rendered
+
+    def _line_prefix(self, event: AgentEvent) -> str:
+        is_iteration = (
+            isinstance(event, AgentProgress)
+            and event.phase == "iteration_started"
+        )
+        if is_iteration:
+            if self._seen_iteration:
+                prefix = "\n" if self._at_line_start else "\n\n"
+            else:
+                prefix = "" if self._at_line_start else "\n"
+            self._seen_iteration = True
+            return prefix
+        return "" if self._at_line_start else "\n"
+
+    def _update_line_state(self, text: str) -> None:
+        if text:
+            self._at_line_start = text.endswith("\n")
 
 
 def _format_event(event: AgentEvent) -> str | None:
@@ -122,3 +163,16 @@ def _format_event(event: AgentEvent) -> str | None:
 
 def _token(value: int | None) -> str:
     return "n/a" if value is None else str(value)
+
+
+def _is_secondary_event(event: AgentEvent) -> bool:
+    return isinstance(
+        event, (AgentToolCall, AgentToolResult, AgentTokenUsage)
+    ) or (
+        isinstance(event, AgentProgress)
+        and event.phase == "tool_batch_started"
+    )
+
+
+def _indent_lines(text: str) -> str:
+    return "".join(f"  {line}" for line in text.splitlines(keepends=True))

@@ -75,7 +75,11 @@ class Conversation:
         ):
             yield event
         outcome = self._last_outcome
-        if outcome is not None and outcome.completed:
+        if (
+            outcome is not None
+            and outcome.completed
+            and outcome.final_text.strip()
+        ):
             self._pending_plan = PendingPlan(clean_task, outcome.final_text)
 
     async def execute_plan(self) -> AsyncIterator[AgentEvent]:

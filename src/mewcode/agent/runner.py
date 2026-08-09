@@ -7,7 +7,14 @@ from enum import Enum, auto
 from typing import Callable
 from uuid import uuid4
 
-from mewcode.providers import ChatMessage, LLMProvider, ProviderError, TokenUsage
+from mewcode.providers import (
+    DEFAULT_MAX_TOKENS,
+    ChatMessage,
+    LLMProvider,
+    ProviderError,
+    ProviderFinishReason,
+    TokenUsage,
+)
 from mewcode.tools import ToolRegistry
 
 from .events import (
@@ -20,6 +27,10 @@ from .events import (
 from .scheduler import ToolSchedule, ToolScheduler
 from .streaming import StreamCollector
 
+PLAN_FINAL_MAX_TOKENS = 8192
+PLAN_FINAL_PROMPT = """Using the workspace evidence gathered above, output the complete implementation plan now.
+Do not call tools. Return only the final plan, with concrete steps and verification."""
+
 
 class AgentRunStateError(RuntimeError):
     pass
@@ -29,12 +40,18 @@ class AgentRunStateError(RuntimeError):
 class AgentRunConfig:
     max_iterations: int = 20
     unknown_tool_limit: int = 3
+    plan_max_investigation_iterations: int = 6
+    plan_final_max_tokens: int = PLAN_FINAL_MAX_TOKENS
 
     def __post_init__(self) -> None:
         if self.max_iterations < 1:
             raise ValueError("max_iterations must be at least 1")
         if self.unknown_tool_limit < 1:
             raise ValueError("unknown_tool_limit must be at least 1")
+        if self.plan_max_investigation_iterations < 1:
+            raise ValueError("plan_max_investigation_iterations must be at least 1")
+        if self.plan_final_max_tokens < 1:
+            raise ValueError("plan_final_max_tokens must be at least 1")
 
 
 @dataclass(frozen=True)
@@ -98,6 +115,7 @@ class AgentRun:
         consecutive_unknown = 0
         iteration = 0
         final_text = ""
+        plan_finalizing = False
 
         try:
             yield AgentProgress(
@@ -108,7 +126,12 @@ class AgentRun:
             )
             tool_definitions = self._provider.tool_definitions(self._tools)
 
-            for iteration in range(1, self._config.max_iterations + 1):
+            loop_limit = (
+                self._config.plan_max_investigation_iterations + 1
+                if self._mode is AgentMode.PLAN
+                else self._config.max_iterations
+            )
+            for iteration in range(1, loop_limit + 1):
                 if self._cancel_requested.is_set():
                     yield self._finish(
                         StopReason.CANCELLED,
@@ -127,8 +150,16 @@ class AgentRun:
                 )
                 collector = StreamCollector(self._run_id, iteration)
                 try:
+                    request_tools = None if plan_finalizing else tool_definitions
+                    max_output_tokens = (
+                        self._config.plan_final_max_tokens
+                        if plan_finalizing
+                        else DEFAULT_MAX_TOKENS
+                    )
                     source = self._provider.stream_reply(
-                        list(working_messages), tools=tool_definitions
+                        list(working_messages),
+                        tools=request_tools,
+                        max_output_tokens=max_output_tokens,
                     )
                     async for event in collector.events(source, cumulative_usage):
                         yield event
@@ -163,7 +194,34 @@ class AgentRun:
                     message="model response completed",
                 )
 
-                if not response.tool_calls:
+                if response.finish_reason is ProviderFinishReason.OUTPUT_LIMIT:
+                    yield self._finish(
+                        StopReason.OUTPUT_LIMIT,
+                        iteration,
+                        response.text,
+                        new_messages,
+                        cumulative_usage,
+                    )
+                    return
+
+                if plan_finalizing:
+                    if response.finish_reason is ProviderFinishReason.TOOL_CALLS:
+                        raise AgentRunStateError(
+                            "Plan finalization returned a tool call while tools were disabled."
+                        )
+                    if response.finish_reason is not ProviderFinishReason.NATURAL:
+                        raise AgentRunStateError(
+                            f"Unsupported provider finish reason: {response.finish_reason}"
+                        )
+                    if not response.text.strip():
+                        yield self._finish(
+                            StopReason.EMPTY_RESPONSE,
+                            iteration,
+                            response.text,
+                            new_messages,
+                            cumulative_usage,
+                        )
+                        return
                     assistant_messages = self._provider.assistant_messages(response)
                     if not user_committed:
                         new_messages.append(self._user_message)
@@ -178,7 +236,51 @@ class AgentRun:
                     )
                     return
 
-                if iteration == self._config.max_iterations:
+                if response.finish_reason is ProviderFinishReason.NATURAL:
+                    if self._mode is AgentMode.PLAN:
+                        assistant_messages = self._provider.assistant_messages(response)
+                        if not user_committed:
+                            new_messages.append(self._user_message)
+                            user_committed = True
+                        new_messages.extend(assistant_messages)
+                        working_messages.extend(assistant_messages)
+                        final_prompt = ChatMessage(role="user", content=PLAN_FINAL_PROMPT)
+                        new_messages.append(final_prompt)
+                        working_messages.append(final_prompt)
+                        plan_finalizing = True
+                        continue
+                    if not response.text.strip():
+                        yield self._finish(
+                            StopReason.EMPTY_RESPONSE,
+                            iteration,
+                            response.text,
+                            new_messages,
+                            cumulative_usage,
+                        )
+                        return
+                    assistant_messages = self._provider.assistant_messages(response)
+                    if not user_committed:
+                        new_messages.append(self._user_message)
+                        user_committed = True
+                    new_messages.extend(assistant_messages)
+                    yield self._finish(
+                        StopReason.COMPLETED,
+                        iteration,
+                        response.text,
+                        new_messages,
+                        cumulative_usage,
+                    )
+                    return
+
+                if response.finish_reason is not ProviderFinishReason.TOOL_CALLS:
+                    raise AgentRunStateError(
+                        f"Unsupported provider finish reason: {response.finish_reason}"
+                    )
+
+                if (
+                    self._mode is not AgentMode.PLAN
+                    and iteration == self._config.max_iterations
+                ):
                     yield self._finish(
                         StopReason.ITERATION_LIMIT,
                         iteration,
@@ -250,6 +352,16 @@ class AgentRun:
                         cumulative_usage,
                     )
                     return
+
+                if (
+                    self._mode is AgentMode.PLAN
+                    and iteration
+                    == self._config.plan_max_investigation_iterations
+                ):
+                    final_prompt = ChatMessage(role="user", content=PLAN_FINAL_PROMPT)
+                    new_messages.append(final_prompt)
+                    working_messages.append(final_prompt)
+                    plan_finalizing = True
 
             raise AgentRunStateError("Agent loop ended without a stop reason.")
         except asyncio.CancelledError:

@@ -13,15 +13,20 @@ from .base import (
     ModelResponse,
     ProviderError,
     ProviderEvent,
+    ProviderFinished,
+    ProviderFinishReason,
+    ProviderInternalPart,
     ProviderProfile,
     ProviderTextDelta,
     ProviderToolCall,
     ProviderUsage,
     TokenUsage,
+    ThinkingMode,
 )
 
 ADAPTIVE_THINKING = {"type": "adaptive", "display": "omitted"}
 MANUAL_THINKING = {"type": "enabled", "budget_tokens": 1024, "display": "omitted"}
+DISABLED_THINKING = {"type": "disabled"}
 
 
 class AnthropicProvider:
@@ -44,11 +49,25 @@ class AnthropicProvider:
         self,
         messages: list[ChatMessage],
         tools: list[dict[str, Any]] | None = None,
+        *,
+        max_output_tokens: int = DEFAULT_MAX_TOKENS,
     ) -> AsyncIterator[ProviderEvent]:
-        request = self._build_request(messages, tools)
-        if not self._profile.thinking:
+        request = self._build_request(messages, tools, max_output_tokens)
+        if self._profile.thinking is ThinkingMode.AUTO:
             try:
                 async for event in self._stream_request(request):
+                    yield event
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise self._to_provider_error(exc) from exc
+            return
+
+        if self._profile.thinking is ThinkingMode.DISABLED:
+            disabled_request = dict(request)
+            disabled_request["thinking"] = DISABLED_THINKING
+            try:
+                async for event in self._stream_request(disabled_request):
                     yield event
             except asyncio.CancelledError:
                 raise
@@ -79,7 +98,9 @@ class AnthropicProvider:
             raise self._to_provider_error(exc) from exc
 
     def assistant_messages(self, response: ModelResponse) -> list[ChatMessage]:
-        content: list[dict[str, Any]] = []
+        content: list[dict[str, Any]] = [
+            part.data for part in response.internal_parts
+        ]
         if response.text or not response.tool_calls:
             content.append({"type": "text", "text": response.text})
         content.extend(
@@ -114,11 +135,14 @@ class AnthropicProvider:
         ]
 
     def _build_request(
-        self, messages: list[ChatMessage], tools: list[dict[str, Any]] | None
+        self,
+        messages: list[ChatMessage],
+        tools: list[dict[str, Any]] | None,
+        max_output_tokens: int,
     ) -> dict[str, Any]:
         request: dict[str, Any] = {
             "model": self._profile.model,
-            "max_tokens": DEFAULT_MAX_TOKENS,
+            "max_tokens": max_output_tokens,
             "messages": [
                 {"role": message.role, "content": message.content} for message in messages
             ],
@@ -164,8 +188,11 @@ def _tool_result_payload(result: ToolResult) -> str:
 
 async def _parse_anthropic_events(events: Any) -> AsyncIterator[ProviderEvent]:
     calls: dict[int, dict[str, Any]] = {}
+    internal_blocks: dict[int, dict[str, Any]] = {}
     input_tokens: int | None = None
     output_tokens: int | None = None
+    finish_reason: ProviderFinishReason | None = None
+    emitted_tool_call = False
 
     async for event in events:
         event_type = _get_event_attr(event, "type")
@@ -174,19 +201,28 @@ async def _parse_anthropic_events(events: Any) -> AsyncIterator[ProviderEvent]:
             usage = _get_event_attr(message, "usage") or {}
             input_tokens = _optional_int(_get_event_attr(usage, "input_tokens"))
         elif event_type == "message_delta":
+            delta = _get_event_attr(event, "delta") or {}
+            stop_reason = _get_event_attr(delta, "stop_reason") or _get_event_attr(
+                event, "stop_reason"
+            )
+            if stop_reason is not None:
+                finish_reason = _anthropic_finish_reason(stop_reason)
             usage = _get_event_attr(event, "usage") or {}
             value = _optional_int(_get_event_attr(usage, "output_tokens"))
             if value is not None:
                 output_tokens = value
         elif event_type == "content_block_start":
             block = _get_event_attr(event, "content_block") or _get_event_attr(event, "block") or {}
-            if _get_event_attr(block, "type") == "tool_use":
+            block_type = _get_event_attr(block, "type")
+            if block_type == "tool_use":
                 index = _event_index(event)
                 calls[index] = {
                     "id": _get_event_attr(block, "id") or "",
                     "name": _get_event_attr(block, "name") or "",
                     "parts": [],
                 }
+            elif block_type in {"thinking", "redacted_thinking"}:
+                internal_blocks[_event_index(event)] = _anthropic_internal_block(block)
         elif event_type == "content_block_delta":
             delta = _get_event_attr(event, "delta") or {}
             delta_type = _get_event_attr(delta, "type")
@@ -198,11 +234,29 @@ async def _parse_anthropic_events(events: Any) -> AsyncIterator[ProviderEvent]:
                 index = _event_index(event)
                 call = calls.setdefault(index, {"id": "", "name": "", "parts": []})
                 call["parts"].append(_get_event_attr(delta, "partial_json") or "")
+            elif delta_type == "thinking_delta":
+                block = internal_blocks.setdefault(
+                    _event_index(event), {"type": "thinking", "thinking": ""}
+                )
+                block["thinking"] = block.get("thinking", "") + (
+                    _get_event_attr(delta, "thinking") or ""
+                )
+            elif delta_type == "signature_delta":
+                block = internal_blocks.setdefault(
+                    _event_index(event), {"type": "thinking", "thinking": ""}
+                )
+                block["signature"] = block.get("signature", "") + (
+                    _get_event_attr(delta, "signature") or ""
+                )
         elif event_type == "content_block_stop":
             index = _event_index(event)
             call = calls.pop(index, None)
             if call is not None:
+                emitted_tool_call = True
                 yield ProviderToolCall(_build_tool_call(call))
+            internal = internal_blocks.pop(index, None)
+            if internal is not None:
+                yield ProviderInternalPart(internal)
 
     total_tokens = (
         input_tokens + output_tokens
@@ -210,6 +264,40 @@ async def _parse_anthropic_events(events: Any) -> AsyncIterator[ProviderEvent]:
         else None
     )
     yield ProviderUsage(TokenUsage(input_tokens, output_tokens, total_tokens))
+    if finish_reason is None:
+        finish_reason = (
+            ProviderFinishReason.TOOL_CALLS
+            if emitted_tool_call
+            else ProviderFinishReason.NATURAL
+        )
+    yield ProviderFinished(finish_reason)
+
+
+def _anthropic_finish_reason(value: Any) -> ProviderFinishReason:
+    if value in {"end_turn", "stop_sequence"}:
+        return ProviderFinishReason.NATURAL
+    if value == "tool_use":
+        return ProviderFinishReason.TOOL_CALLS
+    if value in {"max_tokens", "model_context_window_exceeded"}:
+        return ProviderFinishReason.OUTPUT_LIMIT
+    raise ProviderError(f"Anthropic request failed: unsupported stop reason '{value}'.")
+
+
+def _anthropic_internal_block(block: Any) -> dict[str, Any]:
+    block_type = _get_event_attr(block, "type")
+    if block_type == "redacted_thinking":
+        return {
+            "type": "redacted_thinking",
+            "data": _get_event_attr(block, "data") or "",
+        }
+    result: dict[str, Any] = {
+        "type": "thinking",
+        "thinking": _get_event_attr(block, "thinking") or "",
+    }
+    signature = _get_event_attr(block, "signature")
+    if signature:
+        result["signature"] = signature
+    return result
 
 
 def _build_tool_call(call: dict[str, Any]) -> ToolCallRequest:
