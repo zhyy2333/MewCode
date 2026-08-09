@@ -356,5 +356,9 @@ def _permission_denied_result(
             "tool_call_id": request.id,
             "permission_denied": True,
             "permission_source": decision.source.value,
+            "permission": {
+                "outcome": decision.outcome.value,
+                "source": decision.source.value,
+            },
         },
     )

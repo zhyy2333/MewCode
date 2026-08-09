@@ -91,6 +91,27 @@ def test_writer_preserves_external_rules_and_rejects_corrupt_file(tmp_path: Path
     assert path.read_bytes() == before
 
 
+def test_writer_replace_failure_leaves_old_file_intact(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from mewcode.permissions import config as config_module
+
+    path = tmp_path / "permissions.local.yaml"
+    original = "rules:\n  - rule: read_file(src/**)\n    result: deny\n"
+    path.write_text(original, encoding="utf-8")
+    writer = PermissionConfigWriter(path, KNOWN)
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(config_module.os, "replace", fail_replace)
+    target = PermissionTarget("run_command", "git status", PermissionTargetKind.COMMAND)
+    with pytest.raises(PermissionConfigError, match="replace failed"):
+        writer.add_local_allow(target)
+    assert path.read_text(encoding="utf-8") == original
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
 def test_store_permanent_refreshes_local_snapshot(tmp_path: Path) -> None:
     path = tmp_path / "permissions.local.yaml"
     writer = PermissionConfigWriter(path, KNOWN)
