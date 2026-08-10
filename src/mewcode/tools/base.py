@@ -39,11 +39,12 @@ class PermissionTargetKind(StrEnum):
     COMMAND = "command"
     PATH = "path"
     PATH_GLOB = "path_glob"
+    TOOL = "tool"
 
 
 @dataclass(frozen=True)
 class ToolPermissionSpec:
-    argument: str
+    argument: str | None
     kind: PermissionTargetKind
     default: str | None = None
 

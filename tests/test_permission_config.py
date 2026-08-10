@@ -120,3 +120,39 @@ def test_store_permanent_refreshes_local_snapshot(tmp_path: Path) -> None:
     asyncio.run(store.persist_project_local_allow(target))
     assert store.snapshot().project_local
     assert store.match(target) is not None
+
+
+def test_allows_rule_for_configured_offline_mcp_namespace(tmp_path: Path) -> None:
+    path = tmp_path / "permissions.yaml"
+    path.write_text(
+        "rules:\n  - rule: server__offline(invoke)\n    result: allow\n",
+        encoding="utf-8",
+    )
+    rules = PermissionConfigLoader().load_file(
+        path, RuleScope.USER, KNOWN, ("server__",)
+    )
+    assert rules[0].tool_name == "server__offline"
+
+
+def test_rejects_unknown_non_mcp_tool(tmp_path: Path) -> None:
+    path = tmp_path / "permissions.yaml"
+    path.write_text(
+        "rules:\n  - rule: unknown(invoke)\n    result: allow\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(PermissionConfigError):
+        PermissionConfigLoader().load_file(
+            path, RuleScope.USER, KNOWN, ("server__",)
+        )
+
+
+def test_registered_tool_rule_is_unchanged(tmp_path: Path) -> None:
+    path = tmp_path / "permissions.yaml"
+    path.write_text(
+        "rules:\n  - rule: read_file(src/*)\n    result: allow\n",
+        encoding="utf-8",
+    )
+    rules = PermissionConfigLoader().load_file(
+        path, RuleScope.USER, KNOWN, ("server__",)
+    )
+    assert rules[0].tool_name == "read_file"

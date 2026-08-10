@@ -15,3 +15,21 @@ profiles:
     thinking: disabled
 
 # thinking also accepts "auto". Existing true/false values remain compatible.
+
+# MCP Server 是可选配置。stdio 直接启动程序，不经过 shell。
+mcp_servers:
+  local-tools:
+    transport: stdio
+    command: python
+    args: ["tools/local_mcp.py"]
+    env:
+      SERVICE_TOKEN: "${LOCAL_MCP_TOKEN}"
+
+  team-api:
+    transport: http
+    url: https://mcp.example.com/mcp
+    headers:
+      Authorization: "Bearer ${TEAM_MCP_TOKEN}"
+
+# 项目级 <workspace>/.mewcode/config.yaml 可以只声明 mcp_servers。
+# 同名 Server 由项目条目整项替换，不继承用户条目的 env/headers。

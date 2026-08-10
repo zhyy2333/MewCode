@@ -37,6 +37,41 @@ profiles:
     thinking: false
 ```
 
+### MCP Server
+
+MewCode 支持 MCP `2025-11-25` 的工具发现与调用。用户级 Server 写在 `~/.mewcode/config.yaml`，项目级 Server 写在当前工作区的 `.mewcode/config.yaml`；两个文件使用 `mcp_servers` map。不同名 Server 合并，同名 Server 由项目条目整项替换，不做字段深合并。
+
+本地 Server 使用 stdio，命令和参数作为 argv 直接启动，不经过 shell：
+
+```yaml
+mcp_servers:
+  local-tools:
+    transport: stdio
+    command: python
+    args: ["tools/local_mcp.py"]
+    env:
+      SERVICE_TOKEN: "${LOCAL_MCP_TOKEN}"
+```
+
+远程 Server 使用 Streamable HTTP：
+
+```yaml
+mcp_servers:
+  team-api:
+    transport: http
+    url: https://mcp.example.com/mcp
+    headers:
+      Authorization: "Bearer ${TEAM_MCP_TOKEN}"
+```
+
+`${VAR}` 只在 stdio 的 `env` 值和 HTTP 的 `headers` 值中展开。协议 header 由 MewCode 控制；HTTP 默认校验证书且不跟随重定向。项目配置能够启动本地程序并发送认证 header，因此只应在受信任的项目中启用 MCP Server。
+
+发现到的工具以 `<server>__<tool>` 为公开名；非法或超长名称会确定性规范化并追加短哈希。所有 MCP 工具固定按 `SIDE_EFFECT` 处理，权限目标为 `<public_name>(invoke)`：仅本次只放行当前调用，本会话或永久规则放行该公开工具后续使用任意参数的调用。Server 暂时离线时，其已有 namespace 权限规则可以休眠，不会影响其他工具启动。
+
+每个 Server 在一次 MewCode 进程中复用同一会话。单个 Server 的配置、启动或运行失败不会影响其它 MCP Server 和内置工具；运行期失败后调用快速返回，不自动重连、重启或重新初始化。退出时 MewCode 会关闭 stdio 子进程和 HTTP Session。
+
+本阶段只接入 MCP 工具，不支持资源、提示词、采样、动态工具更新、健康检查、自动重连、长期 SSE GET、OAuth、Registry 安装或二进制结果落盘，也不支持 MCP `2026-07-28` 及其它协议版本。
+
 ## 运行
 
 ```powershell
@@ -79,7 +114,7 @@ Plan 和 Execute 模式按一次 Agent Run 内的真实模型调用次数注入�
 tokens: in=... out=... total=... cache-read=... cache-write=... cumulative=... cumulative-cache-read=... cumulative-cache-write=...
 ```
 
-本阶段只接受调用方直接提供的自定义指令、Skill 和长期记忆内容，不加载项目指令文件、不自动激活 Skill、不生成或持久化记忆，也不接入真实 MCP Server。
+本阶段只接受调用方直接提供的自定义指令、Skill 和长期记忆内容，不加载项目指令文件、不自动激活 Skill、不生成或持久化记忆。MCP 工具来自启动时静态快照，不会改变结构化提示的运行时边界。
 
 ## Plan Mode
 

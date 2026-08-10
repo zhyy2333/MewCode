@@ -50,14 +50,20 @@ class PermissionConfigLoader:
         self,
         paths: PermissionPaths,
         known_tools: set[str],
+        deferred_tool_prefixes: tuple[str, ...] = (),
     ) -> PermissionRuleSets:
         return PermissionRuleSets(
             session=(),
             project_local=self.load_file(
-                paths.project_local, RuleScope.PROJECT_LOCAL, known_tools
+                paths.project_local, RuleScope.PROJECT_LOCAL, known_tools,
+                deferred_tool_prefixes,
             ),
-            project=self.load_file(paths.project, RuleScope.PROJECT, known_tools),
-            user=self.load_file(paths.user, RuleScope.USER, known_tools),
+            project=self.load_file(
+                paths.project, RuleScope.PROJECT, known_tools, deferred_tool_prefixes
+            ),
+            user=self.load_file(
+                paths.user, RuleScope.USER, known_tools, deferred_tool_prefixes
+            ),
         )
 
     def load_file(
@@ -65,12 +71,13 @@ class PermissionConfigLoader:
         path: Path,
         scope: RuleScope,
         known_tools: set[str],
+        deferred_tool_prefixes: tuple[str, ...] = (),
     ) -> tuple[PermissionRule, ...]:
         if not path.exists():
             return ()
         try:
             raw = yaml.safe_load(path.read_text(encoding="utf-8"))
-            return _parse_document(raw, scope, known_tools)
+            return _parse_document(raw, scope, known_tools, deferred_tool_prefixes)
         except (OSError, UnicodeError, yaml.YAMLError, PermissionRuleError, ValueError) as exc:
             raise PermissionConfigError(f"Invalid permission config at {path}: {exc}") from exc
 
@@ -79,6 +86,7 @@ def _parse_document(
     raw: Any,
     scope: RuleScope,
     known_tools: set[str],
+    deferred_tool_prefixes: tuple[str, ...] = (),
 ) -> tuple[PermissionRule, ...]:
     if not isinstance(raw, dict):
         raise ValueError("root must be a YAML object")
@@ -97,7 +105,11 @@ def _parse_document(
         result = item["result"]
         if not isinstance(expression, str) or not isinstance(result, str):
             raise ValueError(f"rules[{index}] fields must be strings")
-        rules.append(parse_permission_rule(expression, result, scope, known_tools))
+        rules.append(
+            parse_permission_rule(
+                expression, result, scope, known_tools, deferred_tool_prefixes
+            )
+        )
     return tuple(rules)
 
 
@@ -107,14 +119,19 @@ class PermissionConfigWriter:
         path: Path,
         known_tools: set[str],
         loader: PermissionConfigLoader | None = None,
+        deferred_tool_prefixes: tuple[str, ...] = (),
     ) -> None:
         self._path = path
         self._known_tools = set(known_tools)
         self._loader = loader or PermissionConfigLoader()
+        self._deferred_tool_prefixes = deferred_tool_prefixes
 
     def add_local_allow(self, target: PermissionTarget) -> tuple[PermissionRule, ...]:
         current = self._loader.load_file(
-            self._path, RuleScope.PROJECT_LOCAL, self._known_tools
+            self._path,
+            RuleScope.PROJECT_LOCAL,
+            self._known_tools,
+            self._deferred_tool_prefixes,
         )
         expression = target.exact_rule()
         if any(
@@ -142,7 +159,10 @@ class PermissionConfigWriter:
                 stream.flush()
                 os.fsync(stream.fileno())
             updated = self._loader.load_file(
-                temporary_path, RuleScope.PROJECT_LOCAL, self._known_tools
+                temporary_path,
+                RuleScope.PROJECT_LOCAL,
+                self._known_tools,
+                self._deferred_tool_prefixes,
             )
             os.replace(temporary_path, self._path)
             temporary_path = None

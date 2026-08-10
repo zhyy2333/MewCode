@@ -90,3 +90,41 @@ def test_default_target_and_missing_declaration(tmp_path: Path) -> None:
     request = ToolCallRequest("call", "custom", {}, "{}")
     denied = builder.build(ValidatedToolCall(request, tool))
     assert denied.source == PermissionSource.CONFIG_ERROR
+
+
+def test_tool_permission_spec_accepts_static_argument() -> None:
+    spec = ToolPermissionSpec(None, PermissionTargetKind.TOOL, "invoke")
+    assert spec.argument is None
+
+
+def test_existing_permission_spec_kinds_are_unchanged() -> None:
+    assert {kind.value for kind in PermissionTargetKind} >= {
+        "command", "path", "path_glob", "tool"
+    }
+
+
+def test_builds_static_tool_invoke_target(tmp_path: Path) -> None:
+    tool = SimpleNamespace(
+        name="remote__act",
+        permission_spec=ToolPermissionSpec(None, PermissionTargetKind.TOOL, "invoke"),
+    )
+    request = ToolCallRequest("1", tool.name, {"secret": "ignored"}, "{}")
+    target = PermissionTargetBuilder(Workspace(tmp_path)).build(
+        ValidatedToolCall(request, tool)
+    )
+    assert target == PermissionTarget(
+        "remote__act", "invoke", PermissionTargetKind.TOOL
+    )
+
+
+def test_invalid_static_tool_target_is_denied(tmp_path: Path) -> None:
+    tool = SimpleNamespace(
+        name="remote__act",
+        permission_spec=ToolPermissionSpec("path", PermissionTargetKind.TOOL, "invoke"),
+    )
+    request = ToolCallRequest("1", tool.name, {"path": "x"}, "{}")
+    decision = PermissionTargetBuilder(Workspace(tmp_path)).build(
+        ValidatedToolCall(request, tool)
+    )
+    assert decision.outcome == PermissionOutcome.DENY
+    assert decision.source == PermissionSource.CONFIG_ERROR

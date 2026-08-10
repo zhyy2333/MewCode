@@ -523,6 +523,13 @@ def test_main_provider_startup_error_returns_one(monkeypatch) -> None:
     profile = ProviderProfile("main", "openai", "model", "https://example.test", "secret")
     monkeypatch.setattr(cli, "load_active_profile", lambda: profile)
     monkeypatch.setattr(cli, "create_provider", lambda loaded: (_ for _ in ()).throw(ProviderError("provider missing")))
+    monkeypatch.setattr(
+        cli,
+        "McpRuntime",
+        lambda root: (_ for _ in ()).throw(
+            AssertionError("MCP runtime must not start before provider validation")
+        ),
+    )
     stderr = io.StringIO()
     monkeypatch.setattr(cli.sys, "stderr", stderr)
     assert cli.main([]) == 1
@@ -582,6 +589,11 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
 
 
 def test_main_permission_config_error_returns_one(monkeypatch) -> None:
+    profile = ProviderProfile(
+        "main", "openai", "model", "https://example.test", "secret"
+    )
+    monkeypatch.setattr(cli, "load_active_profile", lambda: profile)
+    monkeypatch.setattr(cli, "create_provider", lambda loaded: object())
     monkeypatch.setattr(
         cli.PermissionConfigLoader,
         "load",
@@ -614,3 +626,144 @@ def test_token_output_shows_cache_tokens_and_unknowns() -> None:
         "  tokens: in=10 out=2 total=12 cache-read=7 cache-write=3 "
         "cumulative=24 cumulative-cache-read=n/a cumulative-cache-write=0\n"
     )
+
+
+def _prepare_mcp_cli(monkeypatch, config_result, runtime_class, *, repl_result=0):
+    from types import SimpleNamespace
+    from mewcode.permissions import PermissionRuleSets
+    from mewcode.providers import ProviderProfile
+
+    profile = ProviderProfile(
+        "main", "openai", "model", "https://example.test", "secret"
+    )
+    captured = {}
+    monkeypatch.setattr(cli, "load_active_profile", lambda: profile)
+    monkeypatch.setattr(cli, "create_provider", lambda loaded: object())
+    monkeypatch.setattr(cli.McpConfigLoader, "load", lambda self, paths: config_result)
+    monkeypatch.setattr(cli, "McpRuntime", runtime_class)
+
+    def load_permissions(self, paths, known_tools, deferred=()):
+        captured["known_tools"] = set(known_tools)
+        captured["deferred"] = tuple(deferred)
+        return PermissionRuleSets()
+
+    monkeypatch.setattr(cli.PermissionConfigLoader, "load", load_permissions)
+
+    class FakeConversation:
+        def __init__(self, runner, registry):
+            captured["registry"] = registry
+
+    class FakeRepl:
+        def __init__(self, conversation, *, permission_controller):
+            pass
+        def run(self):
+            return repl_result
+
+    monkeypatch.setattr(cli, "Conversation", FakeConversation)
+    monkeypatch.setattr(cli, "Repl", FakeRepl)
+    return captured
+
+
+def test_cli_without_mcp_config_preserves_existing_tool_and_exit_behavior(monkeypatch) -> None:
+    from mewcode.mcp.config import McpConfigLoadResult
+
+    class RuntimeMustNotStart:
+        def __init__(self, root):
+            raise AssertionError("runtime must not start")
+
+    captured = _prepare_mcp_cli(
+        monkeypatch, McpConfigLoadResult((), (), ()), RuntimeMustNotStart
+    )
+    assert cli.main([]) == 0
+    assert len(captured["registry"].list()) == 6
+
+
+def test_cli_registers_healthy_mcp_tools_and_deferred_namespaces(monkeypatch) -> None:
+    from types import SimpleNamespace
+    from mewcode.mcp.config import McpConfigLoadResult
+    from mewcode.mcp.models import StdioServerConfig
+    from mewcode.mcp.runtime import McpRuntimeStartResult
+    from mewcode.tools import PermissionTargetKind, ToolPermissionSpec, ToolSafety
+
+    remote = SimpleNamespace(
+        name="server__echo",
+        description="Echo",
+        parameters_schema={},
+        safety=ToolSafety.SIDE_EFFECT,
+        permission_spec=ToolPermissionSpec(None, PermissionTargetKind.TOOL, "invoke"),
+    )
+
+    class Runtime:
+        def __init__(self, root): pass
+        def start(self, configs, reserved):
+            assert "read_file" in reserved
+            return McpRuntimeStartResult((remote,), ())
+        def close(self): return ()
+
+    config = McpConfigLoadResult(
+        (StdioServerConfig("server", "fake"),), (), ("server__",)
+    )
+    captured = _prepare_mcp_cli(monkeypatch, config, Runtime)
+    assert cli.main([]) == 0
+    assert "server__echo" in captured["known_tools"]
+    assert captured["deferred"] == ("server__",)
+
+
+def test_cli_prints_server_warning_without_leaking_secret(monkeypatch) -> None:
+    from mewcode.mcp.config import McpConfigLoadResult
+    from mewcode.mcp.models import McpDiagnostic, McpPhase
+
+    warning = McpDiagnostic("bad", McpPhase.CONFIG, "safe reason")
+    class RuntimeMustNotStart:
+        def __init__(self, root): raise AssertionError
+    _prepare_mcp_cli(monkeypatch, McpConfigLoadResult((), (warning,), ()), RuntimeMustNotStart)
+    stderr = io.StringIO(); monkeypatch.setattr(cli.sys, "stderr", stderr)
+    assert cli.main([]) == 0
+    assert "bad" in stderr.getvalue() and "sentinel-secret" not in stderr.getvalue()
+
+
+def test_cli_closes_mcp_runtime_on_normal_exit(monkeypatch) -> None:
+    from mewcode.mcp.config import McpConfigLoadResult
+    from mewcode.mcp.models import StdioServerConfig
+    from mewcode.mcp.runtime import McpRuntimeStartResult
+
+    calls = []
+    class Runtime:
+        def __init__(self, root): pass
+        def start(self, configs, reserved): calls.append("start"); return McpRuntimeStartResult((), ())
+        def close(self): calls.append("close"); return ()
+    _prepare_mcp_cli(monkeypatch, McpConfigLoadResult((StdioServerConfig("s", "x"),), (), ("s__",)), Runtime)
+    assert cli.main([]) == 0 and calls == ["start", "close"]
+
+
+def test_cli_closes_partial_runtime_when_later_startup_fails(monkeypatch) -> None:
+    from mewcode.mcp.config import McpConfigLoadResult
+    from mewcode.mcp.models import StdioServerConfig
+    from mewcode.mcp.runtime import McpRuntimeStartResult
+
+    calls = []
+    class Runtime:
+        def __init__(self, root): pass
+        def start(self, configs, reserved): calls.append("start"); return McpRuntimeStartResult((), ())
+        def close(self): calls.append("close"); return ()
+    _prepare_mcp_cli(monkeypatch, McpConfigLoadResult((StdioServerConfig("s", "x"),), (), ("s__",)), Runtime)
+    monkeypatch.setattr(cli.PermissionConfigLoader, "load", lambda *args: (_ for _ in ()).throw(PermissionConfigError("bad permissions")))
+    assert cli.main([]) == 1 and calls == ["start", "close"]
+
+
+def test_cli_closes_runtime_on_keyboard_interrupt(monkeypatch) -> None:
+    from mewcode.mcp.config import McpConfigLoadResult
+    from mewcode.mcp.models import StdioServerConfig
+    from mewcode.mcp.runtime import McpRuntimeStartResult
+
+    calls = []
+    class Runtime:
+        def __init__(self, root): pass
+        def start(self, configs, reserved): calls.append("start"); return McpRuntimeStartResult((), ())
+        def close(self): calls.append("close"); return ()
+    _prepare_mcp_cli(monkeypatch, McpConfigLoadResult((StdioServerConfig("s", "x"),), (), ("s__",)), Runtime)
+    class InterruptRepl:
+        def __init__(self, *args, **kwargs): pass
+        def run(self): raise KeyboardInterrupt
+    monkeypatch.setattr(cli, "Repl", InterruptRepl)
+    assert cli.main([]) == 130 and calls == ["start", "close"]

@@ -24,6 +24,16 @@ class PermissionTargetBuilder:
         spec = getattr(call.tool, "permission_spec", None)
         if spec is None:
             return self._deny_config("Tool has no permission target declaration.")
+        if spec.kind == PermissionTargetKind.TOOL:
+            if spec.argument is not None:
+                return self._deny_config(
+                    "Static tool permission target must not read a call argument."
+                )
+            if not isinstance(spec.default, str) or not spec.default.strip():
+                return self._deny_config("Tool permission target is missing or invalid.")
+            return PermissionTarget(call.tool.name, spec.default.strip(), spec.kind)
+        if spec.argument is None:
+            return self._deny_config("Tool permission target argument is missing.")
         value = call.request.arguments.get(spec.argument, spec.default)
         if not isinstance(value, str) or not value.strip():
             return self._deny_config("Tool permission target is missing or invalid.")

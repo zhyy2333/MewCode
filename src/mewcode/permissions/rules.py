@@ -47,6 +47,7 @@ def parse_permission_rule(
     effect: PermissionEffect | str,
     scope: RuleScope,
     known_tools: set[str],
+    deferred_tool_prefixes: tuple[str, ...] = (),
 ) -> PermissionRule:
     if not isinstance(expression, str) or not expression:
         raise PermissionRuleError("Rule expression must be a non-empty string.")
@@ -57,7 +58,9 @@ def parse_permission_rule(
     pattern = expression[opening + 1 : -1]
     if not tool_name or tool_name.strip() != tool_name:
         raise PermissionRuleError("Rule tool name must be non-empty without whitespace.")
-    if tool_name not in known_tools:
+    if tool_name not in known_tools and not any(
+        tool_name.startswith(prefix) for prefix in deferred_tool_prefixes
+    ):
         raise PermissionRuleError(f"Unknown tool in permission rule: {tool_name}")
     if pattern == "":
         raise PermissionRuleError("Rule pattern must not be empty.")
