@@ -30,6 +30,7 @@ class StopReason(StrEnum):
     STREAM_ERROR = "stream_error"
     CONTEXT_CAPACITY = "context_capacity"
     CONTEXT_COMPACTION = "context_compaction"
+    SESSION_PERSISTENCE = "session_persistence"
     ERROR = "error"
 
 
@@ -88,6 +89,15 @@ class AgentContextStatus:
     status: ContextStatus
 
 
+@dataclass(frozen=True)
+class AgentContinuityStatus:
+    run_id: str
+    iteration: int
+    component: Literal["instructions", "session", "memory"]
+    message: str
+    warning: bool = False
+
+
 ProgressPhase = Literal[
     "run_started",
     "iteration_started",
@@ -125,6 +135,7 @@ AgentEvent = (
     | AgentPermissionDecision
     | AgentTokenUsage
     | AgentContextStatus
+    | AgentContinuityStatus
     | AgentProgress
     | AgentStopped
 )

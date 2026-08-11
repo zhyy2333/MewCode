@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 from uuid import uuid4
 
 from mewcode.context import (
@@ -45,6 +45,14 @@ PLAN_FINAL_MAX_TOKENS = 8192
 
 
 class AgentRunStateError(RuntimeError):
+    pass
+
+
+class HistoryCommitSink(Protocol):
+    def commit(self, messages: Sequence[ChatMessage]) -> None: ...
+
+
+class _HistoryCommitError(RuntimeError):
     pass
 
 
@@ -103,6 +111,7 @@ class AgentRun:
         prompt_builder: PromptBuilder,
         prompt_context: PromptRunContext,
         context_manager: ContextManager | None,
+        history_commit_sink: HistoryCommitSink | None,
     ) -> None:
         self._run_id = run_id
         self._mode = mode
@@ -115,6 +124,7 @@ class AgentRun:
         self._prompt_builder = prompt_builder
         self._prompt_context = prompt_context
         self._context_manager = context_manager
+        self._history_commit_sink = history_commit_sink
         self._state = _State.NEW
         self._outcome: AgentRunOutcome | None = None
         self._cancel_requested = asyncio.Event()
@@ -205,7 +215,7 @@ class AgentRun:
                         cumulative_usage = cumulative_usage.add(preparation.usage)
                         if preparation.changed:
                             working_messages = list(preparation.messages)
-                            self._committed_history = tuple(
+                            candidate = tuple(
                                 [
                                     *(
                                         message
@@ -216,6 +226,7 @@ class AgentRun:
                                     *plan_investigation_messages,
                                 ]
                             )
+                            self._commit_history(candidate)
                         if preparation.request is None:
                             reason = (
                                 StopReason.CONTEXT_CAPACITY
@@ -302,17 +313,18 @@ class AgentRun:
                         )
                         return
                     assistant_messages = self._provider.assistant_messages(response)
-                    if not user_committed:
-                        new_messages.append(self._user_message)
-                        user_committed = True
-                    new_messages.extend(assistant_messages)
-                    self._committed_history = tuple(
+                    candidate = tuple(
                         [
                             *working_messages,
                             *plan_investigation_messages,
                             *assistant_messages,
                         ]
                     )
+                    self._commit_history(candidate)
+                    if not user_committed:
+                        new_messages.append(self._user_message)
+                        user_committed = True
+                    new_messages.extend(assistant_messages)
                     yield self._finish(
                         StopReason.COMPLETED,
                         iteration,
@@ -325,14 +337,15 @@ class AgentRun:
                 if response.finish_reason is ProviderFinishReason.NATURAL:
                     if self._mode is AgentMode.PLAN:
                         assistant_messages = self._provider.assistant_messages(response)
+                        candidate = tuple(
+                            [*working_messages, *plan_investigation_messages, *assistant_messages]
+                        )
+                        self._commit_history(candidate)
                         if not user_committed:
                             new_messages.append(self._user_message)
                             user_committed = True
                         new_messages.extend(assistant_messages)
                         plan_investigation_messages.extend(assistant_messages)
-                        self._committed_history = tuple(
-                            [*working_messages, *plan_investigation_messages]
-                        )
                         plan_finalizing = True
                         continue
                     if not response.text.strip():
@@ -345,12 +358,13 @@ class AgentRun:
                         )
                         return
                     assistant_messages = self._provider.assistant_messages(response)
+                    candidate = tuple([*working_messages, *assistant_messages])
+                    self._commit_history(candidate)
                     if not user_committed:
                         new_messages.append(self._user_message)
                         user_committed = True
                     new_messages.extend(assistant_messages)
                     working_messages.extend(assistant_messages)
-                    self._committed_history = tuple(working_messages)
                     yield self._finish(
                         StopReason.COMPLETED,
                         iteration,
@@ -438,6 +452,10 @@ class AgentRun:
                     executions,
                     group_id,
                 )
+                candidate = tuple(
+                    [*working_messages, *assistant_messages, *tool_messages]
+                )
+                self._commit_history(candidate)
                 if not user_committed:
                     new_messages.append(self._user_message)
                     user_committed = True
@@ -445,7 +463,6 @@ class AgentRun:
                 new_messages.extend(tool_messages)
                 working_messages.extend(assistant_messages)
                 working_messages.extend(tool_messages)
-                self._committed_history = tuple(working_messages)
 
                 if self._cancel_requested.is_set():
                     yield self._finish(
@@ -486,6 +503,15 @@ class AgentRun:
                 new_messages,
                 cumulative_usage,
             )
+        except _HistoryCommitError as exc:
+            yield self._finish(
+                StopReason.SESSION_PERSISTENCE,
+                iteration,
+                final_text,
+                new_messages,
+                cumulative_usage,
+                str(exc),
+            )
         except Exception as exc:
             yield self._finish(
                 StopReason.ERROR,
@@ -498,6 +524,17 @@ class AgentRun:
         finally:
             self._consumer_task = None
             self._done.set()
+
+    def _commit_history(self, messages: Sequence[ChatMessage]) -> None:
+        candidate = tuple(messages)
+        try:
+            if self._history_commit_sink is not None:
+                self._history_commit_sink.commit(candidate)
+        except Exception as exc:
+            raise _HistoryCommitError(
+                "The current session could not be persisted."
+            ) from exc
+        self._committed_history = candidate
 
     async def cancel(self) -> None:
         if self._state is _State.COMPLETE:
@@ -575,6 +612,7 @@ class AgentRunner:
         tools: ToolRegistry,
         mode: AgentMode = AgentMode.DIRECT,
         prompt_context: PromptRunContext | None = None,
+        history_commit_sink: HistoryCommitSink | None = None,
     ) -> AgentRun:
         return AgentRun(
             run_id=self._id_factory(),
@@ -588,4 +626,5 @@ class AgentRunner:
             prompt_builder=self._prompt_builder,
             prompt_context=prompt_context or PromptRunContext(task=user_text),
             context_manager=self._context_manager,
+            history_commit_sink=history_commit_sink,
         )

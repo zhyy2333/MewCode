@@ -1,5 +1,6 @@
 from .events import (
     AgentEvent,
+    AgentContinuityStatus,
     AgentContextStatus,
     AgentMode,
     AgentPermissionDecision,
@@ -20,10 +21,12 @@ from .runner import (
     AgentRunOutcome,
     AgentRunStateError,
     AgentRunner,
+    HistoryCommitSink,
 )
 
 __all__ = [
     "AgentEvent",
+    "AgentContinuityStatus",
     "AgentContextStatus",
     "AgentMode",
     "AgentPermissionDecision",
@@ -34,6 +37,7 @@ __all__ = [
     "AgentRunOutcome",
     "AgentRunStateError",
     "AgentRunner",
+    "HistoryCommitSink",
     "AgentStopped",
     "AgentTextDelta",
     "AgentTokenUsage",

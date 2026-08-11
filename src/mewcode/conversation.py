@@ -14,6 +14,7 @@ from .agent import (
     AgentRunner,
 )
 from .context import ContextManager, ContextOperation, ContextStatus
+from .continuity import SessionBinding, SessionState, StoredPlan
 from .providers import ChatMessage
 from .tools import ToolRegistry, ToolSafety
 
@@ -37,13 +38,22 @@ class Conversation:
         tools: ToolRegistry,
         prompt_additions: PromptAdditions = PromptAdditions(),
         context_manager: ContextManager | None = None,
+        *,
+        initial_state: SessionState | None = None,
+        session: SessionBinding | None = None,
     ) -> None:
         self._runner = runner
         self._tools = tools
         self._prompt_additions = prompt_additions
         self._context_manager = context_manager
-        self._messages: list[ChatMessage] = []
-        self._pending_plan: PendingPlan | None = None
+        self._session = session
+        self._messages = list(initial_state.messages) if initial_state is not None else []
+        stored_plan = initial_state.pending_plan if initial_state is not None else None
+        self._pending_plan = (
+            PendingPlan(stored_plan.task, stored_plan.text)
+            if stored_plan is not None
+            else None
+        )
         self._active_run: AgentRun | None = None
         self._last_outcome: AgentRunOutcome | None = None
         self._active_context_operation: ContextOperation | None = None
@@ -81,7 +91,15 @@ class Conversation:
             and outcome.completed
             and outcome.final_text.strip()
         ):
-            self._pending_plan = PendingPlan(clean_task, outcome.final_text)
+            pending = PendingPlan(clean_task, outcome.final_text)
+            if self._session is not None:
+                try:
+                    self._session.commit_plan(StoredPlan(pending.task, pending.text))
+                except Exception as exc:
+                    raise ConversationError(
+                        "The pending plan could not be persisted."
+                    ) from exc
+            self._pending_plan = pending
 
     async def execute_plan(self) -> AsyncIterator[AgentEvent]:
         plan = self._pending_plan
@@ -96,6 +114,13 @@ class Conversation:
             yield event
         outcome = self._last_outcome
         if outcome is not None and outcome.completed:
+            if self._session is not None:
+                try:
+                    self._session.commit_plan(None)
+                except Exception as exc:
+                    raise ConversationError(
+                        "The pending plan could not be cleared."
+                    ) from exc
             self._pending_plan = None
 
     async def cancel_active(self) -> None:
@@ -116,6 +141,13 @@ class Conversation:
                 yield AgentContextStatus("compact", 0, status)
             outcome = operation.outcome
             if outcome.changed:
+                if self._session is not None:
+                    try:
+                        self._session.commit_history(outcome.messages)
+                    except Exception as exc:
+                        raise ConversationError(
+                            "The compacted session could not be persisted."
+                        ) from exc
                 self._messages = list(outcome.messages)
         finally:
             if self._active_context_operation is operation:
@@ -123,6 +155,8 @@ class Conversation:
 
     async def close(self) -> tuple[ContextStatus, ...]:
         await self.cancel_active()
+        if self._session is not None:
+            self._session.close()
         if self._context_manager is None:
             return ()
         return self._context_manager.close()
@@ -142,6 +176,7 @@ class Conversation:
             tools,
             mode,
             prompt_context,
+            history_commit_sink=self._session,
         )
         self._active_run = run
         self._last_outcome = None

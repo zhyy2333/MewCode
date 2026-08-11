@@ -61,6 +61,17 @@ def _runner(provider, *, max_iterations: int = 20, unknown_limit: int = 3):
     )
 
 
+class RecordingHistorySink:
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.commits: list[tuple[ChatMessage, ...]] = []
+
+    def commit(self, messages) -> None:
+        if self.fail:
+            raise OSError("disk details must stay private")
+        self.commits.append(tuple(messages))
+
+
 def _summary_response(path: str) -> str:
     titles = (
         "当前目标",
@@ -134,6 +145,72 @@ def test_preflight_compacts_history_before_main_provider_call(tmp_path: Path) ->
         run.outcome.new_messages[-1],
     )
     archive.close()
+
+
+def test_compaction_is_committed_before_main_provider_call(tmp_path: Path) -> None:
+    path = ".mewcode/context/session/history-000001.json"
+    provider = ScriptedAsyncProvider(
+        [[ProviderTextDelta(_summary_response(path))], [ProviderTextDelta("done")]]
+    )
+    archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+    archive.start()
+    manager = ContextManager(provider, archive, ContextConfig(40_000))
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run-1",
+        context_manager=manager,
+    )
+    sink = RecordingHistorySink()
+    history = tuple(
+        ChatMessage("user" if index % 2 == 0 else "assistant", "x" * 10_000)
+        for index in range(10)
+    )
+
+    run = runner.start(
+        history, "new request", ToolRegistry([]), history_commit_sink=sink
+    )
+    asyncio.run(collect_async(run.events()))
+
+    assert sink.commits[0][0].kind.value == "summary"
+    assert sink.commits[-1] == run.outcome.committed_history
+    archive.close()
+
+
+def test_tool_batch_and_final_answer_are_atomic_commits() -> None:
+    provider = ScriptedAsyncProvider(
+        [[ProviderToolCall(tool_call("1", "echo"))], [ProviderTextDelta("done")]]
+    )
+    sink = RecordingHistorySink()
+    run = _runner(provider).start(
+        [],
+        "work",
+        ToolRegistry([ControlledTool("echo")]),
+        history_commit_sink=sink,
+    )
+
+    asyncio.run(collect_async(run.events()))
+
+    assert [len(commit) for commit in sink.commits] == [3, 4]
+    assert sink.commits[0][-2].group_id == sink.commits[0][-1].group_id
+    assert sink.commits[-1] == run.outcome.committed_history
+
+
+def test_persistence_failure_stops_without_committing_candidate() -> None:
+    provider = ScriptedAsyncProvider([[ProviderTextDelta("done")]])
+    run = _runner(provider).start(
+        [],
+        "work",
+        ToolRegistry([]),
+        history_commit_sink=RecordingHistorySink(fail=True),
+    )
+
+    events = asyncio.run(collect_async(run.events()))
+
+    assert events[-1].reason is StopReason.SESSION_PERSISTENCE
+    assert events[-1].error == "The current session could not be persisted."
+    assert run.outcome.committed_history == ()
+    assert len(provider.calls) == 1
 
 
 def test_tool_result_is_shown_raw_then_archived_for_followup_context(

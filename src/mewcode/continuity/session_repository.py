@@ -81,6 +81,9 @@ class SessionBinding:
         self._append_record(encode_history(payload, operation, now or self._repository.now()))
         self._messages = candidate
 
+    def commit(self, messages: Sequence[ChatMessage]) -> None:
+        self.commit_history(messages)
+
     def commit_plan(
         self,
         pending_plan: StoredPlan | None,
