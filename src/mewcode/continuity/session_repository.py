@@ -23,7 +23,7 @@ from .session_codec import (
     encode_plan,
     encode_start,
     replay_file,
-    session_title,
+    scan_file,
     valid_tool_prefix,
 )
 from .session_models import (
@@ -154,18 +154,18 @@ class SessionRepository:
             if not SESSION_ID_PATTERN.fullmatch(session_id):
                 continue
             try:
-                replay = replay_file(path, session_id)
+                scanned = scan_file(path, session_id)
             except OSError:
                 continue
-            last = replay.last_activity or _mtime(path)
+            last = scanned.last_activity or _mtime(path)
             summaries.append(
                 SessionSummary(
                     session_id,
-                    session_title(replay.messages, session_id),
-                    len(replay.messages),
+                    scanned.title,
+                    scanned.message_count,
                     last,
-                    replay.recoverable and current - last <= SESSION_RETENTION,
-                    replay.invalid_lines,
+                    scanned.valid_start and current - last <= SESSION_RETENTION,
+                    scanned.invalid_lines,
                 )
             )
         return tuple(summaries)
@@ -199,11 +199,17 @@ class SessionRepository:
                     result.binding,
                     result.state,
                     tuple([*diagnostics, *result.diagnostics]),
+                    True,
                 )
             except SessionError:
                 diagnostics.append(_diagnostic("candidate_skipped", "A recent session could not be recovered."))
         created = self._create(current)
-        return SessionOpenResult(created.binding, created.state, tuple([*diagnostics, *created.diagnostics]))
+        return SessionOpenResult(
+            created.binding,
+            created.state,
+            tuple([*diagnostics, *created.diagnostics]),
+            False,
+        )
 
     def maintain(self, now: datetime | None = None) -> tuple[ContinuityDiagnostic, ...]:
         current = now or self.now()
@@ -269,6 +275,7 @@ class SessionRepository:
                 binding,
                 SessionState(session_id, (), None, now),
                 (_diagnostic("created", f"Created session {session_id}."),),
+                False,
             )
         raise SessionError("A unique session id could not be allocated.")
 
@@ -335,6 +342,7 @@ class SessionRepository:
                 binding,
                 SessionState(session_id, tuple(valid_messages), replay.pending_plan, now),
                 tuple(diagnostics),
+                True,
             )
         except BaseException:
             lock.close()

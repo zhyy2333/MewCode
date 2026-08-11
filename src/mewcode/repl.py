@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import TextIO
 
 from .agent import (
+    AgentContinuityStatus,
     AgentContextStatus,
     AgentEvent,
     AgentPermissionDecision,
@@ -31,12 +32,14 @@ class Repl:
         stderr: TextIO = sys.stderr,
         input_func: InputFunc = input,
         permission_controller: PermissionController | None = None,
+        startup_messages: tuple[str, ...] = (),
     ) -> None:
         self._conversation = conversation
         self._stdout = stdout
         self._stderr = stderr
         self._input = input_func
         self._permission_controller = permission_controller
+        self._startup_messages = startup_messages
 
     def run(self) -> int:
         self._stdout.write("MewCode\n")
@@ -44,6 +47,8 @@ class Repl:
             "Type /exit or /quit to exit. Use /plan <task>, /do, /compact, or "
             "/permissions.\n"
         )
+        for message in self._startup_messages:
+            self._stdout.write(f"{message}\n")
         self._stdout.flush()
 
         with asyncio.Runner() as runner:
@@ -217,6 +222,8 @@ class _EventRenderer:
 
 
 def _format_event(event: AgentEvent) -> str | None:
+    if isinstance(event, AgentContinuityStatus):
+        return f"{event.component}: {event.message}\n"
     if isinstance(event, AgentContextStatus):
         return f"context: {event.status.message}\n"
     if isinstance(event, AgentTextDelta):
@@ -270,6 +277,7 @@ def _is_secondary_event(event: AgentEvent) -> bool:
         event,
         (
             AgentPermissionDecision,
+            AgentContinuityStatus,
             AgentContextStatus,
             AgentToolCall,
             AgentToolResult,

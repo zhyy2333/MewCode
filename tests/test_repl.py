@@ -7,6 +7,7 @@ import pytest
 
 from mewcode import cli, repl as repl_module
 from mewcode.agent import (
+    AgentContinuityStatus,
     AgentContextStatus,
     AgentPermissionDecision,
     AgentProgress,
@@ -154,6 +155,13 @@ def test_context_status_is_rendered_without_summary_body() -> None:
     )
 
     assert render_events([event]) == "  context: history compacted\n"
+
+
+def test_continuity_status_is_rendered_separately() -> None:
+    event = AgentContinuityStatus(
+        "continuity", 0, "memory", "previous indexes kept", True
+    )
+    assert render_events([event]) == "  memory: previous indexes kept\n"
 
 
 def test_repl_event_indent_and_output_hides_json_arguments() -> None:
@@ -605,14 +613,16 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
             created["context_manager"] = context_manager
 
     class FakeSession:
-        def __init__(self, runner, tools, *, context_manager):
+        def __init__(self, runner, tools, *, context_manager, **continuity):
             created["runner"] = runner
             created["tools"] = tools
+            created["continuity"] = continuity
             assert context_manager is created["context_manager"]
 
     class FakeRepl:
-        def __init__(self, session, *, permission_controller):
+        def __init__(self, session, *, permission_controller, startup_messages=()):
             created["session"] = session
+            created["startup_messages"] = startup_messages
             assert permission_controller is created["controller"]
 
         def run(self) -> int:
@@ -624,6 +634,12 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
     monkeypatch.setattr(cli, "AgentRunner", FakeRunner)
     monkeypatch.setattr(cli, "Conversation", FakeSession)
     monkeypatch.setattr(cli, "Repl", FakeRepl)
+    from mewcode.mcp.config import McpConfigLoadResult
+    monkeypatch.setattr(
+        cli.McpConfigLoader,
+        "load",
+        lambda *args: McpConfigLoadResult((), (), ()),
+    )
 
     assert cli.main(["--permission-mode", "strict"]) == 7
     assert isinstance(created["provider"], FakeProvider)
@@ -660,6 +676,15 @@ def test_main_permission_config_error_returns_one(monkeypatch) -> None:
 def test_cli_rejects_invalid_permission_mode() -> None:
     with pytest.raises(SystemExit) as exc_info:
         cli.main(["--permission-mode", "unsafe"])
+    assert exc_info.value.code == 2
+
+
+def test_cli_session_flags_are_mutually_exclusive() -> None:
+    parser = cli._argument_parser()
+    assert parser.parse_args(["--new"]).new is True
+    assert parser.parse_args(["--resume", "20260811-120000-abcd"]).resume.endswith("abcd")
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["--new", "--resume", "20260811-120000-abcd"])
     assert exc_info.value.code == 2
 
 
@@ -702,13 +727,14 @@ def _prepare_mcp_cli(monkeypatch, config_result, runtime_class, *, repl_result=0
     monkeypatch.setattr(cli.PermissionConfigLoader, "load", load_permissions)
 
     class FakeConversation:
-        def __init__(self, runner, registry, *, context_manager):
+        def __init__(self, runner, registry, *, context_manager, **continuity):
             captured["registry"] = registry
             captured["context_manager"] = context_manager
+            captured["continuity"] = continuity
 
     class FakeRepl:
-        def __init__(self, conversation, *, permission_controller):
-            pass
+        def __init__(self, conversation, *, permission_controller, startup_messages=()):
+            captured["startup_messages"] = startup_messages
         def run(self):
             return repl_result
 

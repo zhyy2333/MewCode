@@ -89,13 +89,40 @@ mewcode --permission-mode default
 mewcode --permission-mode allow
 ```
 
+默认启动会自动恢复当前项目 30 天内最近一次可用会话。也可以强制新建或指定恢复：
+
+```powershell
+mewcode --new
+mewcode --resume 20260811-120000-abcd
+```
+
+`--new` 与 `--resume` 互斥。指定会话不存在、已过期、正被另一进程占用或无法恢复时，程序会明确报错，不会静默改用其他会话。
+
 也可以使用：
 
 ```powershell
 python -m mewcode
 ```
 
-进入 REPL 后，输入 `/exit` 或 `/quit` 退出。使用 `/permissions` 查询当前权限模式，或用 `/permissions strict|default|allow` 在会话中切换。使用 `/compact` 可立即尝试压缩较早的对话历史；命令本身不会写入历史。对话历史只保存在当前进程内，程序退出后不会保存。
+进入 REPL 后，输入 `/exit` 或 `/quit` 退出。使用 `/permissions` 查询当前权限模式，或用 `/permissions strict|default|allow` 在会话中切换。使用 `/compact` 可立即尝试压缩较早的对话历史；命令本身不会写入历史，压缩结果会持久化到当前会话。
+
+## 项目指令、会话与长期记忆
+
+启动时会按以下优先级加载人工维护的 Markdown 指令：
+
+1. `<workspace>/.mewcode/instructions.md`（最高）
+2. `<workspace>/MEWCODE.md`
+3. `~/.mewcode/instructions.md`（最低）
+
+指令文件可用独占一行的 `@include 相对路径` 拆分规则，路径相对当前文件解析，最多嵌套 5 层。项目级入口只能引用当前项目内的文件，用户级入口只能引用 `~/.mewcode/` 内的文件；循环、重复、越界和不可读引用会被安全跳过并显示简洁警告。
+
+会话保存在 `<workspace>/.mewcode/sessions/<session-id>.jsonl`。JSONL 采用追加写，不维护额外 meta 文件；恢复时跳过完整坏行、移除未配对的工具调用尾部，并在中断超过 24 小时时插入包含上次活动时间和本次恢复时间的 system 提醒。超过 30 天且未被其他进程占用的会话会定期清理。
+
+自动笔记分为用户偏好、纠正反馈、项目知识和参考资料。项目笔记位于 `<workspace>/.mewcode/memory/`，用户笔记位于 `~/.mewcode/memory/`；每条笔记是带 frontmatter 的 Markdown，并由各自的 `index.md` 索引。每份索引和合并注入内容均限制为 200 行、25KB，合并时优先保留项目记忆。自动记忆只作为参考知识，不能覆盖上述人工指令。
+
+模型自然给出最终回复后，终端会立即展示结果，再在后台用同一 Provider 更新笔记。下一条请求和正常退出会等待上一轮更新完成；更新失败时保留两份旧索引、只警告一次且不自动重试。写入会过滤常见凭据并通过双作用域事务避免项目索引与用户索引出现一新一旧。
+
+本阶段不使用向量数据库、RAG 检索或团队记忆同步。
 
 ## Agent Loop
 
@@ -107,7 +134,7 @@ python -m mewcode
 
 ## 结构化系统提示与缓存
 
-每次模型请求都使用同一套结构化系统提示。稳定前缀依次包含 Identity、System Constraints、Task Mode、Action Execution、Tool Use、Tone and Style 和 Text Output；Environment、调用方提供的自定义指令、已激活 Skill 内容、长期记忆以及当次 `<system-reminder>` 位于稳定边界之后。调用方未提供可选内容时，不会自动发现项目指令、激活 Skill 或创建记忆。
+每次模型请求都使用同一套结构化系统提示。稳定前缀依次包含 Identity、System Constraints、Task Mode、Action Execution、Tool Use、Tone and Style 和 Text Output；Environment、自动发现的项目/用户指令、调用方提供的自定义指令、已激活 Skill 内容、长期记忆以及当次 `<system-reminder>` 位于稳定边界之后。
 
 Plan 和 Execute 模式按一次 Agent Run 内的真实模型调用次数注入提醒：第 1, 5, 9, 13, 17 次使用完整指令，其余调用使用精简提醒。Direct Mode 不增加模式提醒。提醒使用系统语义，不会作为用户消息写入对话历史。
 
@@ -117,7 +144,7 @@ Plan 和 Execute 模式按一次 Agent Run 内的真实模型调用次数注入�
 tokens: in=... out=... total=... cache-read=... cache-write=... cumulative=... cumulative-cache-read=... cumulative-cache-write=...
 ```
 
-本阶段只接受调用方直接提供的自定义指令、Skill 和长期记忆内容，不加载项目指令文件、不自动激活 Skill、不生成或持久化记忆。MCP 工具来自启动时静态快照，不会改变结构化提示的运行时边界。
+MCP 工具来自启动时静态快照，不会改变结构化提示的运行时边界。MewCode 仍不会自动激活 Skill；只有人工指令和有界记忆索引会自动加入动态 Prompt。
 
 ## 上下文管理
 

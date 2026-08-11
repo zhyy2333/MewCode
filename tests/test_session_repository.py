@@ -91,6 +91,24 @@ def test_explicit_missing_expired_and_invalid(tmp_path: Path) -> None:
         repo.open(SessionOpenRequest(SessionOpenMode.RESUME, opened.state.session_id), NOW)
 
 
+def test_scan_uses_streaming_summary_instead_of_full_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path)
+    opened = repo.open(SessionOpenRequest(SessionOpenMode.NEW), NOW)
+    opened.binding.commit_history((ChatMessage("user", "streaming title"),), now=NOW)
+    opened.binding.close()
+    monkeypatch.setattr(
+        "mewcode.continuity.session_repository.replay_file",
+        lambda *args: (_ for _ in ()).throw(AssertionError("full replay not allowed")),
+    )
+
+    summaries = repo.scan(NOW)
+
+    assert summaries[0].title == "streaming title"
+    assert summaries[0].message_count == 1
+
+
 def test_partial_tail_and_tool_history_are_repaired(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     opened = repo.open(SessionOpenRequest(SessionOpenMode.NEW))

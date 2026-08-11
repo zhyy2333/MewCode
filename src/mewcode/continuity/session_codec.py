@@ -8,7 +8,8 @@ from typing import Any
 
 from mewcode.providers import ChatMessage, MessageKind
 
-from .session_models import SessionReplay, StoredPlan
+from .session_models import SessionReplay, SessionScan, StoredPlan
+from .sanitization import sanitize_text
 
 SESSION_VERSION = 1
 
@@ -134,6 +135,59 @@ def replay_file(path: Path, session_id: str) -> SessionReplay:
     )
 
 
+def scan_file(path: Path, session_id: str) -> SessionScan:
+    title = session_id
+    message_count = 0
+    last_activity: datetime | None = None
+    invalid = 0
+    valid_start = False
+    with path.open("rb") as handle:
+        for raw in handle:
+            if not raw.endswith(b"\n"):
+                invalid += 1
+                break
+            try:
+                record = json.loads(raw.decode("utf-8"))
+                if not isinstance(record, dict) or record.get("version") != SESSION_VERSION:
+                    raise ValueError("invalid record")
+                at = _parse_time(record.get("at"))
+                record_type = record.get("type")
+                if record_type == "start":
+                    if record.get("session_id") != session_id:
+                        raise ValueError("session id mismatch")
+                    valid_start = True
+                elif record_type == "history":
+                    decoded = tuple(
+                        decode_message(item)
+                        for item in _require_list(record.get("messages"))
+                    )
+                    operation = record.get("operation")
+                    if operation == "replace":
+                        message_count = len(decoded)
+                        title = session_title(decoded, session_id)
+                    elif operation == "append":
+                        if title == session_id:
+                            title = session_title(decoded, session_id)
+                        message_count += len(decoded)
+                    else:
+                        raise ValueError("invalid history operation")
+                elif record_type == "plan_state":
+                    _decode_plan(record.get("pending_plan"))
+                else:
+                    raise ValueError("unknown record")
+                last_activity = at if last_activity is None or at > last_activity else last_activity
+            except (UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+                invalid += 1
+    return SessionScan(
+        session_id,
+        title,
+        message_count,
+        last_activity,
+        invalid,
+        valid_start,
+    )
+
+
 def valid_tool_prefix(messages: Sequence[ChatMessage]) -> int:
     index = 0
     while index < len(messages):
@@ -182,7 +236,7 @@ def session_title(messages: Sequence[ChatMessage], fallback: str) -> str:
     for message in messages:
         if message.kind is not MessageKind.USER or not isinstance(message.content, str):
             continue
-        text = " ".join(message.content.split())
+        text = " ".join(sanitize_text(message.content).split())
         if text:
             return text[:60]
     return fallback

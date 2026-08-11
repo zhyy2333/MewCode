@@ -60,6 +60,7 @@ class SessionOpenResult:
     binding: SessionBinding
     state: SessionState
     diagnostics: tuple[ContinuityDiagnostic, ...] = ()
+    resumed: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,3 +77,13 @@ class SessionReplay:
     @property
     def recoverable(self) -> bool:
         return self.valid_start and self.last_activity is not None
+
+
+@dataclass(frozen=True)
+class SessionScan:
+    session_id: str
+    title: str
+    message_count: int
+    last_activity: datetime | None
+    invalid_lines: int
+    valid_start: bool
