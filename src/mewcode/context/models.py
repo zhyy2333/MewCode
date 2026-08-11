@@ -136,6 +136,11 @@ class CompactionMode(StrEnum):
     MANUAL = "manual"
 
 
+class ContextFailureKind(StrEnum):
+    CAPACITY = "capacity"
+    COMPACTION = "compaction"
+
+
 @dataclass(frozen=True)
 class ContextPreparation:
     request: ModelRequest | None
@@ -144,6 +149,7 @@ class ContextPreparation:
     usage: TokenUsage = field(default_factory=TokenUsage.zero)
     changed: bool = False
     error: str | None = None
+    failure_kind: ContextFailureKind | None = None
     cancelled: bool = False
 
 

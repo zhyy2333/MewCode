@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import TextIO
 
 from .agent import (
+    AgentContextStatus,
     AgentEvent,
     AgentPermissionDecision,
     AgentPermissionRequest,
@@ -40,40 +41,51 @@ class Repl:
     def run(self) -> int:
         self._stdout.write("MewCode\n")
         self._stdout.write(
-            "Type /exit or /quit to exit. Use /plan <task>, /do, or /permissions.\n"
+            "Type /exit or /quit to exit. Use /plan <task>, /do, /compact, or "
+            "/permissions.\n"
         )
         self._stdout.flush()
 
         with asyncio.Runner() as runner:
-            while True:
-                try:
-                    user_text = self._input("mew> ").strip()
-                except EOFError:
-                    self._stdout.write("\n")
-                    self._stdout.flush()
-                    return 0
-                if not user_text:
-                    continue
-                if user_text in {"/exit", "/quit"}:
-                    return 0
-                if self._handle_permissions_command(user_text):
-                    continue
+            try:
+                while True:
+                    try:
+                        user_text = self._input("mew> ").strip()
+                    except EOFError:
+                        self._stdout.write("\n")
+                        self._stdout.flush()
+                        return 0
+                    if not user_text:
+                        continue
+                    if user_text in {"/exit", "/quit"}:
+                        return 0
+                    if self._handle_permissions_command(user_text):
+                        continue
 
-                source = self._route(user_text)
+                    try:
+                        source = self._route(user_text)
+                        runner.run(self._consume(source))
+                        self._stdout.write("\n")
+                        self._stdout.flush()
+                    except KeyboardInterrupt:
+                        runner.run(self._conversation.cancel_active())
+                        self._stdout.write("\nagent: cancelled\n")
+                        self._stdout.flush()
+                    except ConversationError as exc:
+                        self._stderr.write(f"Error: {exc.message}\n")
+                        self._stderr.flush()
+                    except Exception as exc:
+                        runner.run(self._conversation.cancel_active())
+                        self._stderr.write(f"Error: event consumer failed: {exc}\n")
+                        self._stderr.flush()
+            finally:
                 try:
-                    runner.run(self._consume(source))
-                    self._stdout.write("\n")
-                    self._stdout.flush()
-                except KeyboardInterrupt:
-                    runner.run(self._conversation.cancel_active())
-                    self._stdout.write("\nagent: cancelled\n")
-                    self._stdout.flush()
-                except ConversationError as exc:
-                    self._stderr.write(f"Error: {exc.message}\n")
+                    warnings = runner.run(self._conversation.close())
+                    for warning in warnings:
+                        self._stderr.write(f"Warning: {warning.message}\n")
                     self._stderr.flush()
-                except Exception as exc:
-                    runner.run(self._conversation.cancel_active())
-                    self._stderr.write(f"Error: event consumer failed: {exc}\n")
+                except Exception:
+                    self._stderr.write("Warning: conversation shutdown failed.\n")
                     self._stderr.flush()
 
     def _route(self, user_text: str) -> AsyncIterator[AgentEvent]:
@@ -83,6 +95,10 @@ class Repl:
             return self._conversation.plan(user_text[len("/plan ") :])
         if user_text == "/do":
             return self._conversation.execute_plan()
+        if user_text == "/compact":
+            return self._conversation.compact()
+        if user_text.startswith("/compact "):
+            raise ConversationError("Usage: /compact")
         return self._conversation.ask(user_text)
 
     async def _consume(self, source: AsyncIterator[AgentEvent]) -> None:
@@ -201,6 +217,8 @@ class _EventRenderer:
 
 
 def _format_event(event: AgentEvent) -> str | None:
+    if isinstance(event, AgentContextStatus):
+        return f"context: {event.status.message}\n"
     if isinstance(event, AgentTextDelta):
         return event.text
     if isinstance(event, AgentToolCall):
@@ -252,6 +270,7 @@ def _is_secondary_event(event: AgentEvent) -> bool:
         event,
         (
             AgentPermissionDecision,
+            AgentContextStatus,
             AgentToolCall,
             AgentToolResult,
             AgentTokenUsage,

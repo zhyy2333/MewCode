@@ -15,6 +15,7 @@ from .models import (
     CompactionMode,
     ContextConfig,
     ContextError,
+    ContextFailureKind,
     ContextPreparation,
     ContextStatus,
     ContextStatusKind,
@@ -171,6 +172,7 @@ class ContextManager:
                 request.messages,
                 estimate.footprint,
                 error=message,
+                failure_kind=ContextFailureKind.CAPACITY,
             )
             return
 
@@ -194,6 +196,7 @@ class ContextManager:
                 request.messages,
                 estimate.footprint,
                 error=message,
+                failure_kind=ContextFailureKind.COMPACTION,
             )
             return
 
@@ -208,6 +211,7 @@ class ContextManager:
                 request.messages,
                 estimate.footprint,
                 error=message,
+                failure_kind=ContextFailureKind.CAPACITY,
             )
             return
 
@@ -236,6 +240,7 @@ class ContextManager:
                 usage=compacted.usage,
                 changed=True,
                 error=message,
+                failure_kind=ContextFailureKind.CAPACITY,
             )
             return
         state.outcome = ContextPreparation(
@@ -271,6 +276,7 @@ class ContextManager:
                 messages,
                 None,
                 error=message,
+                failure_kind=ContextFailureKind.COMPACTION,
             )
             return
 

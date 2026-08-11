@@ -2,16 +2,39 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 
-from mewcode.agent import AgentRunner, StopReason, ToolScheduler
+from mewcode.agent import AgentContextStatus, AgentRunner, StopReason, ToolScheduler
+from mewcode.context import ContextArchive, ContextConfig, ContextManager
 from mewcode.conversation import Conversation, ConversationError
 from mewcode.providers import ChatMessage, ModelRequest, ModelResponse, ProviderError, ProviderEvent, ProviderTextDelta
 from mewcode.prompting import PromptAdditions
 from mewcode.tools import ToolExecution, ToolRegistry
 
 from tests.fakes import AllowAllPermissionController, ScriptedAsyncProvider, collect_async
+
+
+def summary_response(path: str) -> str:
+    titles = (
+        "当前目标",
+        "仍有效的用户原始约束",
+        "关键决策及理由",
+        "已完成工作",
+        "当前代码与文件状态",
+        "未解决问题与风险",
+        "下一步行动",
+        "存盘记录索引",
+    )
+    body = "\n\n".join(
+        f"## {index}. {title}\n{path if index == 8 else '无'}"
+        for index, title in enumerate(titles, start=1)
+    )
+    return (
+        "<analysis_draft>draft</analysis_draft>"
+        f"<formal_summary>{body}</formal_summary>"
+    )
 
 
 def make_conversation(provider, tools: ToolRegistry | None = None) -> Conversation:
@@ -42,6 +65,48 @@ def test_messages_returns_copy() -> None:
     copied = conversation.messages()
     copied.clear()
     assert len(conversation.messages()) == 2
+
+
+def test_manual_compact_force_replaces_history_without_adding_command(tmp_path: Path) -> None:
+    path = ".mewcode/context/session/history-000001.json"
+    provider = ScriptedAsyncProvider(
+        [
+            *[[ProviderTextDelta(f"answer-{index}")] for index in range(5)],
+            [ProviderTextDelta(summary_response(path))],
+        ]
+    )
+    archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+    archive.start()
+    manager = ContextManager(
+        provider,
+        archive,
+        ContextConfig(128_000, recent_tokens=1, recent_messages=2),
+    )
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run",
+        context_manager=manager,
+    )
+    conversation = Conversation(
+        runner,
+        ToolRegistry([]),
+        context_manager=manager,
+    )
+    for index in range(5):
+        asyncio.run(collect_async(conversation.ask(f"question-{index}")))
+
+    events = asyncio.run(collect_async(conversation.compact()))
+    messages = conversation.messages()
+
+    assert any(isinstance(event, AgentContextStatus) for event in events)
+    assert messages[0].kind.value == "summary"
+    assert messages[1].kind.value == "boundary"
+    assert all(message.content != "/compact" for message in messages)
+    assert len(provider.calls) == 6
+    session_dir = archive.session_dir
+    assert asyncio.run(conversation.close()) == ()
+    assert session_dir is not None and not session_dir.exists()
 
 
 def test_stable_prefix_second_turn_includes_previous_context() -> None:

@@ -12,6 +12,7 @@ from mewcode.providers import (
     DEFAULT_MAX_TOKENS,
     ChatMessage,
     ConfigError,
+    MessageKind,
     ModelRequest,
     ProviderError,
     ProviderFinished,
@@ -590,6 +591,42 @@ def test_provider_end_to_end_maps_prompt_stream_and_cache_usage(
         assert request["input"][0]["content"][0]["text"] == "stable instructions"
         assert request["input"][1]["content"][0]["text"] == "dynamic context"
         assert request["prompt_cache_options"] == {"mode": "explicit"}
+
+
+@pytest.mark.parametrize("protocol", ["anthropic", "openai"])
+def test_summary_and_boundary_keep_system_semantics_for_each_protocol(
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: str,
+) -> None:
+    summary = ChatMessage("system", "rolling summary", MessageKind.SUMMARY)
+    boundary = ChatMessage("system", "reread files", MessageKind.BOUNDARY)
+    user = ChatMessage("user", "continue")
+    if protocol == "anthropic":
+        client_type = install_fake_anthropic(monkeypatch)
+        provider = AnthropicProvider(
+            profile("anthropic", base_url="https://api.anthropic.com/v1")
+        )
+    else:
+        client_type = install_fake_openai(monkeypatch)
+        provider = OpenAIProvider(profile("openai"))
+
+    asyncio.run(
+        collect_async(provider.stream_reply(model_request(summary, boundary, user)))
+    )
+    request = client_type.created[0].requests[0]
+
+    if protocol == "anthropic":
+        assert [item["text"] for item in request["system"]][-2:] == [
+            "rolling summary",
+            "reread files",
+        ]
+        assert request["messages"] == [{"role": "user", "content": "continue"}]
+    else:
+        assert request["input"][-3:] == [
+            {"role": "system", "content": "rolling summary"},
+            {"role": "system", "content": "reread files"},
+            {"role": "user", "content": "continue"},
+        ]
 
 
 def test_openai_streams_text_usage_and_builds_request(monkeypatch: pytest.MonkeyPatch) -> None:

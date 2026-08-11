@@ -51,7 +51,7 @@ def test_single_large_result_is_archived_with_bounded_head_tail_preview(
     archive.close()
 
 
-def test_batch_archives_largest_results_until_actual_payload_is_under_budget(
+def test_batch_deterministic_selection_archives_largest_until_under_budget(
     tmp_path: Path,
 ) -> None:
     archive, compactor = started_compactor(tmp_path)
@@ -85,7 +85,7 @@ def test_small_batch_is_left_unchanged(tmp_path: Path) -> None:
     archive.close()
 
 
-def test_archival_failure_rolls_back_the_entire_batch(
+def test_atomic_archival_failure_rolls_back_the_entire_batch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     archive, compactor = started_compactor(tmp_path)
@@ -107,4 +107,55 @@ def test_archival_failure_rolls_back_the_entire_batch(
 
     assert archive.session_dir is not None
     assert list(archive.session_dir.glob("tool-*.json")) == []
+    archive.close()
+
+
+def test_single_threshold_uses_strictly_greater_than_original_estimate(
+    tmp_path: Path,
+) -> None:
+    item = execution(0, 12_000)
+    size = estimate_text_tokens(serialize_tool_result(item.result))
+
+    exact_archive = ContextArchive(tmp_path / "exact", session_id_factory=lambda: "s")
+    exact_archive.start()
+    exact = ToolResultCompactor(
+        exact_archive,
+        ContextConfig(
+            128_000,
+            single_tool_tokens=size,
+            tool_batch_tokens=size + 100,
+        ),
+    ).compact([item])
+    assert exact.archives == ()
+    exact_archive.close()
+
+    over_archive = ContextArchive(tmp_path / "over", session_id_factory=lambda: "s")
+    over_archive.start()
+    over = ToolResultCompactor(
+        over_archive,
+        ContextConfig(
+            128_000,
+            single_tool_tokens=size - 1,
+            tool_batch_tokens=size + 100,
+        ),
+    ).compact([item])
+    assert len(over.archives) == 1
+    over_archive.close()
+
+
+def test_security_tool_content_and_name_do_not_control_paths_or_status(
+    tmp_path: Path,
+) -> None:
+    secret = "SECRET-VALUE-DO-NOT-PRINT"
+    item = execution(0, 40_000, name=f"../bad/{secret}\n")
+    archive, compactor = started_compactor(tmp_path)
+
+    result = compactor.compact([item])
+
+    record = result.archives[0]
+    assert record.relative_path.endswith("tool-000001.json")
+    assert secret not in record.relative_path
+    assert secret not in result.statuses[0].message
+    assert "../bad" not in result.statuses[0].message
+    assert (tmp_path / record.relative_path).parent == archive.session_dir
     archive.close()

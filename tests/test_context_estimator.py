@@ -5,6 +5,9 @@ import math
 from mewcode.context import TokenEstimator, estimate_text_tokens
 from mewcode.prompting import PromptPackage
 from mewcode.providers import ChatMessage, ModelRequest, TokenUsage
+from mewcode.tools import ToolRegistry
+
+from tests.fakes import ControlledTool
 
 
 def request(*messages: ChatMessage) -> ModelRequest:
@@ -21,7 +24,7 @@ def test_weighted_character_estimate_is_conservative() -> None:
     assert estimate_text_tokens("猫a") == 2
 
 
-def test_estimator_anchors_actual_usage_and_only_estimates_delta() -> None:
+def test_estimator_anchor_and_incremental_delta_use_actual_usage() -> None:
     estimator = TokenEstimator()
     before = request(ChatMessage("user", "hello"))
     before_estimate = estimator.estimate(before)
@@ -68,3 +71,47 @@ def test_estimator_handles_history_replacement_after_anchor() -> None:
 
     assert estimate.anchored is True
     assert 0 <= estimate.input_tokens < 1_500
+
+
+def test_footprint_covers_stable_dynamic_messages_and_sorted_tools() -> None:
+    estimator = TokenEstimator()
+    base = request(ChatMessage("user", "hello"))
+    signatures = {estimator.footprint(base).signature}
+    signatures.add(
+        estimator.footprint(
+            ModelRequest(PromptPackage("changed", "dynamic"), base.messages)
+        ).signature
+    )
+    signatures.add(
+        estimator.footprint(
+            ModelRequest(PromptPackage("stable", "changed"), base.messages)
+        ).signature
+    )
+    signatures.add(
+        estimator.footprint(
+            request(ChatMessage("user", "changed"))
+        ).signature
+    )
+    registry = ToolRegistry([ControlledTool("z"), ControlledTool("a")])
+    tool_request = ModelRequest(base.prompt, base.messages, registry)
+    signatures.add(estimator.footprint(tool_request).signature)
+
+    assert len(signatures) == 5
+    reversed_registry = ToolRegistry([ControlledTool("a"), ControlledTool("z")])
+    assert estimator.footprint(tool_request).signature == estimator.footprint(
+        ModelRequest(base.prompt, base.messages, reversed_registry)
+    ).signature
+
+
+def test_missing_usage_keeps_estimate_unanchored_then_valid_usage_reanchors() -> None:
+    estimator = TokenEstimator()
+    model_request = request(ChatMessage("user", "hello"))
+    footprint = estimator.footprint(model_request)
+
+    estimator.observe(footprint, TokenUsage())
+    assert estimator.estimate(model_request).anchored is False
+
+    estimator.observe(footprint, TokenUsage(context_input_tokens=321))
+    estimate = estimator.estimate(model_request)
+    assert estimate.anchored is True
+    assert estimate.input_tokens == 321

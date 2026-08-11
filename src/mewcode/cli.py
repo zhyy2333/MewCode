@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .agent import AgentRunner, ToolScheduler
 from .config import load_active_profile
+from .context import ContextArchive, ContextConfig, ContextError, ContextManager
 from .conversation import Conversation
 from .mcp import McpConfigLoader, McpConfigPaths, McpDiagnostic, McpError, McpRuntime
 from .permissions import (
@@ -38,10 +39,18 @@ def _argument_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     arguments = _argument_parser().parse_args(argv)
     mcp_runtime: McpRuntime | None = None
+    context_archive: ContextArchive | None = None
     try:
         workspace = Workspace(Path.cwd())
         profile = load_active_profile()
         provider = create_provider(profile)
+        context_archive = ContextArchive(workspace.root)
+        _write_context_diagnostics(context_archive.start())
+        context_manager = ContextManager(
+            provider,
+            context_archive,
+            ContextConfig(profile.context_window),
+        )
 
         builtin_registry = create_builtin_registry(workspace)
         builtin_tools = builtin_registry.list()
@@ -84,8 +93,13 @@ def main(argv: list[str] | None = None) -> int:
             provider,
             scheduler,
             prompt_builder=prompt_builder,
+            context_manager=context_manager,
         )
-        conversation = Conversation(agent_runner, registry)
+        conversation = Conversation(
+            agent_runner,
+            registry,
+            context_manager=context_manager,
+        )
         return Repl(
             conversation, permission_controller=permission_controller
         ).run()
@@ -94,6 +108,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except (ConfigError, ProviderError) as exc:
         sys.stderr.write(f"Error: {exc.message}\n")
+        return 1
+    except ContextError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
         return 1
     except McpError as exc:
         sys.stderr.write(
@@ -105,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("\n")
         return 130
     finally:
+        if context_archive is not None:
+            _write_context_diagnostics(context_archive.close())
         if mcp_runtime is not None:
             try:
                 _write_mcp_diagnostics(mcp_runtime.close())
@@ -119,3 +138,8 @@ def _write_mcp_diagnostics(diagnostics: tuple[McpDiagnostic, ...]) -> None:
             f"Warning: MCP server '{server}' {diagnostic.phase.value} failed: "
             f"{diagnostic.message}\n"
         )
+
+
+def _write_context_diagnostics(diagnostics) -> None:
+    for diagnostic in diagnostics:
+        sys.stderr.write(f"Warning: {diagnostic.message}\n")

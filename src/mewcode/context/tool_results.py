@@ -107,9 +107,9 @@ class ToolResultCompactor:
         statuses = tuple(
             ContextStatus(
                 ContextStatusKind.TOOL_ARCHIVED,
-                f"Archived tool result for {original[index].request.name} at {record.relative_path}.",
+                f"Archived a tool result at {record.relative_path}.",
             )
-            for index, record in zip(sorted(selected), records, strict=True)
+            for _index, record in zip(sorted(selected), records, strict=True)
         )
         return ToolCompactionResult(compacted, tuple(records), statuses)
 

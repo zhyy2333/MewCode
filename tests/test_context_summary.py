@@ -24,6 +24,7 @@ from mewcode.providers import (
     MessageKind,
     ProviderFinished,
     ProviderFinishReason,
+    ProviderError,
     ProviderTextDelta,
     ProviderToolCall,
     ProviderUsage,
@@ -43,10 +44,10 @@ def config(**overrides: int) -> ContextConfig:
     return ContextConfig(**values)
 
 
-def formal_summary(path: str) -> str:
+def formal_summary(path: str, constraint: str = "逐字约束") -> str:
     sections = (
         ("当前目标", "继续实现上下文管理。"),
-        ("仍有效的用户原始约束", "逐字约束"),
+        ("仍有效的用户原始约束", constraint),
         ("关键决策及理由", "采用两层压缩以控制容量。"),
         ("已完成工作", "已完成估算器。"),
         ("当前代码与文件状态", "工作区存在上下文包。"),
@@ -129,7 +130,7 @@ def test_summary_prompt_has_fixed_contract_and_no_tools() -> None:
     assert ".mewcode/context/s/history.json" in request.messages[0].content
 
 
-def test_parser_returns_only_formal_summary() -> None:
+def test_parser_success_returns_only_formal_summary() -> None:
     parsed = SummaryParser().parse(formal_summary("history.json"))
 
     assert "private reasoning" not in parsed
@@ -179,7 +180,7 @@ def test_summary_collector_is_private_and_rejects_tool_calls() -> None:
     asyncio.run(scenario())
 
 
-def test_history_compaction_commits_summary_boundary_and_original_recent_messages(
+def test_compaction_success_commits_summary_boundary_and_original_recent_messages(
     tmp_path: Path,
 ) -> None:
     async def scenario() -> None:
@@ -211,6 +212,113 @@ def test_history_compaction_commits_summary_boundary_and_original_recent_message
         assert (tmp_path / result.archive.relative_path).exists()
         assert provider.calls[0].tools is None
         assert provider.calls[0].max_output_tokens == 8_192
+        archive.close()
+
+    asyncio.run(scenario())
+
+
+def test_active_constraints_remain_verbatim_and_full_original_is_archived(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> None:
+        constraint = "必须逐字保留：只修改 src/main.py"
+        path = ".mewcode/context/session/history-000001.json"
+        provider = ScriptedAsyncProvider(
+            [[ProviderTextDelta(formal_summary(path, constraint))]]
+        )
+        archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+        archive.start()
+        compactor = HistoryCompactor(provider, archive, config(), TokenEstimator())
+        messages = (
+            ChatMessage("user", constraint),
+            ChatMessage("assistant", "old work"),
+            ChatMessage("user", "x" * 80),
+            ChatMessage("assistant", "recent"),
+            ChatMessage("user", "latest"),
+        )
+
+        result = await compactor.compact(messages, CompactionMode.MANUAL)
+
+        assert constraint in result.messages[0].content
+        assert result.archive is not None
+        archived = (tmp_path / result.archive.relative_path).read_text(encoding="utf-8")
+        assert constraint in archived
+        archive.close()
+
+    asyncio.run(scenario())
+
+
+def test_rolling_compaction_replaces_old_summary_and_boundary(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        first_path = ".mewcode/context/session/history-000001.json"
+        second_path = ".mewcode/context/session/history-000002.json"
+        provider = ScriptedAsyncProvider(
+            [
+                [ProviderTextDelta(formal_summary(first_path))],
+                [ProviderTextDelta(formal_summary(second_path))],
+            ]
+        )
+        archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+        archive.start()
+        rolling_config = config(recent_tokens=1, recent_messages=2)
+        compactor = HistoryCompactor(
+            provider,
+            archive,
+            rolling_config,
+            TokenEstimator(),
+        )
+        first_messages = tuple(
+            ChatMessage("user", f"first-{index}") for index in range(5)
+        )
+        first = await compactor.compact(first_messages, CompactionMode.MANUAL)
+        second_input = (
+            *first.messages,
+            ChatMessage("assistant", "new work"),
+            ChatMessage("user", "next"),
+            ChatMessage("assistant", "latest"),
+        )
+
+        second = await compactor.compact(second_input, CompactionMode.MANUAL)
+
+        assert sum(message.kind is MessageKind.SUMMARY for message in second.messages) == 1
+        assert sum(message.kind is MessageKind.BOUNDARY for message in second.messages) == 1
+        assert first.messages[0].content not in {
+            message.content for message in second.messages
+        }
+        assert second_path in second.messages[0].content
+        archive.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    "script",
+    [
+        ProviderError("provider failed"),
+        [],
+        [ProviderTextDelta("invalid")],
+        [
+            ProviderTextDelta(formal_summary("unused")),
+            ProviderFinished(ProviderFinishReason.OUTPUT_LIMIT),
+        ],
+    ],
+)
+def test_failure_matrix_rolls_back_provider_empty_structure_and_truncation(
+    tmp_path: Path,
+    script,
+) -> None:
+    async def scenario() -> None:
+        provider = ScriptedAsyncProvider([script])
+        archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+        archive.start()
+        compactor = HistoryCompactor(provider, archive, config(), TokenEstimator())
+        messages = tuple(ChatMessage("user", f"message-{index}") for index in range(5))
+
+        with pytest.raises(ContextCompactionError):
+            await compactor.compact(messages, CompactionMode.MANUAL)
+
+        assert archive.session_dir is not None
+        assert list(archive.session_dir.glob("history-*.json")) == []
         archive.close()
 
     asyncio.run(scenario())

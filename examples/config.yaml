@@ -6,6 +6,7 @@ profiles:
     base_url: https://api.anthropic.com
     api_key: env:ANTHROPIC_API_KEY
     thinking: enabled
+    context_window: 128000
 
   - name: openai-main
     protocol: openai
@@ -13,8 +14,10 @@ profiles:
     base_url: https://api.openai.com/v1
     api_key: env:OPENAI_API_KEY
     thinking: disabled
+    context_window: 128000
 
 # thinking also accepts "auto". Existing true/false values remain compatible.
+# context_window 可省略；所有 Provider 缺省都按保守的 128000 Token 处理。
 
 # MCP Server 是可选配置。stdio 直接启动程序，不经过 shell。
 mcp_servers:

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator
+from pathlib import Path
 
 import pytest
 
 from mewcode.agent import (
+    AgentContextStatus,
     AgentMode,
     AgentProgress,
     AgentRunConfig,
@@ -18,6 +20,12 @@ from mewcode.agent import (
     AgentRunner,
     StopReason,
     ToolScheduler,
+)
+from mewcode.context import (
+    ContextArchive,
+    ContextArchiveError,
+    ContextConfig,
+    ContextManager,
 )
 from mewcode.prompting import PromptAdditions, PromptRunContext
 from mewcode.providers import (
@@ -53,6 +61,27 @@ def _runner(provider, *, max_iterations: int = 20, unknown_limit: int = 3):
     )
 
 
+def _summary_response(path: str) -> str:
+    titles = (
+        "当前目标",
+        "仍有效的用户原始约束",
+        "关键决策及理由",
+        "已完成工作",
+        "当前代码与文件状态",
+        "未解决问题与风险",
+        "下一步行动",
+        "存盘记录索引",
+    )
+    body = "\n\n".join(
+        f"## {index}. {title}\n{path if index == 8 else '无'}"
+        for index, title in enumerate(titles, start=1)
+    )
+    return (
+        "<analysis_draft>draft</analysis_draft>"
+        f"<formal_summary>{body}</formal_summary>"
+    )
+
+
 def test_completed_without_tools() -> None:
     provider = ScriptedAsyncProvider(
         [[ProviderTextDelta("hel"), ProviderTextDelta("lo"), ProviderUsage(TokenUsage(3, 2, 5))]]
@@ -68,6 +97,145 @@ def test_completed_without_tools() -> None:
     assert run.outcome.new_messages[0] == ChatMessage("user", "Hi")
     assert run.outcome.final_text == "hello"
     assert provider.calls[0].max_output_tokens == 4096
+
+
+def test_preflight_compacts_history_before_main_provider_call(tmp_path: Path) -> None:
+    path = ".mewcode/context/session/history-000001.json"
+    provider = ScriptedAsyncProvider(
+        [
+            [ProviderTextDelta(_summary_response(path))],
+            [ProviderTextDelta("done")],
+        ]
+    )
+    archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+    archive.start()
+    manager = ContextManager(provider, archive, ContextConfig(40_000))
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run-1",
+        context_manager=manager,
+    )
+    history = tuple(
+        ChatMessage("user" if index % 2 == 0 else "assistant", "x" * 10_000)
+        for index in range(10)
+    )
+
+    run = runner.start(history, "new request", ToolRegistry([]))
+    events = asyncio.run(collect_async(run.events()))
+
+    assert len(provider.calls) == 2
+    assert provider.calls[0].tools is None
+    assert provider.calls[0].max_output_tokens == 8_192
+    assert provider.calls[1].messages[0].kind.value == "summary"
+    assert any(isinstance(event, AgentContextStatus) for event in events)
+    assert run.outcome.reason is StopReason.COMPLETED
+    assert run.outcome.committed_history == provider.calls[1].messages + (
+        run.outcome.new_messages[-1],
+    )
+    archive.close()
+
+
+def test_tool_result_is_shown_raw_then_archived_for_followup_context(
+    tmp_path: Path,
+) -> None:
+    call = tool_call("call-1", "large")
+    provider = ScriptedAsyncProvider(
+        [[ProviderToolCall(call)], [ProviderTextDelta("done")]]
+    )
+    tool = ControlledTool(
+        "large",
+        result=ToolResult(True, "large", "HEAD" + "x" * 40_000 + "TAIL"),
+    )
+    archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+    archive.start()
+    manager = ContextManager(provider, archive, ContextConfig(128_000))
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run-1",
+        context_manager=manager,
+    )
+
+    run = runner.start([], "work", ToolRegistry([tool]))
+    events = asyncio.run(collect_async(run.events()))
+
+    raw_event = next(event for event in events if isinstance(event, AgentToolResult))
+    assert len(raw_event.execution.result.content) > 40_000
+    tool_message = provider.calls[1].messages[-1]
+    assert "[tool result archived]" in tool_message.content[0]["content"]
+    assert provider.calls[1].messages[-2].group_id == tool_message.group_id
+    assert tool_message.group_id == "run-1:1"
+    assert archive.session_dir is not None
+    assert len(list(archive.session_dir.glob("tool-*.json"))) == 1
+    archive.close()
+
+
+def test_tool_compaction_failure_stops_before_followup_and_commits_no_partial_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    call = tool_call("call-1", "large")
+    provider = ScriptedAsyncProvider([[ProviderToolCall(call)]])
+    tool = ControlledTool("large", result=ToolResult(True, "large", "result"))
+    archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+    archive.start()
+    manager = ContextManager(provider, archive, ContextConfig(128_000))
+    monkeypatch.setattr(
+        manager,
+        "compact_tool_results",
+        lambda _executions: (_ for _ in ()).throw(ContextArchiveError("failed")),
+    )
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run-1",
+        context_manager=manager,
+    )
+
+    run = runner.start([], "work", ToolRegistry([tool]))
+    events = asyncio.run(collect_async(run.events()))
+
+    assert events[-1].reason is StopReason.CONTEXT_COMPACTION
+    assert len(provider.calls) == 1
+    assert run.outcome.committed_history == ()
+    archive.close()
+
+
+def test_committed_history_keeps_successful_compaction_but_not_failed_user_turn(
+    tmp_path: Path,
+) -> None:
+    path = ".mewcode/context/session/history-000001.json"
+    provider = ScriptedAsyncProvider(
+        [
+            [ProviderTextDelta(_summary_response(path))],
+            ProviderError("main failed"),
+        ]
+    )
+    archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+    archive.start()
+    manager = ContextManager(provider, archive, ContextConfig(40_000))
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run-1",
+        context_manager=manager,
+    )
+    history = tuple(
+        ChatMessage("user" if index % 2 == 0 else "assistant", "x" * 10_000)
+        for index in range(10)
+    )
+
+    run = runner.start(history, "uncommitted request", ToolRegistry([]))
+    events = asyncio.run(collect_async(run.events()))
+
+    assert events[-1].reason is StopReason.STREAM_ERROR
+    assert run.outcome.committed_history[0].kind.value == "summary"
+    assert all(
+        message.content != "uncommitted request"
+        for message in run.outcome.committed_history
+    )
+    archive.close()
 
 
 def test_output_limit_is_not_completed_or_committed() -> None:

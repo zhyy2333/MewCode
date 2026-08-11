@@ -11,6 +11,7 @@ from mewcode.context import (
     ContextError,
     ContextManager,
     ContextStatusKind,
+    TokenEstimator,
 )
 from mewcode.prompting import PromptPackage
 from mewcode.providers import ChatMessage, ModelRequest, ProviderTextDelta, TokenUsage
@@ -84,6 +85,41 @@ def test_below_threshold_request_passes_without_summary_call(tmp_path: Path) -> 
     archive.close()
 
 
+def test_automatic_threshold_triggers_exactly_at_computed_boundary(
+    tmp_path: Path,
+) -> None:
+    model_request = request((ChatMessage("user", "x" * 20_000),))
+    estimate = TokenEstimator().estimate(model_request).input_tokens
+    boundary_window = estimate + model_request.max_output_tokens + 13_000
+
+    below_provider = ScriptedAsyncProvider([])
+    below_archive = ContextArchive(tmp_path / "below", session_id_factory=lambda: "s")
+    below_archive.start()
+    below = ContextManager(
+        below_provider,
+        below_archive,
+        ContextConfig(boundary_window + 1),
+    )
+    statuses, outcome = consume(below.prepare(model_request))
+    assert statuses == []
+    assert outcome.request is model_request
+    below_archive.close()
+
+    at_provider = ScriptedAsyncProvider([])
+    at_archive = ContextArchive(tmp_path / "at", session_id_factory=lambda: "s")
+    at_archive.start()
+    at = ContextManager(
+        at_provider,
+        at_archive,
+        ContextConfig(boundary_window),
+    )
+    statuses, outcome = consume(at.prepare(model_request))
+    assert statuses[0].kind is ContextStatusKind.COMPACTION_STARTED
+    assert outcome.request is None
+    assert at_provider.calls == []
+    at_archive.close()
+
+
 def test_automatic_compaction_rebuilds_request_before_main_model(tmp_path: Path) -> None:
     path = ".mewcode/context/session/history-000001.json"
     provider = ScriptedAsyncProvider(
@@ -105,7 +141,36 @@ def test_automatic_compaction_rebuilds_request_before_main_model(tmp_path: Path)
     archive.close()
 
 
-def test_three_failures_open_breaker_and_risky_request_stops_without_retry(
+def test_automatic_success_still_over_limit_keeps_summary_but_stops_main_call(
+    tmp_path: Path,
+) -> None:
+    path = ".mewcode/context/session/history-000001.json"
+    provider = ScriptedAsyncProvider(
+        [[ProviderTextDelta(summary_response(path))]]
+    )
+    archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+    archive.start()
+    manager = ContextManager(
+        provider,
+        archive,
+        ContextConfig(40_000, recent_tokens=24_000, recent_messages=5),
+    )
+    messages = tuple(
+        ChatMessage("user" if index % 2 == 0 else "assistant", "x" * 8_000)
+        for index in range(15)
+    )
+
+    statuses, outcome = consume(manager.prepare(request(messages)))
+
+    assert len(provider.calls) == 1
+    assert outcome.request is None
+    assert outcome.changed is True
+    assert outcome.messages[0].kind.value == "summary"
+    assert statuses[-1].kind is ContextStatusKind.COMPACTION_FAILED
+    archive.close()
+
+
+def test_automatic_failure_three_times_opens_breaker_and_stops_without_retry(
     tmp_path: Path,
 ) -> None:
     provider = ScriptedAsyncProvider(
@@ -133,7 +198,7 @@ def test_three_failures_open_breaker_and_risky_request_stops_without_retry(
     archive.close()
 
 
-def test_breaker_allows_safe_requests_and_manual_success_recovers(tmp_path: Path) -> None:
+def test_manual_recovery_allows_safe_requests_and_recovers_breaker(tmp_path: Path) -> None:
     scripts = [[ProviderTextDelta("invalid")] for _ in range(3)]
     scripts.append(
         [
@@ -166,7 +231,9 @@ def test_breaker_allows_safe_requests_and_manual_success_recovers(tmp_path: Path
     archive.close()
 
 
-def test_manual_noop_does_not_call_provider_or_change_history(tmp_path: Path) -> None:
+def test_manual_no_compaction_needed_does_not_call_provider_or_change_history(
+    tmp_path: Path,
+) -> None:
     provider = ScriptedAsyncProvider([])
     archive, manager = started_manager(tmp_path, provider)
     messages = (ChatMessage("user", "one"), ChatMessage("assistant", "two"))
@@ -181,6 +248,55 @@ def test_manual_noop_does_not_call_provider_or_change_history(tmp_path: Path) ->
     assert outcome.changed is False
     assert provider.calls == []
     archive.close()
+
+
+def test_manual_request_uses_8192_output_no_tools_and_explicit_margin(
+    tmp_path: Path,
+) -> None:
+    path = ".mewcode/context/session/history-000001.json"
+    provider = ScriptedAsyncProvider(
+        [[ProviderTextDelta(summary_response(path))]]
+    )
+    archive, manager = started_manager(tmp_path, provider)
+
+    statuses, outcome = consume(manager.compact(large_history()))
+
+    assert outcome.changed is True
+    assert statuses[-1].kind is ContextStatusKind.COMPACTION_COMPLETED
+    assert provider.calls[0].max_output_tokens == 8_192
+    assert provider.calls[0].tools is None
+    archive.close()
+
+
+def test_context_cancel_rolls_back_without_counting_failure(tmp_path: Path) -> None:
+    class BlockingProvider(ScriptedAsyncProvider):
+        def __init__(self) -> None:
+            super().__init__([])
+            self.started = asyncio.Event()
+
+        async def stream_reply(self, model_request):
+            self.calls.append(model_request)
+            self.started.set()
+            await asyncio.Event().wait()
+            if False:
+                yield ProviderTextDelta("")
+
+    async def scenario() -> None:
+        provider = BlockingProvider()
+        archive, manager = started_manager(tmp_path, provider)
+        operation = manager.compact(large_history())
+        consumer = asyncio.create_task(collect_async(operation.statuses()))
+        await provider.started.wait()
+
+        await operation.cancel()
+
+        assert consumer.cancelled()
+        assert manager.consecutive_failures == 0
+        assert archive.session_dir is not None
+        assert list(archive.session_dir.glob("history-*.json")) == []
+        archive.close()
+
+    asyncio.run(scenario())
 
 
 def test_operation_is_single_use_and_outcome_is_guarded(tmp_path: Path) -> None:

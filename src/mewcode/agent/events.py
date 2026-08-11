@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Literal
 
+from mewcode.context import ContextStatus
 from mewcode.providers import TokenUsage
 from mewcode.permissions import (
     PermissionChallenge,
@@ -27,6 +28,8 @@ class StopReason(StrEnum):
     CANCELLED = "cancelled"
     UNKNOWN_TOOL_LIMIT = "unknown_tool_limit"
     STREAM_ERROR = "stream_error"
+    CONTEXT_CAPACITY = "context_capacity"
+    CONTEXT_COMPACTION = "context_compaction"
     ERROR = "error"
 
 
@@ -78,6 +81,13 @@ class AgentTokenUsage:
     cumulative: TokenUsage
 
 
+@dataclass(frozen=True)
+class AgentContextStatus:
+    run_id: str
+    iteration: int
+    status: ContextStatus
+
+
 ProgressPhase = Literal[
     "run_started",
     "iteration_started",
@@ -114,6 +124,7 @@ AgentEvent = (
     | AgentPermissionRequest
     | AgentPermissionDecision
     | AgentTokenUsage
+    | AgentContextStatus
     | AgentProgress
     | AgentStopped
 )

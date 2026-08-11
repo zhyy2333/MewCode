@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from .prompting import PromptAdditions, PromptRunContext
 from .agent import (
+    AgentContextStatus,
     AgentEvent,
     AgentMode,
     AgentRun,
@@ -12,6 +13,7 @@ from .agent import (
     AgentRunStateError,
     AgentRunner,
 )
+from .context import ContextManager, ContextOperation, ContextStatus
 from .providers import ChatMessage
 from .tools import ToolRegistry, ToolSafety
 
@@ -34,14 +36,17 @@ class Conversation:
         runner: AgentRunner,
         tools: ToolRegistry,
         prompt_additions: PromptAdditions = PromptAdditions(),
+        context_manager: ContextManager | None = None,
     ) -> None:
         self._runner = runner
         self._tools = tools
         self._prompt_additions = prompt_additions
+        self._context_manager = context_manager
         self._messages: list[ChatMessage] = []
         self._pending_plan: PendingPlan | None = None
         self._active_run: AgentRun | None = None
         self._last_outcome: AgentRunOutcome | None = None
+        self._active_context_operation: ContextOperation | None = None
 
     def messages(self) -> list[ChatMessage]:
         return list(self._messages)
@@ -96,6 +101,31 @@ class Conversation:
     async def cancel_active(self) -> None:
         if self._active_run is not None:
             await self._active_run.cancel()
+        if self._active_context_operation is not None:
+            await self._active_context_operation.cancel()
+
+    async def compact(self) -> AsyncIterator[AgentEvent]:
+        if self._context_manager is None:
+            raise ConversationError("Context management is unavailable.")
+        if self._active_run is not None or self._active_context_operation is not None:
+            raise ConversationError("Another conversation operation is already active.")
+        operation = self._context_manager.compact(self._messages)
+        self._active_context_operation = operation
+        try:
+            async for status in operation.statuses():
+                yield AgentContextStatus("compact", 0, status)
+            outcome = operation.outcome
+            if outcome.changed:
+                self._messages = list(outcome.messages)
+        finally:
+            if self._active_context_operation is operation:
+                self._active_context_operation = None
+
+    async def close(self) -> tuple[ContextStatus, ...]:
+        await self.cancel_active()
+        if self._context_manager is None:
+            return ()
+        return self._context_manager.close()
 
     async def _run(
         self,
@@ -104,8 +134,8 @@ class Conversation:
         mode: AgentMode,
         prompt_context: PromptRunContext,
     ) -> AsyncIterator[AgentEvent]:
-        if self._active_run is not None:
-            raise ConversationError("Another agent run is already active.")
+        if self._active_run is not None or self._active_context_operation is not None:
+            raise ConversationError("Another conversation operation is already active.")
         run = self._runner.start(
             self._messages,
             user_text,
@@ -119,7 +149,7 @@ class Conversation:
             async for event in run.events():
                 yield event
             self._last_outcome = run.outcome
-            self._messages.extend(run.outcome.new_messages)
+            self._messages = list(run.outcome.committed_history)
         except AgentRunStateError as exc:
             raise ConversationError(str(exc)) from exc
         finally:

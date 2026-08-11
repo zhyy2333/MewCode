@@ -7,6 +7,7 @@ import pytest
 
 from mewcode import cli, repl as repl_module
 from mewcode.agent import (
+    AgentContextStatus,
     AgentPermissionDecision,
     AgentProgress,
     AgentStopped,
@@ -16,6 +17,7 @@ from mewcode.agent import (
     AgentToolResult,
     StopReason,
 )
+from mewcode.context import ContextStatus, ContextStatusKind
 from mewcode.conversation import ConversationError
 from mewcode.permissions import (
     PermissionChallenge,
@@ -35,6 +37,7 @@ class FakeConversation:
         self.events = events or []
         self.routes: list[tuple[str, str]] = []
         self.cancelled = 0
+        self.closed = 0
         self.error: ConversationError | None = None
 
     async def ask(self, user_text: str):
@@ -52,8 +55,17 @@ class FakeConversation:
         async for event in self._yield_events():
             yield event
 
+    async def compact(self):
+        self.routes.append(("compact", ""))
+        async for event in self._yield_events():
+            yield event
+
     async def cancel_active(self) -> None:
         self.cancelled += 1
+
+    async def close(self):
+        self.closed += 1
+        return ()
 
     async def _yield_events(self):
         if self.error is not None:
@@ -85,25 +97,31 @@ def render_events(events: list[object]) -> str:
     )
 
 
-def test_repl_exit_command_returns_zero() -> None:
+def test_repl_exit_closes_conversation_and_returns_zero() -> None:
     stdout = io.StringIO()
-    repl = Repl(FakeConversation(), stdout=stdout, input_func=input_sequence(["/exit"]))
+    conversation = FakeConversation()
+    repl = Repl(conversation, stdout=stdout, input_func=input_sequence(["/exit"]))
     assert repl.run() == 0
     assert "MewCode" in stdout.getvalue()
+    assert conversation.closed == 1
 
 
-def test_repl_quit_command_returns_zero() -> None:
-    repl = Repl(FakeConversation(), stdout=io.StringIO(), input_func=input_sequence(["/quit"]))
+def test_repl_quit_closes_conversation_and_returns_zero() -> None:
+    conversation = FakeConversation()
+    repl = Repl(conversation, stdout=io.StringIO(), input_func=input_sequence(["/quit"]))
     assert repl.run() == 0
+    assert conversation.closed == 1
 
 
-def test_repl_eof_returns_zero() -> None:
+def test_repl_eof_closes_conversation_and_returns_zero() -> None:
     def raise_eof(prompt: str) -> str:
         raise EOFError
 
     stdout = io.StringIO()
-    assert Repl(FakeConversation(), stdout=stdout, input_func=raise_eof).run() == 0
+    conversation = FakeConversation()
+    assert Repl(conversation, stdout=stdout, input_func=raise_eof).run() == 0
     assert stdout.getvalue().endswith("\n")
+    assert conversation.closed == 1
 
 
 def test_repl_ignores_empty_input_and_routes_direct_message() -> None:
@@ -111,6 +129,31 @@ def test_repl_ignores_empty_input_and_routes_direct_message() -> None:
     repl = Repl(conversation, stdout=io.StringIO(), input_func=input_sequence(["", "hello", "/exit"]))
     assert repl.run() == 0
     assert conversation.routes == [("ask", "hello")]
+
+
+def test_repl_routes_exact_compact_command_and_compact_arguments_are_rejected() -> None:
+    conversation = FakeConversation()
+    stderr = io.StringIO()
+    repl = Repl(
+        conversation,
+        stdout=io.StringIO(),
+        stderr=stderr,
+        input_func=input_sequence(["/compact", "/compact now", "/exit"]),
+    )
+
+    assert repl.run() == 0
+    assert conversation.routes == [("compact", "")]
+    assert "Usage: /compact" in stderr.getvalue()
+
+
+def test_context_status_is_rendered_without_summary_body() -> None:
+    event = AgentContextStatus(
+        "run",
+        1,
+        ContextStatus(ContextStatusKind.COMPACTION_COMPLETED, "history compacted"),
+    )
+
+    assert render_events([event]) == "  context: history compacted\n"
 
 
 def test_repl_event_indent_and_output_hides_json_arguments() -> None:
@@ -555,15 +598,17 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
             created["controller"] = controller
 
     class FakeRunner:
-        def __init__(self, provider, scheduler, *, prompt_builder):
+        def __init__(self, provider, scheduler, *, prompt_builder, context_manager):
             created["provider"] = provider
             created["scheduler"] = scheduler
             created["prompt_builder"] = prompt_builder
+            created["context_manager"] = context_manager
 
     class FakeSession:
-        def __init__(self, runner, tools):
+        def __init__(self, runner, tools, *, context_manager):
             created["runner"] = runner
             created["tools"] = tools
+            assert context_manager is created["context_manager"]
 
     class FakeRepl:
         def __init__(self, session, *, permission_controller):
@@ -589,11 +634,18 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
 
 
 def test_main_permission_config_error_returns_one(monkeypatch) -> None:
+    from mewcode.mcp.config import McpConfigLoadResult
+
     profile = ProviderProfile(
         "main", "openai", "model", "https://example.test", "secret"
     )
     monkeypatch.setattr(cli, "load_active_profile", lambda: profile)
     monkeypatch.setattr(cli, "create_provider", lambda loaded: object())
+    monkeypatch.setattr(
+        cli.McpConfigLoader,
+        "load",
+        lambda *args: McpConfigLoadResult((), (), ()),
+    )
     monkeypatch.setattr(
         cli.PermissionConfigLoader,
         "load",
@@ -650,8 +702,9 @@ def _prepare_mcp_cli(monkeypatch, config_result, runtime_class, *, repl_result=0
     monkeypatch.setattr(cli.PermissionConfigLoader, "load", load_permissions)
 
     class FakeConversation:
-        def __init__(self, runner, registry):
+        def __init__(self, runner, registry, *, context_manager):
             captured["registry"] = registry
+            captured["context_manager"] = context_manager
 
     class FakeRepl:
         def __init__(self, conversation, *, permission_controller):

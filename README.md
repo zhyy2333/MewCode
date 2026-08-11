@@ -35,7 +35,10 @@ profiles:
     base_url: https://api.openai.com/v1
     api_key: env:OPENAI_API_KEY
     thinking: false
+    context_window: 128000
 ```
+
+`context_window` 可省略；旧配置无需迁移，MewCode 会统一采用保守的 128000 Token 默认值。需要为兼容模型设置更小窗口时，可以在活动 Profile 中显式填写不小于 21193 的整数。
 
 ### MCP Server
 
@@ -92,7 +95,7 @@ mewcode --permission-mode allow
 python -m mewcode
 ```
 
-进入 REPL 后，输入 `/exit` 或 `/quit` 退出。使用 `/permissions` 查询当前权限模式，或用 `/permissions strict|default|allow` 在会话中切换。对话历史只保存在当前进程内，程序退出后不会保存。
+进入 REPL 后，输入 `/exit` 或 `/quit` 退出。使用 `/permissions` 查询当前权限模式，或用 `/permissions strict|default|allow` 在会话中切换。使用 `/compact` 可立即尝试压缩较早的对话历史；命令本身不会写入历史。对话历史只保存在当前进程内，程序退出后不会保存。
 
 ## Agent Loop
 
@@ -115,6 +118,16 @@ tokens: in=... out=... total=... cache-read=... cache-write=... cumulative=... c
 ```
 
 本阶段只接受调用方直接提供的自定义指令、Skill 和长期记忆内容，不加载项目指令文件、不自动激活 Skill、不生成或持久化记忆。MCP 工具来自启动时静态快照，不会改变结构化提示的运行时边界。
+
+## 上下文管理
+
+每次模型请求前，MewCode 会先限制工具结果体积，再检查累计历史容量。单个工具结果估算超过 8K Token 时会保存完整结果；同一轮工具结果合计超过 12K 时，会从最大的结果开始继续保存，直到活动内容回到预算内。上下文中的占位内容保留文件路径以及合计最多约 1K Token 的首尾预览。
+
+当整体请求接近窗口上限时，MewCode 会用当前活动 Profile 和 Provider 生成一份无工具、最大输出 8192 Token 的结构化滚动摘要。近期约 10K Token 且至少 5 条消息保持原文，工具调用组不会被拆开；较早的完整记录写入工作区的 `.mewcode/context/<session-id>/`。摘要与近期原文之间的边界提示要求模型在需要代码、文件或工具细节时重新读取原文件或存盘记录，不得根据摘要猜测。
+
+自动触发边界为 `context_window - 本次最大输出 Token - 13000`。`/compact` 即使未达到自动阈值也会显式尝试一次，摘要请求使用 `context_window - 8192 - 3000` 的容量边界；没有可压缩的早期消息时不会调用模型。连续三次摘要失败后，本会话停止自动摘要：安全请求仍可继续，存在溢出风险的请求会在调用主模型前报错。此时可再次执行 `/compact`；成功后失败计数清零并恢复自动摘要。
+
+Token 数采用近似估算：以上一次 API 返回的输入 usage 为锚，只按后续字符增量修正；ASCII 约按 4 字符/Token、非 ASCII 约按 1 字符/Token 估算，并用安全余量吸收误差，不依赖精确 tokenizer。存盘文件只在当前会话期间保留，正常退出时删除；下次启动会清理崩溃遗留目录，同时保留仍由其他进程锁定的活动会话。
 
 ## Plan Mode
 
@@ -140,7 +153,7 @@ agent: completed
 
 `/plan <任务>` 只向模型开放 `read_file`、`find_files` 和 `search_code`，并保存最近一次成功生成的计划。`/do` 恢复全部工具执行该计划；成功后清除计划，失败或取消时保留计划以便重试。
 
-当前阶段不包含网络请求限制、资源配额、审计日志、上下文压缩和自动化质量评估。
+当前阶段不包含网络请求限制、资源配额、审计日志和自动化质量评估。
 
 ## 权限系统
 

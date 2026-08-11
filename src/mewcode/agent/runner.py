@@ -8,6 +8,11 @@ from pathlib import Path
 from typing import Callable
 from uuid import uuid4
 
+from mewcode.context import (
+    ContextArchiveError,
+    ContextFailureKind,
+    ContextManager,
+)
 from mewcode.prompting import (
     PromptBuilder,
     PromptEnvironmentProvider,
@@ -26,6 +31,7 @@ from mewcode.providers import (
 from mewcode.tools import ToolRegistry
 
 from .events import (
+    AgentContextStatus,
     AgentEvent,
     AgentMode,
     AgentProgress,
@@ -67,6 +73,7 @@ class AgentRunOutcome:
     reason: StopReason
     final_text: str
     new_messages: tuple[ChatMessage, ...]
+    committed_history: tuple[ChatMessage, ...]
     usage: TokenUsage
     error: str | None = None
 
@@ -95,6 +102,7 @@ class AgentRun:
         tools: ToolRegistry,
         prompt_builder: PromptBuilder,
         prompt_context: PromptRunContext,
+        context_manager: ContextManager | None,
     ) -> None:
         self._run_id = run_id
         self._mode = mode
@@ -106,12 +114,14 @@ class AgentRun:
         self._tools = tools
         self._prompt_builder = prompt_builder
         self._prompt_context = prompt_context
+        self._context_manager = context_manager
         self._state = _State.NEW
         self._outcome: AgentRunOutcome | None = None
         self._cancel_requested = asyncio.Event()
         self._done = asyncio.Event()
         self._consumer_task: asyncio.Task[object] | None = None
         self._active_schedule: ToolSchedule | None = None
+        self._committed_history = tuple(history)
 
     async def events(self) -> AsyncIterator[AgentEvent]:
         if self._state is not _State.NEW:
@@ -126,6 +136,7 @@ class AgentRun:
         iteration = 0
         final_text = ""
         plan_finalizing = False
+        plan_investigation_messages: list[ChatMessage] = []
 
         try:
             yield AgentProgress(
@@ -175,14 +186,55 @@ class AgentRun:
                         phase,
                         iteration,
                     )
-                    source = self._provider.stream_reply(
-                        ModelRequest(
-                            prompt=prompt,
-                            messages=tuple(working_messages),
-                            tools=request_tools,
-                            max_output_tokens=max_output_tokens,
-                        )
+                    model_request = ModelRequest(
+                        prompt=prompt,
+                        messages=tuple(working_messages),
+                        tools=request_tools,
+                        max_output_tokens=max_output_tokens,
                     )
+                    request_footprint = None
+                    if self._context_manager is not None:
+                        operation = self._context_manager.prepare(model_request)
+                        async for status in operation.statuses():
+                            yield AgentContextStatus(
+                                self._run_id,
+                                iteration,
+                                status,
+                            )
+                        preparation = operation.outcome
+                        cumulative_usage = cumulative_usage.add(preparation.usage)
+                        if preparation.changed:
+                            working_messages = list(preparation.messages)
+                            self._committed_history = tuple(
+                                [
+                                    *(
+                                        message
+                                        for message in preparation.messages
+                                        if user_committed
+                                        or message is not self._user_message
+                                    ),
+                                    *plan_investigation_messages,
+                                ]
+                            )
+                        if preparation.request is None:
+                            reason = (
+                                StopReason.CONTEXT_CAPACITY
+                                if preparation.failure_kind
+                                is ContextFailureKind.CAPACITY
+                                else StopReason.CONTEXT_COMPACTION
+                            )
+                            yield self._finish(
+                                reason,
+                                iteration,
+                                final_text,
+                                new_messages,
+                                cumulative_usage,
+                                preparation.error,
+                            )
+                            return
+                        model_request = preparation.request
+                        request_footprint = preparation.footprint
+                    source = self._provider.stream_reply(model_request)
                     async for event in collector.events(source, cumulative_usage):
                         yield event
                 except asyncio.CancelledError:
@@ -207,6 +259,11 @@ class AgentRun:
                     return
 
                 response = collector.response
+                if self._context_manager is not None:
+                    self._context_manager.observe_usage(
+                        request_footprint,
+                        response.usage,
+                    )
                 cumulative_usage = cumulative_usage.add(response.usage)
                 final_text = response.text
                 yield AgentProgress(
@@ -249,6 +306,13 @@ class AgentRun:
                         new_messages.append(self._user_message)
                         user_committed = True
                     new_messages.extend(assistant_messages)
+                    self._committed_history = tuple(
+                        [
+                            *working_messages,
+                            *plan_investigation_messages,
+                            *assistant_messages,
+                        ]
+                    )
                     yield self._finish(
                         StopReason.COMPLETED,
                         iteration,
@@ -265,6 +329,10 @@ class AgentRun:
                             new_messages.append(self._user_message)
                             user_committed = True
                         new_messages.extend(assistant_messages)
+                        plan_investigation_messages.extend(assistant_messages)
+                        self._committed_history = tuple(
+                            [*working_messages, *plan_investigation_messages]
+                        )
                         plan_finalizing = True
                         continue
                     if not response.text.strip():
@@ -281,6 +349,8 @@ class AgentRun:
                         new_messages.append(self._user_message)
                         user_committed = True
                     new_messages.extend(assistant_messages)
+                    working_messages.extend(assistant_messages)
+                    self._committed_history = tuple(working_messages)
                     yield self._finish(
                         StopReason.COMPLETED,
                         iteration,
@@ -341,8 +411,33 @@ class AgentRun:
                 executions = schedule.executions
                 if schedule.cancelled:
                     self._cancel_requested.set()
-                assistant_messages = self._provider.assistant_messages(response)
-                tool_messages = self._provider.tool_result_messages(executions)
+                group_id = f"{self._run_id}:{iteration}"
+                if self._context_manager is not None:
+                    try:
+                        tool_compaction = self._context_manager.compact_tool_results(
+                            executions
+                        )
+                    except ContextArchiveError:
+                        yield self._finish(
+                            StopReason.CONTEXT_COMPACTION,
+                            iteration,
+                            response.text,
+                            new_messages,
+                            cumulative_usage,
+                            "A tool result could not be archived safely.",
+                        )
+                        return
+                    executions = tool_compaction.executions
+                    for status in tool_compaction.statuses:
+                        yield AgentContextStatus(self._run_id, iteration, status)
+                assistant_messages = self._provider.assistant_messages(
+                    response,
+                    group_id,
+                )
+                tool_messages = self._provider.tool_result_messages(
+                    executions,
+                    group_id,
+                )
                 if not user_committed:
                     new_messages.append(self._user_message)
                     user_committed = True
@@ -350,6 +445,7 @@ class AgentRun:
                 new_messages.extend(tool_messages)
                 working_messages.extend(assistant_messages)
                 working_messages.extend(tool_messages)
+                self._committed_history = tuple(working_messages)
 
                 if self._cancel_requested.is_set():
                     yield self._finish(
@@ -437,6 +533,7 @@ class AgentRun:
             reason=reason,
             final_text=final_text,
             new_messages=tuple(new_messages),
+            committed_history=self._committed_history,
             usage=usage,
             error=error,
         )
@@ -460,6 +557,7 @@ class AgentRunner:
         *,
         prompt_builder: PromptBuilder | None = None,
         id_factory: Callable[[], str] | None = None,
+        context_manager: ContextManager | None = None,
     ) -> None:
         self._provider = provider
         self._scheduler = scheduler
@@ -468,6 +566,7 @@ class AgentRunner:
             PromptEnvironmentProvider(Path.cwd())
         )
         self._id_factory = id_factory or (lambda: str(uuid4()))
+        self._context_manager = context_manager
 
     def start(
         self,
@@ -488,4 +587,5 @@ class AgentRunner:
             tools=tools,
             prompt_builder=self._prompt_builder,
             prompt_context=prompt_context or PromptRunContext(task=user_text),
+            context_manager=self._context_manager,
         )
