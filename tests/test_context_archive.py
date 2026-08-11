@@ -9,6 +9,8 @@ import pytest
 
 from mewcode.context import ArchiveKind, ContextArchive, ContextArchiveError
 from mewcode.context import archive as archive_module
+from mewcode import locking as locking_module
+from mewcode.locking import FileLock
 from mewcode.providers import ChatMessage
 from mewcode.tools import ToolExecution, ToolResult
 
@@ -156,9 +158,8 @@ def test_unix_lock_branch_uses_nonblocking_flock(
         flock=lambda _fileno, operation: calls.append(operation),
     )
     monkeypatch.setitem(sys.modules, "fcntl", fake_fcntl)
-    monkeypatch.setattr(archive_module.os, "name", "posix")
-    handle = (tmp_path / "lock").open("a+b")
-    lock = archive_module._SessionLock(handle)
+    monkeypatch.setattr(locking_module.os, "name", "posix")
+    lock = FileLock(tmp_path / "lock")
 
     assert lock.acquire() is True
     lock.close()

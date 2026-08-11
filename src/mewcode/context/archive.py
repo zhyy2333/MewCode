@@ -4,9 +4,10 @@ import json
 import os
 from pathlib import Path
 import shutil
-from typing import Any, BinaryIO, Callable, Sequence
+from typing import Any, Callable, Sequence
 from uuid import uuid4
 
+from mewcode.locking import FileLock
 from mewcode.providers import ChatMessage
 from mewcode.tools import ToolExecution
 
@@ -20,55 +21,6 @@ from .models import (
 )
 
 
-class _SessionLock:
-    def __init__(self, handle: BinaryIO) -> None:
-        self._handle = handle
-        self._locked = False
-
-    def acquire(self) -> bool:
-        self._handle.seek(0)
-        if os.name == "nt":
-            import msvcrt
-
-            try:
-                msvcrt.locking(self._handle.fileno(), msvcrt.LK_NBLCK, 1)
-            except OSError:
-                return False
-        else:
-            import fcntl
-
-            try:
-                fcntl.flock(
-                    self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB
-                )
-            except OSError:
-                return False
-        self._locked = True
-        return True
-
-    def release(self) -> None:
-        if not self._locked:
-            return
-        self._handle.seek(0)
-        try:
-            if os.name == "nt":
-                import msvcrt
-
-                msvcrt.locking(self._handle.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                import fcntl
-
-                fcntl.flock(self._handle.fileno(), fcntl.LOCK_UN)
-        finally:
-            self._locked = False
-
-    def close(self) -> None:
-        try:
-            self.release()
-        finally:
-            self._handle.close()
-
-
 class ContextArchive:
     def __init__(
         self,
@@ -80,7 +32,7 @@ class ContextArchive:
         self._context_root = self._workspace_root / ".mewcode" / "context"
         self._session_id_factory = session_id_factory or (lambda: str(uuid4()))
         self._session_dir: Path | None = None
-        self._lock: _SessionLock | None = None
+        self._lock: FileLock | None = None
         self._sequence = 0
 
     @property
@@ -94,10 +46,8 @@ class ContextArchive:
         self._context_root.mkdir(parents=True, exist_ok=True)
         session_dir = self._context_root / self._session_id_factory()
         session_dir.mkdir(parents=False, exist_ok=False)
-        handle = self._open_lock_file(session_dir / ".active.lock")
-        lock = _SessionLock(handle)
+        lock = FileLock(session_dir / ".active.lock")
         if not lock.acquire():
-            handle.close()
             shutil.rmtree(session_dir, ignore_errors=True)
             raise ContextArchiveError("Unable to lock the context session directory.")
         self._session_dir = session_dir
@@ -212,13 +162,11 @@ class ContextArchive:
             if not candidate.is_dir():
                 continue
             lock_path = candidate / ".active.lock"
-            handle: BinaryIO | None = None
-            probe: _SessionLock | None = None
+            probe: FileLock | None = None
             try:
-                handle = self._open_lock_file(lock_path)
-                probe = _SessionLock(handle)
+                probe = FileLock(lock_path)
                 if not probe.acquire():
-                    handle.close()
+                    probe.close()
                     continue
                 probe.close()
                 shutil.rmtree(candidate)
@@ -228,8 +176,6 @@ class ContextArchive:
                         probe.close()
                     except OSError:
                         pass
-                elif handle is not None:
-                    handle.close()
                 warnings.append(
                     ContextStatus(
                         ContextStatusKind.CLEANUP_WARNING,
@@ -237,15 +183,6 @@ class ContextArchive:
                     )
                 )
         return tuple(warnings)
-
-    def _open_lock_file(self, path: Path) -> BinaryIO:
-        handle = path.open("a+b")
-        handle.seek(0, os.SEEK_END)
-        if handle.tell() == 0:
-            handle.write(b"1")
-            handle.flush()
-        handle.seek(0)
-        return handle
 
     def _require_session(self) -> Path:
         if self._session_dir is None:
