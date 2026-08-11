@@ -1,0 +1,196 @@
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+
+import pytest
+
+from mewcode.context import (
+    ContextArchive,
+    ContextConfig,
+    ContextError,
+    ContextManager,
+    ContextStatusKind,
+)
+from mewcode.prompting import PromptPackage
+from mewcode.providers import ChatMessage, ModelRequest, ProviderTextDelta, TokenUsage
+
+from tests.fakes import ScriptedAsyncProvider, collect_async
+
+
+def request(messages: tuple[ChatMessage, ...]) -> ModelRequest:
+    return ModelRequest(
+        PromptPackage("stable", "dynamic"),
+        messages,
+        max_output_tokens=4_096,
+    )
+
+
+def large_history() -> tuple[ChatMessage, ...]:
+    return tuple(
+        ChatMessage("user" if index % 2 == 0 else "assistant", "x" * 10_000)
+        for index in range(10)
+    )
+
+
+def summary_response(path: str) -> str:
+    titles = (
+        "当前目标",
+        "仍有效的用户原始约束",
+        "关键决策及理由",
+        "已完成工作",
+        "当前代码与文件状态",
+        "未解决问题与风险",
+        "下一步行动",
+        "存盘记录索引",
+    )
+    body = "\n\n".join(
+        f"## {index}. {title}\n{path if index == 8 else '无'}"
+        for index, title in enumerate(titles, start=1)
+    )
+    return (
+        "<analysis_draft>draft</analysis_draft>"
+        f"<formal_summary>{body}</formal_summary>"
+    )
+
+
+def consume(operation):
+    statuses = asyncio.run(collect_async(operation.statuses()))
+    return statuses, operation.outcome
+
+
+def started_manager(
+    tmp_path: Path,
+    provider: ScriptedAsyncProvider,
+) -> tuple[ContextArchive, ContextManager]:
+    archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+    archive.start()
+    manager = ContextManager(provider, archive, ContextConfig(40_000))
+    return archive, manager
+
+
+def test_below_threshold_request_passes_without_summary_call(tmp_path: Path) -> None:
+    provider = ScriptedAsyncProvider([])
+    archive, manager = started_manager(tmp_path, provider)
+    model_request = request((ChatMessage("user", "hello"),))
+
+    statuses, outcome = consume(manager.prepare(model_request))
+
+    assert statuses == []
+    assert outcome.request is model_request
+    assert outcome.changed is False
+    assert provider.calls == []
+    manager.observe_usage(outcome.footprint, TokenUsage(context_input_tokens=90))
+    archive.close()
+
+
+def test_automatic_compaction_rebuilds_request_before_main_model(tmp_path: Path) -> None:
+    path = ".mewcode/context/session/history-000001.json"
+    provider = ScriptedAsyncProvider(
+        [[ProviderTextDelta(summary_response(path))]]
+    )
+    archive, manager = started_manager(tmp_path, provider)
+
+    statuses, outcome = consume(manager.prepare(request(large_history())))
+
+    assert [status.kind for status in statuses] == [
+        ContextStatusKind.COMPACTION_STARTED,
+        ContextStatusKind.COMPACTION_COMPLETED,
+    ]
+    assert outcome.request is not None
+    assert outcome.changed is True
+    assert len(outcome.messages) == 7
+    assert provider.calls[0].tools is None
+    assert provider.calls[0].max_output_tokens == 8_192
+    archive.close()
+
+
+def test_three_failures_open_breaker_and_risky_request_stops_without_retry(
+    tmp_path: Path,
+) -> None:
+    provider = ScriptedAsyncProvider(
+        [[ProviderTextDelta("invalid")]] for _ in range(3)
+    )
+    archive, manager = started_manager(tmp_path, provider)
+    model_request = request(large_history())
+
+    for expected_failures in range(1, 4):
+        statuses, outcome = consume(manager.prepare(model_request))
+        assert outcome.request is None
+        assert outcome.messages == model_request.messages
+        assert manager.consecutive_failures == expected_failures
+        assert ContextStatusKind.COMPACTION_FAILED in {
+            status.kind for status in statuses
+        }
+
+    statuses, outcome = consume(manager.prepare(model_request))
+
+    assert manager.automatic_compaction_disabled is True
+    assert len(provider.calls) == 3
+    assert outcome.request is None
+    assert "/compact" in (outcome.error or "")
+    assert [status.kind for status in statuses] == [ContextStatusKind.CIRCUIT_OPEN]
+    archive.close()
+
+
+def test_breaker_allows_safe_requests_and_manual_success_recovers(tmp_path: Path) -> None:
+    scripts = [[ProviderTextDelta("invalid")] for _ in range(3)]
+    scripts.append(
+        [
+            ProviderTextDelta(
+                summary_response(
+                    ".mewcode/context/session/history-000004.json"
+                )
+            )
+        ]
+    )
+    provider = ScriptedAsyncProvider(scripts)
+    archive, manager = started_manager(tmp_path, provider)
+    model_request = request(large_history())
+    for _ in range(3):
+        consume(manager.prepare(model_request))
+
+    safe_statuses, safe = consume(
+        manager.prepare(request((ChatMessage("user", "safe"),)))
+    )
+    manual_statuses, manual = consume(manager.compact(model_request.messages))
+
+    assert safe_statuses == []
+    assert safe.request is not None
+    assert manual.changed is True
+    assert ContextStatusKind.CIRCUIT_RECOVERED in {
+        status.kind for status in manual_statuses
+    }
+    assert manager.consecutive_failures == 0
+    assert manager.automatic_compaction_disabled is False
+    archive.close()
+
+
+def test_manual_noop_does_not_call_provider_or_change_history(tmp_path: Path) -> None:
+    provider = ScriptedAsyncProvider([])
+    archive, manager = started_manager(tmp_path, provider)
+    messages = (ChatMessage("user", "one"), ChatMessage("assistant", "two"))
+
+    statuses, outcome = consume(manager.compact(messages))
+
+    assert [status.kind for status in statuses] == [
+        ContextStatusKind.COMPACTION_STARTED,
+        ContextStatusKind.NO_COMPACTION_NEEDED,
+    ]
+    assert outcome.messages == messages
+    assert outcome.changed is False
+    assert provider.calls == []
+    archive.close()
+
+
+def test_operation_is_single_use_and_outcome_is_guarded(tmp_path: Path) -> None:
+    provider = ScriptedAsyncProvider([])
+    archive, manager = started_manager(tmp_path, provider)
+    operation = manager.prepare(request((ChatMessage("user", "hello"),)))
+
+    with pytest.raises(ContextError, match="not completed"):
+        _ = operation.outcome
+    consume(operation)
+    with pytest.raises(ContextError, match="only be consumed once"):
+        asyncio.run(collect_async(operation.statuses()))
+    archive.close()

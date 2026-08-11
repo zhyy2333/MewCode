@@ -20,11 +20,23 @@ from .models import (
     ContextPreparation,
     ContextStatus,
     ContextStatusKind,
+    HistoryCompactionResult,
+    HistorySelection,
     RequestFootprint,
     TokenEstimate,
     ToolCompactionResult,
 )
 from .tool_results import ToolResultCompactor
+from .manager import ContextManager, ContextOperation
+from .summary import (
+    BOUNDARY_MESSAGE,
+    SUMMARY_SECTIONS,
+    HistoryCompactor,
+    RecentHistorySelector,
+    SummaryCollector,
+    SummaryParser,
+    SummaryPromptBuilder,
+)
 
 __all__ = [
     "ArchiveKind",
@@ -41,11 +53,22 @@ __all__ = [
     "ContextPreparation",
     "ContextStatus",
     "ContextStatusKind",
+    "ContextManager",
+    "ContextOperation",
+    "HistoryCompactionResult",
+    "HistoryCompactor",
+    "HistorySelection",
+    "RecentHistorySelector",
     "RequestFootprint",
     "TokenEstimate",
     "TokenEstimator",
     "ToolCompactionResult",
     "ToolResultCompactor",
+    "SummaryCollector",
+    "SummaryParser",
+    "SummaryPromptBuilder",
+    "BOUNDARY_MESSAGE",
+    "SUMMARY_SECTIONS",
     "estimate_text_tokens",
     "measure_text",
     "take_prefix",

@@ -116,6 +116,21 @@ class ToolCompactionResult:
     statuses: tuple[ContextStatus, ...]
 
 
+@dataclass(frozen=True)
+class HistorySelection:
+    early: tuple[ChatMessage, ...]
+    recent: tuple[ChatMessage, ...]
+    can_compact: bool
+
+
+@dataclass(frozen=True)
+class HistoryCompactionResult:
+    messages: tuple[ChatMessage, ...]
+    archive: ArchiveRecord | None
+    usage: TokenUsage = field(default_factory=TokenUsage.zero)
+    changed: bool = False
+
+
 class CompactionMode(StrEnum):
     AUTOMATIC = "automatic"
     MANUAL = "manual"
