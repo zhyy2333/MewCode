@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from mewcode.agent import AgentContextStatus, AgentRunner, StopReason, ToolScheduler
+from mewcode.continuity import InstructionSnapshot, MemoryPromptView
 from mewcode.context import ContextArchive, ContextConfig, ContextManager
 from mewcode.conversation import Conversation, ConversationError
 from mewcode.providers import ChatMessage, ModelRequest, ModelResponse, ProviderError, ProviderEvent, ProviderTextDelta
@@ -194,3 +195,91 @@ def test_prompt_additions_are_system_context_with_real_user_history() -> None:
     assert [message.content for message in conversation.messages() if message.role == "user"] == [
         "real question"
     ]
+
+
+class BlockingMemoryManager:
+    def __init__(self, release: asyncio.Event) -> None:
+        self.release = release
+        self.pending = None
+        self.view = MemoryPromptView()
+        self.scheduled = 0
+
+    def prompt_view(self):
+        return self.view
+
+    def schedule(self, turn):
+        self.scheduled += 1
+        self.pending = asyncio.create_task(self._update())
+
+    async def _update(self):
+        await self.release.wait()
+        self.view = MemoryPromptView("new memory", 1, 10, ("mem-abcdef",))
+
+    async def await_pending(self):
+        if self.pending is not None:
+            await self.pending
+            self.pending = None
+        return ()
+
+    async def close(self):
+        return await self.await_pending()
+
+
+def test_next_turn_waits_for_memory_and_uses_refreshed_prompt() -> None:
+    async def scenario():
+        release = asyncio.Event()
+        provider = ScriptedAsyncProvider(
+            [[ProviderTextDelta("first")], [ProviderTextDelta("second")]]
+        )
+        memory = BlockingMemoryManager(release)
+        runner = AgentRunner(
+            provider,
+            ToolScheduler(AllowAllPermissionController()),
+            id_factory=lambda: "run",
+        )
+        conversation = Conversation(runner, ToolRegistry([]), memory=memory)
+        first = await collect_async(conversation.ask("one"))
+        assert first[-1].reason is StopReason.COMPLETED
+        assert memory.scheduled == 1
+        second_task = asyncio.create_task(collect_async(conversation.ask("two")))
+        await asyncio.sleep(0)
+        assert len(provider.calls) == 1
+        release.set()
+        second = await second_task
+        await conversation.close()
+        return provider, second
+
+    provider, second = asyncio.run(scenario())
+    assert second[-1].reason is StopReason.COMPLETED
+    assert "new memory" in provider.calls[1].prompt.dynamic_system
+
+
+def test_instructions_precede_custom_and_memory_is_reference_section() -> None:
+    provider = ScriptedAsyncProvider([[ProviderTextDelta("done")]])
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run",
+    )
+    conversation = Conversation(
+        runner,
+        ToolRegistry([]),
+        PromptAdditions(custom_instructions="base custom", long_term_memory="base memory"),
+        instructions=InstructionSnapshot("project instruction"),
+    )
+    asyncio.run(collect_async(conversation.ask("question")))
+    dynamic = provider.calls[0].prompt.dynamic_system
+    assert dynamic.index("project instruction") < dynamic.index("base custom")
+    assert dynamic.index("base custom") < dynamic.index("base memory")
+
+
+def test_non_completed_run_does_not_schedule_memory() -> None:
+    release = asyncio.Event()
+    memory = BlockingMemoryManager(release)
+    conversation = make_conversation(
+        ScriptedAsyncProvider([[ProviderError("failed")]])
+    )
+    conversation._memory = memory
+    events = asyncio.run(collect_async(conversation.ask("question")))
+    assert events[-1].reason is StopReason.STREAM_ERROR
+    assert memory.scheduled == 0

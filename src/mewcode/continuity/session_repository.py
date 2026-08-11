@@ -59,8 +59,11 @@ class SessionBinding:
         self._pending_plan = pending_plan
         self._closed = False
 
-    def maintain(self, now: datetime) -> tuple[ContinuityDiagnostic, ...]:
+    def maintain(self, now: datetime | None = None) -> tuple[ContinuityDiagnostic, ...]:
         return self._repository.maintain(now)
+
+    def now(self) -> datetime:
+        return self._repository.now()
 
     def commit_history(
         self,

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from datetime import datetime
 
 from .prompting import PromptAdditions, PromptRunContext
 from .agent import (
+    AgentContinuityStatus,
     AgentContextStatus,
     AgentEvent,
     AgentMode,
@@ -14,7 +16,16 @@ from .agent import (
     AgentRunner,
 )
 from .context import ContextManager, ContextOperation, ContextStatus
-from .continuity import SessionBinding, SessionState, StoredPlan
+from .continuity import (
+    ContinuityDiagnostic,
+    InstructionSnapshot,
+    MemoryManager,
+    MemoryTurn,
+    NullMemoryManager,
+    SessionBinding,
+    SessionState,
+    StoredPlan,
+)
 from .providers import ChatMessage
 from .tools import ToolRegistry, ToolSafety
 
@@ -41,12 +52,19 @@ class Conversation:
         *,
         initial_state: SessionState | None = None,
         session: SessionBinding | None = None,
+        instructions: InstructionSnapshot = InstructionSnapshot(),
+        memory: MemoryManager | NullMemoryManager | None = None,
     ) -> None:
         self._runner = runner
         self._tools = tools
         self._prompt_additions = prompt_additions
         self._context_manager = context_manager
         self._session = session
+        self._instructions = instructions
+        self._memory = memory or NullMemoryManager()
+        self._session_id = (
+            initial_state.session_id if initial_state is not None else "ephemeral"
+        )
         self._messages = list(initial_state.messages) if initial_state is not None else []
         stored_plan = initial_state.pending_plan if initial_state is not None else None
         self._pending_plan = (
@@ -68,7 +86,9 @@ class Conversation:
         text = user_text.strip()
         if not text:
             raise ConversationError("Message must not be empty.")
-        context = PromptRunContext(task=text, additions=self._prompt_additions)
+        async for event in self._preflight():
+            yield event
+        context = PromptRunContext(task=text, additions=self._current_additions())
         async for event in self._run(
             text, self._tools, AgentMode.DIRECT, context
         ):
@@ -78,10 +98,12 @@ class Conversation:
         clean_task = task.strip()
         if not clean_task:
             raise ConversationError("Usage: /plan <task>")
+        async for event in self._preflight():
+            yield event
         readonly = self._tools.select({ToolSafety.READ_ONLY})
         context = PromptRunContext(
             task=clean_task,
-            additions=self._prompt_additions,
+            additions=self._current_additions(),
         )
         async for event in self._run(clean_task, readonly, AgentMode.PLAN, context):
             yield event
@@ -105,10 +127,12 @@ class Conversation:
         plan = self._pending_plan
         if plan is None:
             raise ConversationError("No pending plan. Use /plan <task> first.")
+        async for event in self._preflight():
+            yield event
         context = PromptRunContext(
             task=plan.task,
             approved_plan=plan.text,
-            additions=self._prompt_additions,
+            additions=self._current_additions(),
         )
         async for event in self._run("/do", self._tools, AgentMode.EXECUTE, context):
             yield event
@@ -134,6 +158,8 @@ class Conversation:
             raise ConversationError("Context management is unavailable.")
         if self._active_run is not None or self._active_context_operation is not None:
             raise ConversationError("Another conversation operation is already active.")
+        async for event in self._preflight():
+            yield event
         operation = self._context_manager.compact(self._messages)
         self._active_context_operation = operation
         try:
@@ -153,13 +179,17 @@ class Conversation:
             if self._active_context_operation is operation:
                 self._active_context_operation = None
 
-    async def close(self) -> tuple[ContextStatus, ...]:
+    async def close(self) -> tuple[ContextStatus | ContinuityDiagnostic, ...]:
         await self.cancel_active()
+        diagnostics: list[ContextStatus | ContinuityDiagnostic] = list(
+            await self._memory.close()
+        )
         if self._session is not None:
-            self._session.close()
+            diagnostics.extend(self._session.close())
         if self._context_manager is None:
-            return ()
-        return self._context_manager.close()
+            return tuple(diagnostics)
+        diagnostics.extend(self._context_manager.close())
+        return tuple(diagnostics)
 
     async def _run(
         self,
@@ -185,8 +215,38 @@ class Conversation:
                 yield event
             self._last_outcome = run.outcome
             self._messages = list(run.outcome.committed_history)
+            if run.outcome.completed:
+                self._memory.schedule(
+                    MemoryTurn(
+                        self._session_id,
+                        prompt_context.task,
+                        run.outcome.final_text,
+                        self._session.now()
+                        if self._session is not None
+                        else datetime.now().astimezone(),
+                    )
+                )
         except AgentRunStateError as exc:
             raise ConversationError(str(exc)) from exc
         finally:
             if self._active_run is run:
                 self._active_run = None
+
+    async def _preflight(self) -> AsyncIterator[AgentEvent]:
+        diagnostics = list(await self._memory.await_pending())
+        if self._session is not None:
+            diagnostics.extend(self._session.maintain())
+        for diagnostic in diagnostics:
+            yield AgentContinuityStatus(
+                "continuity",
+                0,
+                diagnostic.component.value,
+                diagnostic.message,
+                diagnostic.severity.value != "info",
+            )
+
+    def _current_additions(self) -> PromptAdditions:
+        return self._prompt_additions.merged(
+            custom_instructions=self._instructions.content,
+            long_term_memory=self._memory.prompt_view().content,
+        )
