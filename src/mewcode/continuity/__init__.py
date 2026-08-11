@@ -14,6 +14,15 @@ from .instructions import (
     InstructionSnapshot,
 )
 from .paths import ContinuityPaths
+from .session_models import (
+    SessionOpenMode,
+    SessionOpenRequest,
+    SessionOpenResult,
+    SessionState,
+    SessionSummary,
+    StoredPlan,
+)
+from .session_repository import SessionBinding, SessionRepository
 
 __all__ = [
     "ContinuityComponent",
@@ -27,5 +36,13 @@ __all__ = [
     "InstructionSnapshot",
     "MemoryError",
     "SessionError",
+    "SessionBinding",
+    "SessionOpenMode",
+    "SessionOpenRequest",
+    "SessionOpenResult",
     "SessionPersistenceError",
+    "SessionRepository",
+    "SessionState",
+    "SessionSummary",
+    "StoredPlan",
 ]

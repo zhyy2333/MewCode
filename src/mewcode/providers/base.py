@@ -28,6 +28,7 @@ class MessageKind(StrEnum):
     TOOL_RESULT = "tool_result"
     SUMMARY = "summary"
     BOUNDARY = "boundary"
+    RESUME_NOTICE = "resume_notice"
 
 
 @dataclass(frozen=True)
