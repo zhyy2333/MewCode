@@ -6,6 +6,11 @@ import sys
 from pathlib import Path
 
 from .agent import AgentRunner, ToolScheduler
+from .commands import (
+    CommandRegistrationError,
+    InteractionState,
+    create_builtin_command_registry,
+)
 from .config import load_active_profile
 from .context import ContextArchive, ContextConfig, ContextError, ContextManager
 from .conversation import Conversation
@@ -36,8 +41,15 @@ from .permissions import (
     PermissionTargetBuilder,
 )
 from .prompting import PromptBuilder, PromptEnvironmentProvider
-from .providers import ConfigError, ProviderError, create_provider
+from .providers import (
+    ConfigError,
+    ProviderError,
+    UsageLedger,
+    UsageTrackingProvider,
+    create_provider,
+)
 from .repl import Repl
+from .terminal import PromptToolkitTerminal
 from .tools import ToolRegistry, Workspace, create_builtin_registry
 
 
@@ -70,9 +82,12 @@ def main(argv: list[str] | None = None) -> int:
     session_binding: SessionBinding | None = None
     memory_manager: MemoryManager | None = None
     try:
+        command_registry = create_builtin_command_registry()
+        interaction_state = InteractionState()
         workspace = Workspace(Path.cwd())
         profile = load_active_profile()
-        provider = create_provider(profile)
+        usage_ledger = UsageLedger()
+        provider = UsageTrackingProvider(create_provider(profile), usage_ledger)
         continuity_paths = ContinuityPaths.for_workspace(workspace.root)
         instructions = InstructionLoader().load(continuity_paths)
         session_repository = SessionRepository(continuity_paths)
@@ -152,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             session=opened_session.binding,
             instructions=instructions,
             memory=memory_manager,
+            resumed=opened_session.resumed,
         )
         action = "resumed" if opened_session.resumed else "created"
         title = session_title(
@@ -172,11 +188,21 @@ def main(argv: list[str] | None = None) -> int:
             )
             if diagnostic.code not in {"created", "resumed"}
         )
+        terminal = PromptToolkitTerminal(command_registry, interaction_state)
         return Repl(
             conversation,
             permission_controller=permission_controller,
             startup_messages=tuple(startup_messages),
+            registry=command_registry,
+            state=interaction_state,
+            terminal=terminal,
+            usage_ledger=usage_ledger,
+            memory_manager=memory_manager,
+            context_manager=context_manager,
         ).run()
+    except CommandRegistrationError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        return 1
     except PermissionConfigError as exc:
         sys.stderr.write(f"Error: {exc}\n")
         return 1

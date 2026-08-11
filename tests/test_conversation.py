@@ -7,9 +7,9 @@ from pathlib import Path
 import pytest
 
 from mewcode.agent import AgentContextStatus, AgentRunner, StopReason, ToolScheduler
-from mewcode.continuity import InstructionSnapshot, MemoryPromptView
+from mewcode.continuity import InstructionSnapshot, MemoryPromptView, SessionState
 from mewcode.context import ContextArchive, ContextConfig, ContextManager
-from mewcode.conversation import Conversation, ConversationError
+from mewcode.conversation import Conversation, ConversationError, ConversationMode
 from mewcode.providers import ChatMessage, ModelRequest, ModelResponse, ProviderError, ProviderEvent, ProviderTextDelta
 from mewcode.prompting import PromptAdditions
 from mewcode.tools import ToolExecution, ToolRegistry
@@ -66,6 +66,29 @@ def test_messages_returns_copy() -> None:
     copied = conversation.messages()
     copied.clear()
     assert len(conversation.messages()) == 2
+
+
+def test_conversation_status_is_safe_dynamic_and_marks_resumed() -> None:
+    provider = ScriptedAsyncProvider([])
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "run",
+    )
+    conversation = Conversation(
+        runner,
+        ToolRegistry([]),
+        initial_state=SessionState(
+            "session-id", (ChatMessage("user", "token secret=longvalue hello"),)
+        ),
+        resumed=True,
+    )
+    status = conversation.status()
+    assert status.session_id == "session-id"
+    assert status.resumed is True
+    assert status.message_count == 1
+    assert status.busy is False
+    assert "secret=longvalue" not in status.title
 
 
 def test_manual_compact_force_replaces_history_without_adding_command(tmp_path: Path) -> None:

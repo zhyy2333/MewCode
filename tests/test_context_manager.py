@@ -70,6 +70,22 @@ def started_manager(
     return archive, manager
 
 
+def test_context_runtime_status_tracks_breaker(tmp_path: Path) -> None:
+    provider = ScriptedAsyncProvider([])
+    archive, manager = started_manager(tmp_path, provider)
+    assert manager.status().automatic_compaction_enabled is True
+    assert manager.status().consecutive_failures == 0
+    manager._breaker.record_failure()
+    manager._breaker.record_failure()
+    manager._breaker.record_failure()
+    assert manager.status().automatic_compaction_enabled is False
+    assert manager.status().consecutive_failures == 3
+    manager._breaker.record_success()
+    assert manager.status().automatic_compaction_enabled is True
+    assert manager.status().consecutive_failures == 0
+    archive.close()
+
+
 def test_below_threshold_request_passes_without_summary_call(tmp_path: Path) -> None:
     provider = ScriptedAsyncProvider([])
     archive, manager = started_manager(tmp_path, provider)

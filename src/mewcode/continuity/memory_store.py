@@ -189,6 +189,10 @@ class MemoryStore:
     def write_enabled(self) -> bool:
         return self._write_enabled
 
+    @property
+    def config(self) -> MemoryConfig:
+        return self._config
+
     def catalog(self) -> tuple[MemoryIndexEntry, ...]:
         return self._catalog
 

@@ -13,6 +13,7 @@ from mewcode.continuity import (
     MemoryScope,
     MemoryStore,
     MemoryTurn,
+    MemoryUpdateState,
     MemoryUpdatePlan,
     NullMemoryManager,
 )
@@ -70,6 +71,29 @@ def test_initial_and_null_managers_do_not_call_updater(tmp_path: Path) -> None:
     null = NullMemoryManager()
     null.schedule(MemoryTurn("session", "user", "answer", NOW))
     assert asyncio.run(null.await_pending()) == ()
+    assert manager.status().update_state is MemoryUpdateState.IDLE
+    assert null.status().update_state is MemoryUpdateState.DISABLED
+
+
+def test_status_uses_loaded_catalog_and_config_without_waiting(tmp_path: Path) -> None:
+    async def scenario():
+        release = asyncio.Event()
+        updater = ControlledUpdater(release=release)
+        updater.started = asyncio.Event()
+        manager = MemoryManager(_store(tmp_path), updater)
+        manager.schedule(MemoryTurn("session", "user", "answer", NOW))
+        await updater.started.wait()
+        status = manager.status()
+        release.set()
+        await manager.close()
+        return status
+
+    status = asyncio.run(scenario())
+    assert status.project_notes == 0
+    assert status.user_notes == 0
+    assert status.max_index_lines == 200
+    assert status.max_index_bytes == 25 * 1024
+    assert status.update_state is MemoryUpdateState.RUNNING
 
 
 def test_success_refreshes_view_after_await(tmp_path: Path) -> None:
@@ -83,6 +107,8 @@ def test_success_refreshes_view_after_await(tmp_path: Path) -> None:
     manager, diagnostics = asyncio.run(scenario())
     assert diagnostics == ()
     assert "prefers concise output" in manager.prompt_view().content
+    assert manager.status().user_notes == 1
+    assert manager.status().update_state is MemoryUpdateState.SUCCEEDED
 
 
 def test_failure_warns_once_keeps_old_view_and_does_not_retry(tmp_path: Path) -> None:
@@ -100,6 +126,7 @@ def test_failure_warns_once_keeps_old_view_and_does_not_retry(tmp_path: Path) ->
     assert manager.prompt_view() == old
     assert len(first) == 1 and first[0].code == "memory_update_failed"
     assert second == ()
+    assert manager.status().update_state is MemoryUpdateState.FAILED
 
 
 def test_await_and_close_wait_for_the_same_background_task(tmp_path: Path) -> None:

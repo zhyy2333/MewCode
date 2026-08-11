@@ -6,6 +6,7 @@ import io
 import pytest
 
 from mewcode import cli, repl as repl_module
+from mewcode.commands import CommandRegistrationError
 from mewcode.agent import (
     AgentContinuityStatus,
     AgentContextStatus,
@@ -19,7 +20,7 @@ from mewcode.agent import (
     StopReason,
 )
 from mewcode.context import ContextStatus, ContextStatusKind
-from mewcode.conversation import ConversationError
+from mewcode.conversation import ConversationError, ConversationMode, ConversationStatus
 from mewcode.permissions import (
     PermissionChallenge,
     PermissionChoice,
@@ -28,7 +29,13 @@ from mewcode.permissions import (
     PermissionOutcome,
     PermissionSource,
 )
-from mewcode.providers import ConfigError, ProviderError, ProviderProfile, TokenUsage
+from mewcode.providers import (
+    ConfigError,
+    ProviderError,
+    ProviderProfile,
+    TokenUsage,
+    UsageTrackingProvider,
+)
 from mewcode.repl import Repl
 from mewcode.tools import ToolCallRequest, ToolExecution, ToolResult
 
@@ -60,6 +67,19 @@ class FakeConversation:
         async for event in self._yield_events():
             yield event
 
+    async def send(
+        self,
+        user_text: str,
+        mode: ConversationMode = ConversationMode.DEFAULT,
+    ):
+        if mode is ConversationMode.DEFAULT:
+            async for event in self.ask(user_text):
+                yield event
+            return
+        self.routes.append((mode.value, user_text))
+        async for event in self._yield_events():
+            yield event
+
     async def plan(self, task: str):
         self.routes.append(("plan", task))
         async for event in self._yield_events():
@@ -81,6 +101,9 @@ class FakeConversation:
     async def close(self):
         self.closed += 1
         return ()
+
+    def status(self) -> ConversationStatus:
+        return ConversationStatus("session", "Test session", False, 0, False)
 
     async def _yield_events(self):
         if self.error is not None:
@@ -403,29 +426,29 @@ def test_end_to_end_hierarchy_matches_approved_layout() -> None:
     )
 
 
-def test_plan_command_do_command_and_routing() -> None:
+def test_plan_and_do_switch_persistent_routing_mode() -> None:
     conversation = FakeConversation([stop_event()])
     Repl(
         conversation,
         stdout=io.StringIO(),
-        input_func=input_sequence(["/plan build it", "/do", "chat", "/exit"]),
+        input_func=input_sequence(["/plan", "build it", "/do", "chat", "/exit"]),
     ).run()
     assert conversation.routes == [
-        ("plan", "build it"), ("do", ""), ("ask", "chat")
+        ("plan", "build it"), ("ask", "chat")
     ]
 
 
-def test_empty_plan_error_goes_to_stderr_and_continues() -> None:
+def test_plan_arguments_are_rejected_locally_and_continue() -> None:
     stderr = io.StringIO()
     conversation = FakeConversation()
-    conversation.error = ConversationError("Usage: /plan <task>")
     Repl(
         conversation,
         stdout=io.StringIO(),
         stderr=stderr,
-        input_func=input_sequence(["/plan", "/exit"]),
+        input_func=input_sequence(["/plan build", "/exit"]),
     ).run()
-    assert "Usage: /plan <task>" in stderr.getvalue()
+    assert "Usage: /plan" in stderr.getvalue()
+    assert conversation.routes == []
 
 
 def test_end_to_end_cancel_ctrl_c_continues_after_cancel() -> None:
@@ -485,7 +508,8 @@ def test_render_error_cancels_current_run_and_continues(monkeypatch) -> None:
     assert result == 0
     assert conversation.cancelled == 1
     assert conversation.routes == [("ask", "first"), ("ask", "second")]
-    assert "event consumer failed: render failed" in stderr.getvalue()
+    assert "event consumer failed." in stderr.getvalue()
+    assert "render failed" not in stderr.getvalue()
     assert "recovered" in stdout.getvalue()
 
 
@@ -532,7 +556,7 @@ def test_permission_confirmation_choices(raw: str, expected: PermissionChoice) -
             input_func=input_sequence(["invalid", raw]),
         )
         event = repl_module.AgentPermissionRequest("run", 1, challenge)
-        repl._handle_permission_request(event)
+        await repl._handle_permission_request(event)
         assert await challenge.wait() == expected
 
     asyncio.run(scenario())
@@ -546,7 +570,7 @@ def test_permission_confirmation_eof_denies() -> None:
             raise EOFError
 
         repl = Repl(FakeConversation(), stdout=io.StringIO(), input_func=eof)
-        repl._handle_permission_request(
+        await repl._handle_permission_request(
             repl_module.AgentPermissionRequest("run", 1, challenge)
         )
         assert await challenge.wait() == PermissionChoice.DENY
@@ -570,9 +594,9 @@ def test_permissions_command_queries_switches_and_rejects_invalid() -> None:
     ).run()
     assert result == 0
     assert controller.mode == PermissionMode.STRICT
-    assert "permission mode: default" in stdout.getvalue()
-    assert "permission mode: strict" in stdout.getvalue()
-    assert "Usage: /permissions [strict|default|allow]" in stderr.getvalue()
+    assert "permission: default" in stdout.getvalue()
+    assert "permission: strict" in stdout.getvalue()
+    assert "Usage: /permission [strict|default|allow]" in stderr.getvalue()
     assert conversation.routes == []
 
 
@@ -582,6 +606,28 @@ def test_main_config_error_returns_one(monkeypatch) -> None:
     monkeypatch.setattr(cli.sys, "stderr", stderr)
     assert cli.main([]) == 1
     assert "Error: bad config" in stderr.getvalue()
+
+
+def test_main_registration_conflict_fails_before_provider_or_prompt(monkeypatch) -> None:
+    monkeypatch.setattr(
+        cli,
+        "create_builtin_command_registry",
+        lambda: (_ for _ in ()).throw(
+            CommandRegistrationError("Command identifier conflict: help")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "load_active_profile",
+        lambda: (_ for _ in ()).throw(
+            AssertionError("provider configuration must not be loaded")
+        ),
+    )
+    stderr = io.StringIO()
+    monkeypatch.setattr(cli.sys, "stderr", stderr)
+
+    assert cli.main([]) == 1
+    assert "Command identifier conflict: help" in stderr.getvalue()
 
 
 def test_main_provider_startup_error_returns_one(monkeypatch) -> None:
@@ -634,9 +680,17 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
             assert context_manager is created["context_manager"]
 
     class FakeRepl:
-        def __init__(self, session, *, permission_controller, startup_messages=()):
+        def __init__(
+            self,
+            session,
+            *,
+            permission_controller,
+            startup_messages=(),
+            **runtime,
+        ):
             created["session"] = session
             created["startup_messages"] = startup_messages
+            created["repl_runtime"] = runtime
             assert permission_controller is created["controller"]
 
         def run(self) -> int:
@@ -656,7 +710,14 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
     )
 
     assert cli.main(["--permission-mode", "strict"]) == 7
-    assert isinstance(created["provider"], FakeProvider)
+    assert isinstance(created["provider"], UsageTrackingProvider)
+    assert created["repl_runtime"]["usage_ledger"] is not None
+    assert created["continuity"]["resumed"] is False
+    tracked = created["provider"]
+    context_manager = created["repl_runtime"]["context_manager"]
+    memory_manager = created["repl_runtime"]["memory_manager"]
+    assert context_manager._history_compactor._provider is tracked
+    assert memory_manager._updater._provider is tracked
     assert isinstance(created["scheduler"], FakeScheduler)
     assert created["prompt_builder"] is not None
     assert created["tools"] is not None
@@ -747,8 +808,16 @@ def _prepare_mcp_cli(monkeypatch, config_result, runtime_class, *, repl_result=0
             captured["continuity"] = continuity
 
     class FakeRepl:
-        def __init__(self, conversation, *, permission_controller, startup_messages=()):
+        def __init__(
+            self,
+            conversation,
+            *,
+            permission_controller,
+            startup_messages=(),
+            **runtime,
+        ):
             captured["startup_messages"] = startup_messages
+            captured["repl_runtime"] = runtime
         def run(self):
             return repl_result
 

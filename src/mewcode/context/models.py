@@ -60,6 +60,12 @@ class ContextStatusKind(StrEnum):
 
 
 @dataclass(frozen=True)
+class ContextRuntimeStatus:
+    automatic_compaction_enabled: bool
+    consecutive_failures: int
+
+
+@dataclass(frozen=True)
 class ContextStatus:
     kind: ContextStatusKind
     message: str

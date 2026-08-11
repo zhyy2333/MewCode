@@ -5,7 +5,12 @@ import asyncio
 import pytest
 
 from mewcode.agent import AgentRunner, AgentTokenUsage, StopReason, ToolScheduler
-from mewcode.conversation import Conversation, ConversationError, PendingPlan
+from mewcode.conversation import (
+    Conversation,
+    ConversationError,
+    ConversationMode,
+    PendingPlan,
+)
 from mewcode.providers import (
     ProviderError,
     ProviderFinished,
@@ -72,6 +77,30 @@ def test_plan_uses_readonly_tools_and_saves_text() -> None:
     assert session.pending_plan() == PendingPlan("build it", "the plan")
     assert provider.calls[0].messages[-1].content == "build it"
     assert "read-only" in provider.calls[0].prompt.dynamic_system.casefold()
+
+
+def test_persistent_plan_send_uses_readonly_tools_without_pending_plan() -> None:
+    provider = ScriptedAsyncProvider(
+        [[ProviderTextDelta("investigated")], [ProviderTextDelta("final plan")]]
+    )
+    session = conversation(provider)
+    asyncio.run(collect_async(session.send("build it", ConversationMode.PLAN)))
+    assert [tool.name for tool in provider.calls[0].tools.list()] == [
+        "read_file", "find_files", "search_code"
+    ]
+    assert provider.calls[1].tools is None
+    assert session.pending_plan() is None
+
+
+def test_one_shot_read_only_send_uses_direct_prompt_and_readonly_tools() -> None:
+    provider = ScriptedAsyncProvider([[ProviderTextDelta("reviewed")]])
+    session = conversation(provider)
+    asyncio.run(collect_async(session.send("review", ConversationMode.READ_ONLY)))
+    assert [tool.name for tool in provider.calls[0].tools.list()] == [
+        "read_file", "find_files", "search_code"
+    ]
+    assert "Mode: Plan" not in provider.calls[0].prompt.dynamic_system
+    assert session.pending_plan() is None
 
 
 def test_new_successful_plan_replaces_old_plan() -> None:

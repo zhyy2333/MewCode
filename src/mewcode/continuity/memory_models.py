@@ -26,6 +26,14 @@ class MemoryAction(StrEnum):
     DELETE = "delete"
 
 
+class MemoryUpdateState(StrEnum):
+    IDLE = "idle"
+    RUNNING = "running"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    DISABLED = "disabled"
+
+
 @dataclass(frozen=True)
 class MemoryConfig:
     index_max_lines: int = 200
@@ -100,6 +108,17 @@ class MemoryPromptView:
     lines: int = 0
     bytes: int = 0
     included_note_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class MemoryRuntimeStatus:
+    project_notes: int
+    user_notes: int
+    index_lines: int
+    index_bytes: int
+    max_index_lines: int
+    max_index_bytes: int
+    update_state: MemoryUpdateState
 
 
 @dataclass(frozen=True)

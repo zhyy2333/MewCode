@@ -5,6 +5,18 @@ import sys
 from collections.abc import AsyncIterator, Callable
 from typing import TextIO
 
+from .commands import (
+    CommandDispatcher,
+    CommandExecutionError,
+    CommandRegistry,
+    InputKind,
+    InteractionMode,
+    InteractionState,
+    create_builtin_command_registry,
+    parse_input,
+)
+from .context import ContextRuntimeStatus
+from .continuity import MemoryRuntimeStatus, NullMemoryManager
 from .agent import (
     AgentContinuityStatus,
     AgentContextStatus,
@@ -18,8 +30,10 @@ from .agent import (
     AgentToolCall,
     AgentToolResult,
 )
-from .conversation import Conversation, ConversationError
+from .conversation import Conversation, ConversationError, ConversationMode, ConversationStatus
 from .permissions import PermissionChoice, PermissionController, PermissionMode
+from .providers import UsageLedger, UsageSnapshot
+from .terminal import TerminalSession
 
 InputFunc = Callable[[str], str]
 
@@ -33,6 +47,13 @@ class Repl:
         input_func: InputFunc = input,
         permission_controller: PermissionController | None = None,
         startup_messages: tuple[str, ...] = (),
+        *,
+        registry: CommandRegistry | None = None,
+        state: InteractionState | None = None,
+        terminal: TerminalSession | None = None,
+        usage_ledger: UsageLedger | None = None,
+        memory_manager=None,
+        context_manager=None,
     ) -> None:
         self._conversation = conversation
         self._stdout = stdout
@@ -40,116 +61,138 @@ class Repl:
         self._input = input_func
         self._permission_controller = permission_controller
         self._startup_messages = startup_messages
+        self._registry = registry or create_builtin_command_registry()
+        self._state = state or InteractionState()
+        self._terminal = terminal or _LegacyTerminal(
+            stdout, stderr, input_func
+        )
+        self._usage_ledger = usage_ledger or UsageLedger()
+        self._memory_manager = memory_manager or NullMemoryManager()
+        self._context_manager = context_manager
+        self._dispatcher = CommandDispatcher(self._registry, self, self)
 
     def run(self) -> int:
-        self._stdout.write("MewCode\n")
-        self._stdout.write(
-            "Type /exit or /quit to exit. Use /plan <task>, /do, /compact, or "
-            "/permissions.\n"
-        )
-        for message in self._startup_messages:
-            self._stdout.write(f"{message}\n")
-        self._stdout.flush()
-
         with asyncio.Runner() as runner:
             try:
-                while True:
-                    try:
-                        user_text = self._input("mew> ").strip()
-                    except EOFError:
-                        self._stdout.write("\n")
-                        self._stdout.flush()
-                        return 0
-                    if not user_text:
-                        continue
-                    if user_text in {"/exit", "/quit"}:
-                        return 0
-                    if self._handle_permissions_command(user_text):
-                        continue
+                return runner.run(self._run_loop())
+            except KeyboardInterrupt:
+                return 130
 
-                    try:
-                        source = self._route(user_text)
-                        runner.run(self._consume(source))
-                        self._stdout.write("\n")
-                        self._stdout.flush()
-                    except KeyboardInterrupt:
-                        runner.run(self._conversation.cancel_active())
-                        self._stdout.write("\nagent: cancelled\n")
-                        self._stdout.flush()
-                    except ConversationError as exc:
-                        self._stderr.write(f"Error: {exc.message}\n")
-                        self._stderr.flush()
-                    except Exception as exc:
-                        runner.run(self._conversation.cancel_active())
-                        self._stderr.write(f"Error: event consumer failed: {exc}\n")
-                        self._stderr.flush()
-            finally:
+    async def _run_loop(self) -> int:
+        self._terminal.write(
+            "MewCode\nType /help for commands. Use /exit or /quit to exit.\n"
+        )
+        for message in self._startup_messages:
+            self._terminal.write(f"{message}\n")
+        try:
+            while not self._state.exit_requested:
                 try:
-                    warnings = runner.run(self._conversation.close())
-                    for warning in warnings:
-                        self._stderr.write(f"Warning: {warning.message}\n")
-                    self._stderr.flush()
+                    raw = await self._terminal.prompt()
+                except EOFError:
+                    self._terminal.write("\n")
+                    return 0
+                parsed = parse_input(raw)
+                if parsed.kind is InputKind.EMPTY:
+                    continue
+                try:
+                    if parsed.kind is InputKind.COMMAND:
+                        await self._dispatcher.dispatch(parsed)
+                    else:
+                        await self.send_user_message(parsed.text)
+                except KeyboardInterrupt:
+                    await self._conversation.cancel_active()
+                    self._terminal.write("\nagent: cancelled\n")
+                except ConversationError as exc:
+                    self.show_error(exc.message)
+                except asyncio.CancelledError:
+                    await self._conversation.cancel_active()
+                    self._terminal.write("\nagent: cancelled\n")
                 except Exception:
-                    self._stderr.write("Warning: conversation shutdown failed.\n")
-                    self._stderr.flush()
+                    await self._conversation.cancel_active()
+                    self.show_error("event consumer failed.")
+            return 0
+        finally:
+            try:
+                warnings = await self._conversation.close()
+                for warning in warnings:
+                    self._terminal.write_error(f"Warning: {warning.message}\n")
+            except Exception:
+                self._terminal.write_error("Warning: conversation shutdown failed.\n")
 
-    def _route(self, user_text: str) -> AsyncIterator[AgentEvent]:
-        if user_text == "/plan":
-            return self._conversation.plan("")
-        if user_text.startswith("/plan "):
-            return self._conversation.plan(user_text[len("/plan ") :])
-        if user_text == "/do":
-            return self._conversation.execute_plan()
-        if user_text == "/compact":
-            return self._conversation.compact()
-        if user_text.startswith("/compact "):
-            raise ConversationError("Usage: /compact")
-        return self._conversation.ask(user_text)
+    def show_message(self, message: str) -> None:
+        self._terminal.write(f"{message}\n")
+
+    def show_error(self, message: str) -> None:
+        self._terminal.write_error(f"Error: {message}\n")
+
+    def clear_display(self) -> None:
+        self._terminal.clear()
+
+    async def send_user_message(
+        self, message: str, *, read_only: bool = False
+    ) -> None:
+        if read_only:
+            mode = ConversationMode.READ_ONLY
+        elif self._state.mode is InteractionMode.PLAN:
+            mode = ConversationMode.PLAN
+        else:
+            mode = ConversationMode.DEFAULT
+        source = self._conversation.send(message, mode)
+        await self._consume(source)
+        self._terminal.write("\n")
+
+    def interaction_mode(self) -> InteractionMode:
+        return self._state.mode
+
+    def set_interaction_mode(self, mode: InteractionMode) -> None:
+        self._state.mode = mode
+
+    def token_usage(self) -> UsageSnapshot:
+        return self._usage_ledger.snapshot()
+
+    def refresh_status(self) -> None:
+        self._terminal.invalidate()
+
+    def request_exit(self) -> None:
+        self._state.exit_requested = True
+
+    async def compact_context(self) -> None:
+        await self._consume(self._conversation.compact())
+        self._terminal.write("\n")
+
+    def session_status(self) -> ConversationStatus:
+        return self._conversation.status()
+
+    def memory_status(self) -> MemoryRuntimeStatus:
+        return self._memory_manager.status()
+
+    def context_status(self) -> ContextRuntimeStatus:
+        if self._context_manager is None:
+            return ContextRuntimeStatus(True, 0)
+        return self._context_manager.status()
+
+    def permission_mode(self) -> PermissionMode:
+        if self._permission_controller is None:
+            raise CommandExecutionError("Permission controller is unavailable.")
+        return self._permission_controller.mode
+
+    def set_permission_mode(self, mode: PermissionMode) -> None:
+        if self._permission_controller is None:
+            raise CommandExecutionError("Permission controller is unavailable.")
+        self._permission_controller.set_mode(mode)
 
     async def _consume(self, source: AsyncIterator[AgentEvent]) -> None:
         renderer = _EventRenderer()
         async for event in source:
             if isinstance(event, AgentPermissionRequest):
-                self._handle_permission_request(event)
+                await self._handle_permission_request(event)
                 continue
             text = renderer.render(event)
             if text is None:
                 continue
-            self._stdout.write(text)
-            self._stdout.flush()
+            self._terminal.write(text)
 
-    def _handle_permissions_command(self, user_text: str) -> bool:
-        if user_text != "/permissions" and not user_text.startswith("/permissions "):
-            return False
-        if self._permission_controller is None:
-            self._stderr.write("Error: permission controller is unavailable.\n")
-            self._stderr.flush()
-            return True
-        parts = user_text.split()
-        if len(parts) == 1:
-            self._stdout.write(
-                f"permission mode: {self._permission_controller.mode.value}\n"
-            )
-            self._stdout.flush()
-            return True
-        if len(parts) != 2:
-            self._write_permissions_usage()
-            return True
-        try:
-            mode = PermissionMode(parts[1])
-        except ValueError:
-            self._write_permissions_usage()
-            return True
-        self._permission_controller.set_mode(mode)
-        self._stdout.write(f"permission mode: {mode.value}\n")
-        self._stdout.flush()
-        return True
-
-    def _write_permissions_usage(self) -> None:
-        self._stderr.write("Usage: /permissions [strict|default|allow]\n")
-        self._stderr.flush()
-
-    def _handle_permission_request(self, event: AgentPermissionRequest) -> None:
+    async def _handle_permission_request(self, event: AgentPermissionRequest) -> None:
         challenge = event.challenge
         prompt = (
             f"permission: allow {challenge.tool_name}({challenge.target})? "
@@ -167,18 +210,48 @@ class Repl:
         }
         while True:
             try:
-                raw = self._input(prompt).strip().lower()
+                raw = (await self._terminal.prompt_permission(prompt)).strip().lower()
             except EOFError:
                 challenge.resolve(PermissionChoice.DENY)
-                self._stdout.write("\n")
-                self._stdout.flush()
+                self._terminal.write("\n")
                 return
             choice = choices.get(raw)
             if choice is not None:
                 challenge.resolve(choice)
                 return
-            self._stderr.write("Choose d, o, s, or p.\n")
-            self._stderr.flush()
+            self._terminal.write_error("Choose d, o, s, or p.\n")
+
+
+class _LegacyTerminal:
+    def __init__(
+        self,
+        stdout: TextIO,
+        stderr: TextIO,
+        input_func: InputFunc,
+    ) -> None:
+        self._stdout = stdout
+        self._stderr = stderr
+        self._input = input_func
+
+    async def prompt(self) -> str:
+        return self._input("mew> ")
+
+    async def prompt_permission(self, message: str) -> str:
+        return self._input(message)
+
+    def write(self, text: str) -> None:
+        self._stdout.write(text)
+        self._stdout.flush()
+
+    def write_error(self, text: str) -> None:
+        self._stderr.write(text)
+        self._stderr.flush()
+
+    def clear(self) -> None:
+        self.write("\x1b[2J\x1b[H")
+
+    def invalidate(self) -> None:
+        return None
 
 
 class _EventRenderer:

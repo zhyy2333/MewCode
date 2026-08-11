@@ -104,7 +104,26 @@ mewcode --resume 20260811-120000-abcd
 python -m mewcode
 ```
 
-进入 REPL 后，输入 `/exit` 或 `/quit` 退出。使用 `/permissions` 查询当前权限模式，或用 `/permissions strict|default|allow` 在会话中切换。使用 `/compact` 可立即尝试压缩较早的对话历史；命令本身不会写入历史，压缩结果会持久化到当前会话。
+进入 REPL 后，以 `/` 开头的输入由本地命令系统处理，不会先交给 Agent。公开命令如下：
+
+| 命令 | 作用 |
+|---|---|
+| `/help [command]` | 列出公开命令，或查看单个命令的描述、用法、参数提示和别名 |
+| `/compact` | 显式尝试压缩较早的对话历史 |
+| `/clear` | 仅清除当前终端显示，不修改会话、记忆或模式 |
+| `/plan` | 进入持续的 PLAN 模式，后续普通消息强制只读 |
+| `/do` | 退出 PLAN 模式，恢复 DEFAULT 执行模式 |
+| `/session` | 显示当前会话 ID、标题、恢复状态、消息数和忙闲状态的安全摘要 |
+| `/memory` | 显示项目/用户记忆条数、索引容量和后台更新状态，不显示记忆正文 |
+| `/permission [strict\|default\|allow]` | 查询或切换当前权限模式；兼容别名为 `/permissions` |
+| `/status` | 显示模式、会话、权限、Token、上下文和记忆的核心摘要 |
+| `/review` | 让 AI 以单次强制只读方式审查当前工作区未提交的 Git 改动 |
+
+`/exit` 及其兼容别名 `/quit` 仍可退出，但作为隐藏兼容命令不出现在帮助和补全中。命令名称大小写不敏感；未知命令会提示使用 `/help`，不会发送给 AI。
+
+输入命令前缀后可按 Tab 补全：单个匹配直接补齐，多个匹配显示候选菜单，光标进入参数区域后不再提供命令名候选。底部状态栏始终显示共享模式标记 `[DEFAULT]` 或 `[PLAN]`。
+
+`/status` 的 Token 数据覆盖当前进程内当前会话的全部模型调用，包括普通对话、PLAN、review、上下文压缩和自动记忆更新；Provider 未报告的累计字段显示为 `n/a`，不会用估算值代替。
 
 ## 项目指令、会话与长期记忆
 
@@ -158,27 +177,22 @@ Token 数采用近似估算：以上一次 API 返回的输入 usage 为锚，�
 
 ## Plan Mode
 
-需要先审阅计划再执行时，使用两阶段命令：
+`/plan` 是持续状态切换命令，本身不接收任务、不调用模型，也不写入对话历史。切换后，底栏立即显示 `[PLAN]`，后续普通消息使用计划提示并且只开放只读工具；即使用户要求修改文件或运行有副作用的操作，也不会获得写工具。
 
 ```text
-mew> /plan 为配置加载器增加环境变量校验并补测试
+mew> /plan
+[PLAN]
+mew> 分析配置加载器应如何增加环境变量校验
 agent: iteration 1
 tool: search_code ...
-tool: search_code ok - src/mewcode/config.py:...
-1. 检查现有配置加载路径……
-2. 增加校验并补充回归测试……
-agent: completed
+...
 
 mew> /do
-agent: iteration 1
-tool: edit_file ...
-tool: edit_file ok - Edited src/mewcode/config.py
-...
-已完成实现和验证。
-agent: completed
+[DEFAULT]
+mew> 按刚才的分析实现并验证
 ```
 
-`/plan <任务>` 只向模型开放 `read_file`、`find_files` 和 `search_code`，并保存最近一次成功生成的计划。`/do` 恢复全部工具执行该计划；成功后清除计划，失败或取消时保留计划以便重试。
+`/do` 只把持续模式切回 DEFAULT，不会自动执行或改写旧版本会话中保存的计划。`/review` 与持续模式无关：它始终使用固定审查请求和只读工具执行一次，完成或失败后都保持原来的 `[DEFAULT]` 或 `[PLAN]` 状态。
 
 当前阶段不包含网络请求限制、资源配额、审计日志和自动化质量评估。
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
+from enum import StrEnum
 
 from .prompting import PromptAdditions, PromptRunContext
 from .agent import (
@@ -26,6 +27,7 @@ from .continuity import (
     SessionState,
     StoredPlan,
 )
+from .continuity.session_codec import session_title
 from .providers import ChatMessage
 from .tools import ToolRegistry, ToolSafety
 
@@ -42,6 +44,21 @@ class PendingPlan:
     text: str
 
 
+class ConversationMode(StrEnum):
+    DEFAULT = "default"
+    PLAN = "plan"
+    READ_ONLY = "read_only"
+
+
+@dataclass(frozen=True)
+class ConversationStatus:
+    session_id: str
+    title: str
+    resumed: bool
+    message_count: int
+    busy: bool
+
+
 class Conversation:
     def __init__(
         self,
@@ -54,6 +71,7 @@ class Conversation:
         session: SessionBinding | None = None,
         instructions: InstructionSnapshot = InstructionSnapshot(),
         memory: MemoryManager | NullMemoryManager | None = None,
+        resumed: bool = False,
     ) -> None:
         self._runner = runner
         self._tools = tools
@@ -65,6 +83,7 @@ class Conversation:
         self._session_id = (
             initial_state.session_id if initial_state is not None else "ephemeral"
         )
+        self._resumed = resumed
         self._messages = list(initial_state.messages) if initial_state is not None else []
         stored_plan = initial_state.pending_plan if initial_state is not None else None
         self._pending_plan = (
@@ -82,16 +101,40 @@ class Conversation:
     def pending_plan(self) -> PendingPlan | None:
         return self._pending_plan
 
-    async def ask(self, user_text: str) -> AsyncIterator[AgentEvent]:
+    def status(self) -> ConversationStatus:
+        return ConversationStatus(
+            session_id=self._session_id,
+            title=session_title(self._messages, self._session_id),
+            resumed=self._resumed,
+            message_count=len(self._messages),
+            busy=(
+                self._active_run is not None
+                or self._active_context_operation is not None
+            ),
+        )
+
+    async def send(
+        self,
+        user_text: str,
+        mode: ConversationMode = ConversationMode.DEFAULT,
+    ) -> AsyncIterator[AgentEvent]:
         text = user_text.strip()
         if not text:
             raise ConversationError("Message must not be empty.")
         async for event in self._preflight():
             yield event
+        tools = (
+            self._tools
+            if mode is ConversationMode.DEFAULT
+            else self._tools.select({ToolSafety.READ_ONLY})
+        )
+        agent_mode = AgentMode.PLAN if mode is ConversationMode.PLAN else AgentMode.DIRECT
         context = PromptRunContext(task=text, additions=self._current_additions())
-        async for event in self._run(
-            text, self._tools, AgentMode.DIRECT, context
-        ):
+        async for event in self._run(text, tools, agent_mode, context):
+            yield event
+
+    async def ask(self, user_text: str) -> AsyncIterator[AgentEvent]:
+        async for event in self.send(user_text, ConversationMode.DEFAULT):
             yield event
 
     async def plan(self, task: str) -> AsyncIterator[AgentEvent]:

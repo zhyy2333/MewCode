@@ -17,6 +17,7 @@ from .models import (
     ContextError,
     ContextFailureKind,
     ContextPreparation,
+    ContextRuntimeStatus,
     ContextStatus,
     ContextStatusKind,
     RequestFootprint,
@@ -119,6 +120,12 @@ class ContextManager:
     @property
     def automatic_compaction_disabled(self) -> bool:
         return self._breaker.is_open
+
+    def status(self) -> ContextRuntimeStatus:
+        return ContextRuntimeStatus(
+            automatic_compaction_enabled=not self._breaker.is_open,
+            consecutive_failures=self._breaker.consecutive_failures,
+        )
 
     def compact_tool_results(
         self,
