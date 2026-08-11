@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+import json
 from typing import Any, Iterable, Protocol
 
 ToolParameterSchema = dict[str, Any]
@@ -20,6 +21,20 @@ class ToolResult:
         if self.ok:
             return self.content.splitlines()[0][:120] if self.content else "ok"
         return (self.error or "failed")[:120]
+
+
+def serialize_tool_result(result: ToolResult) -> str:
+    return json.dumps(
+        {
+            "ok": result.ok,
+            "content": result.content,
+            "error": result.error,
+            "metadata": result.metadata,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 @dataclass(frozen=True)

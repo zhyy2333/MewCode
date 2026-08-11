@@ -20,10 +20,32 @@ class ThinkingMode(StrEnum):
     DISABLED = "disabled"
 
 
+class MessageKind(StrEnum):
+    USER = "user"
+    ASSISTANT = "assistant"
+    INTERNAL = "internal"
+    TOOL_CALL = "tool_call"
+    TOOL_RESULT = "tool_result"
+    SUMMARY = "summary"
+    BOUNDARY = "boundary"
+
+
 @dataclass(frozen=True)
 class ChatMessage:
     role: ChatRole
     content: Any
+    kind: MessageKind | None = None
+    group_id: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind is not None:
+            return
+        inferred = {
+            "user": MessageKind.USER,
+            "assistant": MessageKind.ASSISTANT,
+            "tool": MessageKind.TOOL_RESULT,
+        }.get(self.role, MessageKind.ASSISTANT)
+        object.__setattr__(self, "kind", inferred)
 
 
 @dataclass(frozen=True)
@@ -34,6 +56,7 @@ class RawProviderProfile:
     base_url: str
     api_key: str
     thinking: bool | str | None = None
+    context_window: int | None = None
 
 
 @dataclass(frozen=True)
@@ -44,6 +67,7 @@ class ProviderProfile:
     base_url: str
     api_key: str
     thinking: ThinkingMode = ThinkingMode.AUTO
+    context_window: int = 128_000
 
 
 @dataclass(frozen=True)
@@ -73,6 +97,7 @@ class TokenUsage:
     total_tokens: int | None = None
     cache_read_tokens: int | None = None
     cache_write_tokens: int | None = None
+    context_input_tokens: int | None = None
 
     @classmethod
     def zero(cls) -> TokenUsage:
@@ -82,6 +107,7 @@ class TokenUsage:
             total_tokens=0,
             cache_read_tokens=0,
             cache_write_tokens=0,
+            context_input_tokens=0,
         )
 
     def add(self, other: TokenUsage) -> TokenUsage:
@@ -94,6 +120,9 @@ class TokenUsage:
             ),
             cache_write_tokens=_add_optional(
                 self.cache_write_tokens, other.cache_write_tokens
+            ),
+            context_input_tokens=_add_optional(
+                self.context_input_tokens, other.context_input_tokens
             ),
         )
 
@@ -113,11 +142,15 @@ class LLMProvider(TypingProtocol):
     ) -> AsyncIterator[ProviderEvent]:
         ...
 
-    def assistant_messages(self, response: ModelResponse) -> list[ChatMessage]:
+    def assistant_messages(
+        self, response: ModelResponse, group_id: str | None = None
+    ) -> list[ChatMessage]:
         ...
 
     def tool_result_messages(
-        self, executions: Sequence[ToolExecution]
+        self,
+        executions: Sequence[ToolExecution],
+        group_id: str | None = None,
     ) -> list[ChatMessage]:
         ...
 

@@ -6,10 +6,17 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
-from mewcode.tools import Tool, ToolCallRequest, ToolExecution, ToolRegistry, ToolResult
+from mewcode.tools import (
+    Tool,
+    ToolCallRequest,
+    ToolExecution,
+    ToolRegistry,
+    serialize_tool_result,
+)
 
 from .base import (
     ChatMessage,
+    MessageKind,
     ModelRequest,
     ModelResponse,
     ProviderError,
@@ -92,7 +99,9 @@ class AnthropicProvider:
         except Exception as exc:
             raise self._to_provider_error(exc) from exc
 
-    def assistant_messages(self, response: ModelResponse) -> list[ChatMessage]:
+    def assistant_messages(
+        self, response: ModelResponse, group_id: str | None = None
+    ) -> list[ChatMessage]:
         content: list[dict[str, Any]] = [
             part.data for part in response.internal_parts
         ]
@@ -107,10 +116,23 @@ class AnthropicProvider:
             }
             for call in response.tool_calls
         )
-        return [ChatMessage(role="assistant", content=content)]
+        return [
+            ChatMessage(
+                role="assistant",
+                content=content,
+                kind=(
+                    MessageKind.TOOL_CALL
+                    if response.tool_calls
+                    else MessageKind.ASSISTANT
+                ),
+                group_id=group_id,
+            )
+        ]
 
     def tool_result_messages(
-        self, executions: Sequence[ToolExecution]
+        self,
+        executions: Sequence[ToolExecution],
+        group_id: str | None = None,
     ) -> list[ChatMessage]:
         if not executions:
             return []
@@ -121,11 +143,13 @@ class AnthropicProvider:
                     {
                         "type": "tool_result",
                         "tool_use_id": execution.request.id,
-                        "content": _tool_result_payload(execution.result),
+                        "content": serialize_tool_result(execution.result),
                         "is_error": not execution.result.ok,
                     }
                     for execution in executions
                 ],
+                kind=MessageKind.TOOL_RESULT,
+                group_id=group_id,
             )
         ]
 
@@ -133,12 +157,22 @@ class AnthropicProvider:
         self,
         model_request: ModelRequest,
     ) -> dict[str, Any]:
+        context_system = [
+            str(message.content)
+            for message in model_request.messages
+            if message.kind in {MessageKind.SUMMARY, MessageKind.BOUNDARY}
+        ]
+        dialogue_messages = [
+            message
+            for message in model_request.messages
+            if message.kind not in {MessageKind.SUMMARY, MessageKind.BOUNDARY}
+        ]
         request: dict[str, Any] = {
             "model": self._profile.model,
             "max_tokens": model_request.max_output_tokens,
             "messages": [
                 {"role": message.role, "content": message.content}
-                for message in model_request.messages
+                for message in dialogue_messages
             ],
         }
         stable_system = model_request.prompt.stable_system
@@ -153,9 +187,20 @@ class AnthropicProvider:
             ]
             if dynamic_system:
                 system.append({"type": "text", "text": dynamic_system})
+            system.extend(
+                {"type": "text", "text": content}
+                for content in context_system
+            )
             request["system"] = system
         else:
-            request["system"] = _join_system(stable_system, dynamic_system)
+            request["system"] = _join_system(
+                stable_system,
+                "\n\n".join(
+                    part
+                    for part in [dynamic_system, *context_system]
+                    if part
+                ),
+            )
         if model_request.tools is not None:
             tools = _anthropic_tools(model_request.tools)
             if tools:
@@ -183,18 +228,6 @@ class AnthropicProvider:
         if message.startswith("Anthropic request failed:"):
             return ProviderError(message)
         return ProviderError(f"Anthropic request failed: {message}")
-
-
-def _tool_result_payload(result: ToolResult) -> str:
-    return json.dumps(
-        {
-            "ok": result.ok,
-            "content": result.content,
-            "error": result.error,
-            "metadata": result.metadata,
-        },
-        ensure_ascii=False,
-    )
 
 
 def _anthropic_tools(registry: ToolRegistry) -> list[dict[str, Any]]:
@@ -306,11 +339,14 @@ async def _parse_anthropic_events(events: Any) -> AsyncIterator[ProviderEvent]:
     )
     yield ProviderUsage(
         TokenUsage(
-            input_tokens,
-            output_tokens,
-            total_tokens,
-            cache_read_tokens,
-            cache_write_tokens,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            cache_read_tokens=cache_read_tokens,
+            cache_write_tokens=cache_write_tokens,
+            context_input_tokens=_sum_optional(
+                input_tokens, cache_read_tokens, cache_write_tokens
+            ),
         )
     )
     if finish_reason is None:
@@ -372,6 +408,11 @@ def _event_index(event: Any) -> int:
 
 def _optional_int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _sum_optional(*values: int | None) -> int | None:
+    present = [value for value in values if value is not None]
+    return sum(present) if present else None
 
 
 def _get_event_attr(value: Any, name: str) -> Any:

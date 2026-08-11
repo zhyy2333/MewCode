@@ -7,10 +7,17 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 from urllib.parse import urlparse
 
-from mewcode.tools import Tool, ToolCallRequest, ToolExecution, ToolRegistry, ToolResult
+from mewcode.tools import (
+    Tool,
+    ToolCallRequest,
+    ToolExecution,
+    ToolRegistry,
+    serialize_tool_result,
+)
 
 from .base import (
     ChatMessage,
+    MessageKind,
     ModelRequest,
     ModelResponse,
     ProviderError,
@@ -164,13 +171,27 @@ class OpenAIProvider:
                 inputs.append({"role": message.role, "content": message.content})
         return inputs
 
-    def assistant_messages(self, response: ModelResponse) -> list[ChatMessage]:
+    def assistant_messages(
+        self, response: ModelResponse, group_id: str | None = None
+    ) -> list[ChatMessage]:
         messages: list[ChatMessage] = [
-            ChatMessage(role="assistant", content=part.data)
+            ChatMessage(
+                role="assistant",
+                content=part.data,
+                kind=MessageKind.INTERNAL,
+                group_id=group_id,
+            )
             for part in response.internal_parts
         ]
         if response.text or not response.tool_calls:
-            messages.append(ChatMessage(role="assistant", content=response.text))
+            messages.append(
+                ChatMessage(
+                    role="assistant",
+                    content=response.text,
+                    kind=MessageKind.ASSISTANT,
+                    group_id=group_id,
+                )
+            )
         messages.extend(
             ChatMessage(
                 role="assistant",
@@ -180,13 +201,17 @@ class OpenAIProvider:
                     "name": call.name,
                     "arguments": call.raw_arguments,
                 },
+                kind=MessageKind.TOOL_CALL,
+                group_id=group_id,
             )
             for call in response.tool_calls
         )
         return messages
 
     def tool_result_messages(
-        self, executions: Sequence[ToolExecution]
+        self,
+        executions: Sequence[ToolExecution],
+        group_id: str | None = None,
     ) -> list[ChatMessage]:
         return [
             ChatMessage(
@@ -194,8 +219,10 @@ class OpenAIProvider:
                 content={
                     "type": "function_call_output",
                     "call_id": execution.request.id,
-                    "output": _tool_result_payload(execution.result),
+                    "output": serialize_tool_result(execution.result),
                 },
+                kind=MessageKind.TOOL_RESULT,
+                group_id=group_id,
             )
             for execution in executions
         ]
@@ -209,18 +236,6 @@ class OpenAIProvider:
         if message.startswith("OpenAI request failed:"):
             return ProviderError(message)
         return ProviderError(f"OpenAI request failed: {message}")
-
-
-def _tool_result_payload(result: ToolResult) -> str:
-    return json.dumps(
-        {
-            "ok": result.ok,
-            "content": result.content,
-            "error": result.error,
-            "metadata": result.metadata,
-        },
-        ensure_ascii=False,
-    )
 
 
 def _openai_tools(registry: ToolRegistry) -> list[dict[str, Any]]:
@@ -350,14 +365,16 @@ def _openai_usage(usage: Any) -> TokenUsage:
     if usage is None:
         return TokenUsage()
     details = _get_event_attr(usage, "input_tokens_details") or {}
+    input_tokens = _optional_int(_get_event_attr(usage, "input_tokens"))
     return TokenUsage(
-        input_tokens=_optional_int(_get_event_attr(usage, "input_tokens")),
+        input_tokens=input_tokens,
         output_tokens=_optional_int(_get_event_attr(usage, "output_tokens")),
         total_tokens=_optional_int(_get_event_attr(usage, "total_tokens")),
         cache_read_tokens=_optional_int(_get_event_attr(details, "cached_tokens")),
         cache_write_tokens=_optional_int(
             _get_event_attr(details, "cache_write_tokens")
         ),
+        context_input_tokens=input_tokens,
     )
 
 

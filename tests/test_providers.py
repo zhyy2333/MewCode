@@ -157,7 +157,7 @@ def test_cache_usage_adds_and_propagates_unknown() -> None:
     assert TokenUsage(1, 2, 3, None, 0).add(TokenUsage(1, 2, 3, 5, 0)) == TokenUsage(
         2, 4, 6, None, 0
     )
-    assert TokenUsage.zero() == TokenUsage(0, 0, 0, 0, 0)
+    assert TokenUsage.zero() == TokenUsage(0, 0, 0, 0, 0, 0)
 
 
 def test_anthropic_system_blocks_cache_breakpoint_uses_official_boundary(
@@ -216,7 +216,7 @@ def test_anthropic_cache_usage_is_normalized(monkeypatch) -> None:
     events = asyncio.run(
         collect_async(provider.stream_reply(model_request(ChatMessage("user", "Hi"))))
     )
-    assert ProviderUsage(TokenUsage(10, 2, 12, 7, 3)) in events
+    assert ProviderUsage(TokenUsage(10, 2, 12, 7, 3, 20)) in events
 
 
 def test_openai_system_input_and_explicit_cache(monkeypatch) -> None:
@@ -330,7 +330,7 @@ def test_openai_cache_usage_is_normalized(monkeypatch) -> None:
     events = asyncio.run(
         collect_async(provider.stream_reply(model_request(ChatMessage("user", "Hi"))))
     )
-    assert ProviderUsage(TokenUsage(10, 2, 12, 7, 3)) in events
+    assert ProviderUsage(TokenUsage(10, 2, 12, 7, 3, 10)) in events
 
 
 def test_anthropic_streams_text_usage_and_builds_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -340,7 +340,7 @@ def test_anthropic_streams_text_usage_and_builds_request(monkeypatch: pytest.Mon
 
     assert events == [
         ProviderTextDelta("hel"), ProviderTextDelta("lo"),
-        ProviderUsage(TokenUsage(3, 2, 5)),
+        ProviderUsage(TokenUsage(3, 2, 5, None, None, 3)),
         ProviderFinished(ProviderFinishReason.NATURAL),
     ]
     client = client_type.created[0]
@@ -576,9 +576,10 @@ def test_provider_end_to_end_maps_prompt_stream_and_cache_usage(
     )
     request = client_type.created[0].requests[0]
 
+    expected_context_input = 20 if protocol == "anthropic" else 10
     assert events == [
         ProviderTextDelta("answer"),
-        ProviderUsage(TokenUsage(10, 2, 12, 7, 3)),
+        ProviderUsage(TokenUsage(10, 2, 12, 7, 3, expected_context_input)),
         ProviderFinished(ProviderFinishReason.NATURAL),
     ]
     if protocol == "anthropic":
@@ -600,7 +601,7 @@ def test_openai_streams_text_usage_and_builds_request(monkeypatch: pytest.Monkey
 
     assert events == [
         ProviderTextDelta("hel"), ProviderTextDelta("lo"),
-        ProviderUsage(TokenUsage(3, 2, 5)),
+        ProviderUsage(TokenUsage(3, 2, 5, None, None, 3)),
         ProviderFinished(ProviderFinishReason.NATURAL),
     ]
     assert client_type.created[0].requests == [{
@@ -674,7 +675,7 @@ def test_openai_incomplete_max_output_is_normalized(monkeypatch: pytest.MonkeyPa
 
     events = asyncio.run(collect_async(provider.stream_reply(model_request(ChatMessage("user", "Hi")))))
     assert events == [
-        ProviderUsage(TokenUsage(4, 9, 13)),
+        ProviderUsage(TokenUsage(4, 9, 13, None, None, 4)),
         ProviderFinished(ProviderFinishReason.OUTPUT_LIMIT),
     ]
 

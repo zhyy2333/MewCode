@@ -11,6 +11,8 @@ from .providers import ConfigError, ProviderProfile, ThinkingMode
 DEFAULT_CONFIG_PATH = Path.home() / ".mewcode" / "config.yaml"
 SUPPORTED_PROTOCOLS = {"anthropic", "openai"}
 REQUIRED_PROFILE_FIELDS = ("name", "protocol", "model", "base_url", "api_key")
+DEFAULT_CONTEXT_WINDOW = 128_000
+MIN_CONTEXT_WINDOW = 21_193
 
 
 def load_active_profile(path: Path = DEFAULT_CONFIG_PATH) -> ProviderProfile:
@@ -61,6 +63,7 @@ def _parse_profile(raw: dict[str, Any]) -> ProviderProfile:
         raise ConfigError(f"Unsupported protocol '{protocol}'. Use 'anthropic' or 'openai'.")
 
     thinking = _parse_thinking_mode(raw)
+    context_window = _parse_context_window(raw)
 
     api_key = _resolve_api_key(api_key_ref)
     return ProviderProfile(
@@ -70,6 +73,7 @@ def _parse_profile(raw: dict[str, Any]) -> ProviderProfile:
         base_url=base_url,
         api_key=api_key,
         thinking=thinking,
+        context_window=context_window,
     )
 
 
@@ -89,6 +93,22 @@ def _parse_thinking_mode(raw: dict[str, Any]) -> ThinkingMode:
         "Profile field 'thinking' must be 'auto', 'enabled', 'disabled', "
         "true, or false when provided."
     )
+
+
+def _parse_context_window(raw: dict[str, Any]) -> int:
+    if "context_window" not in raw:
+        return DEFAULT_CONTEXT_WINDOW
+    value = raw["context_window"]
+    if (
+        not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < MIN_CONTEXT_WINDOW
+    ):
+        raise ConfigError(
+            "Profile field 'context_window' must be an integer of at least "
+            f"{MIN_CONTEXT_WINDOW}."
+        )
+    return value
 
 
 def _require_string(raw: dict[str, Any], field: str) -> str:

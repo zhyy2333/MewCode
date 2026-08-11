@@ -6,6 +6,7 @@ from typing import Any, TypeVar
 
 from mewcode.providers import (
     ChatMessage,
+    MessageKind,
     ModelRequest,
     ModelResponse,
     ProviderEvent,
@@ -84,7 +85,9 @@ class ScriptedAsyncProvider:
             )
             yield ProviderFinished(reason)
 
-    def assistant_messages(self, response: ModelResponse) -> list[ChatMessage]:
+    def assistant_messages(
+        self, response: ModelResponse, group_id: str | None = None
+    ) -> list[ChatMessage]:
         return [
             ChatMessage(
                 role="assistant",
@@ -99,11 +102,19 @@ class ScriptedAsyncProvider:
                         for call in response.tool_calls
                     ],
                 },
+                kind=(
+                    MessageKind.TOOL_CALL
+                    if response.tool_calls
+                    else MessageKind.ASSISTANT
+                ),
+                group_id=group_id,
             )
         ]
 
     def tool_result_messages(
-        self, executions: Sequence[ToolExecution]
+        self,
+        executions: Sequence[ToolExecution],
+        group_id: str | None = None,
     ) -> list[ChatMessage]:
         return [
             ChatMessage(
@@ -117,6 +128,8 @@ class ScriptedAsyncProvider:
                     }
                     for execution in executions
                 ],
+                kind=MessageKind.TOOL_RESULT,
+                group_id=group_id,
             )
         ]
 

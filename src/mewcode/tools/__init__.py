@@ -10,6 +10,7 @@ from .base import (
     ToolResult,
     ToolSafety,
     ValidatedToolCall,
+    serialize_tool_result,
     truncate_text,
     validate_arguments,
 )
@@ -32,6 +33,7 @@ __all__ = [
     "ToolResult",
     "ToolSafety",
     "ValidatedToolCall",
+    "serialize_tool_result",
     "truncate_text",
     "validate_arguments",
     "Workspace",

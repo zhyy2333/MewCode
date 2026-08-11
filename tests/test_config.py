@@ -43,7 +43,56 @@ profiles:
         base_url="https://api.openai.com/v1",
         api_key="openai-secret",
         thinking=ThinkingMode.AUTO,
+        context_window=128_000,
     )
+
+
+def test_context_window_is_optional_and_customizable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("API_KEY", "secret")
+    config_path = tmp_path / "config.yaml"
+    write_config(
+        config_path,
+        """
+active: main
+profiles:
+  - name: main
+    protocol: openai
+    model: model
+    base_url: https://example.test
+    api_key: env:API_KEY
+    context_window: 200000
+""",
+    )
+
+    assert load_active_profile(config_path).context_window == 200_000
+
+
+@pytest.mark.parametrize("value", ["true", "1.5", "21192", "text"])
+def test_invalid_context_window_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setenv("API_KEY", "secret")
+    config_path = tmp_path / "config.yaml"
+    write_config(
+        config_path,
+        f"""
+active: main
+profiles:
+  - name: main
+    protocol: openai
+    model: model
+    base_url: https://example.test
+    api_key: env:API_KEY
+    context_window: {value}
+""",
+    )
+
+    with pytest.raises(ConfigError, match="context_window.*21193"):
+        load_active_profile(config_path)
 
 
 @pytest.mark.parametrize(
