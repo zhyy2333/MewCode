@@ -33,6 +33,20 @@ from mewcode.repl import Repl
 from mewcode.tools import ToolCallRequest, ToolExecution, ToolResult
 
 
+@pytest.fixture(autouse=True)
+def isolate_cli_continuity(monkeypatch, tmp_path) -> None:
+    real_for_workspace = cli.ContinuityPaths.for_workspace
+    monkeypatch.setattr(
+        cli.ContinuityPaths,
+        "for_workspace",
+        classmethod(
+            lambda cls, _workspace: real_for_workspace(
+                tmp_path / "workspace", user_root=tmp_path / "user"
+            )
+        ),
+    )
+
+
 class FakeConversation:
     def __init__(self, events: list[object] | None = None) -> None:
         self.events = events or []

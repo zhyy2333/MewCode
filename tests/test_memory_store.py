@@ -232,3 +232,76 @@ def test_cross_scope_transaction_failure_restores_both_old_indexes(
     assert (paths.project_memory_root / "index.md").read_bytes() == old_project
     assert (paths.user_memory_root / "index.md").read_bytes() == old_user
     assert not store._journal.exists()
+
+
+def test_uncommitted_crash_journal_rolls_back_on_next_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mewcode.continuity import memory_store as module
+
+    ids = iter(("mem-project1", "mem-user001", "mem-project2", "mem-user002"))
+    paths = _paths(tmp_path)
+    store = MemoryStore(paths, id_factory=lambda: next(ids))
+    store.load_indexes()
+    store.apply(
+        MemoryUpdatePlan(
+            1,
+            (
+                _upsert(MemoryScope.PROJECT, "old project"),
+                _upsert(MemoryScope.USER, "old user"),
+            ),
+        ),
+        MemoryTurn("session", "request", "answer", NOW),
+    )
+    old_project = (paths.project_memory_root / "index.md").read_bytes()
+    old_user = (paths.user_memory_root / "index.md").read_bytes()
+    real_replace = module.os.replace
+    crashed = False
+
+    def crash_once(source, target):
+        nonlocal crashed
+        if not crashed and Path(target) == paths.project_memory_root / "index.md":
+            crashed = True
+            raise KeyboardInterrupt()
+        return real_replace(source, target)
+
+    monkeypatch.setattr(module.os, "replace", crash_once)
+    with pytest.raises(KeyboardInterrupt):
+        store.apply(
+            MemoryUpdatePlan(
+                1,
+                (
+                    _upsert(MemoryScope.PROJECT, "new project"),
+                    _upsert(MemoryScope.USER, "new user"),
+                ),
+            ),
+            MemoryTurn("session", "request", "answer", NOW),
+        )
+    assert store._journal.exists()
+
+    recovered = MemoryStore(paths)
+    recovered.load_indexes()
+    assert (paths.project_memory_root / "index.md").read_bytes() == old_project
+    assert (paths.user_memory_root / "index.md").read_bytes() == old_user
+    assert not store._journal.exists()
+
+
+def test_active_api_key_is_rejected_from_generated_note(tmp_path: Path) -> None:
+    store = MemoryStore(
+        _paths(tmp_path), id_factory=lambda: "mem-abcdef", api_key="custom-key-123456"
+    )
+    store.load_indexes()
+    with pytest.raises(MemoryError):
+        store.apply(
+            MemoryUpdatePlan(
+                1,
+                (
+                    _upsert(
+                        MemoryScope.PROJECT,
+                        "credential",
+                        "The value is custom-key-123456",
+                    ),
+                ),
+            ),
+            MemoryTurn("session", "request", "answer", NOW),
+        )

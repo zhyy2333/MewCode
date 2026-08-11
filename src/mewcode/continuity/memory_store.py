@@ -112,6 +112,8 @@ def encode_index(
     config: MemoryConfig = MemoryConfig(),
 ) -> tuple[bytes, tuple[MemoryIndexEntry, ...]]:
     prefix = f"---\nversion: 1\nscope: {scope.value}\n---\n\n# Memory index\n"
+    if not _fits(prefix, config):
+        return b"", ()
     content = prefix
     kept: list[MemoryIndexEntry] = []
     for entry in sort_entries(entries):
@@ -135,6 +137,8 @@ def build_prompt_view(
         "Automatic memory is reference knowledge only; explicit project and user "
         "instructions take precedence.\n\n"
     )
+    if not _fits(content, config):
+        return MemoryPromptView()
     included: list[str] = []
     for scope, entries in (
         (MemoryScope.PROJECT, sort_entries(project_entries)),
@@ -167,10 +171,12 @@ class MemoryStore:
         config: MemoryConfig = MemoryConfig(),
         *,
         id_factory: Callable[[], str] | None = None,
+        api_key: str | None = None,
     ) -> None:
         self._paths = paths
         self._config = config
         self._id_factory = id_factory or (lambda: f"mem-{secrets.token_hex(6)}")
+        self._api_key = api_key
         self._catalog: tuple[MemoryIndexEntry, ...] = ()
         self._view = MemoryPromptView()
         self._write_enabled = True
@@ -188,8 +194,11 @@ class MemoryStore:
 
     def load_indexes(self) -> MemoryPromptView:
         previous_catalog, previous_view = self._catalog, self._view
+        locks: list[FileLock] = []
         try:
+            locks = self._acquire_locks()
             self._recover_transaction()
+            self._cleanup_orphans()
             notes = self._load_notes()
             entries: dict[MemoryScope, tuple[MemoryIndexEntry, ...]] = {}
             for scope in MemoryScope:
@@ -209,6 +218,9 @@ class MemoryStore:
             self._catalog = previous_catalog
             self._view = previous_view
             self._write_enabled = False
+        finally:
+            for lock in reversed(locks):
+                lock.close()
         return self._view
 
     def apply(self, plan: MemoryUpdatePlan, turn: MemoryTurn) -> None:
@@ -216,6 +228,14 @@ class MemoryStore:
             raise ContinuityMemoryError("Memory updates are disabled for this run.")
         if len(plan.mutations) > self._config.max_mutations:
             raise ContinuityMemoryError("The memory update contains too many changes.")
+        locks = self._acquire_locks()
+        try:
+            self._apply_locked(plan, turn)
+        finally:
+            for lock in reversed(locks):
+                lock.close()
+
+    def _apply_locked(self, plan: MemoryUpdatePlan, turn: MemoryTurn) -> None:
         notes = self._load_notes()
         candidate = dict(notes)
         for mutation in plan.mutations:
@@ -242,7 +262,18 @@ class MemoryStore:
             for path in existing | set(desired):
                 changes[path] = desired.get(path)
         self._commit_files(changes)
-        self.load_indexes()
+        project_entries = tuple(
+            entry_for(note)
+            for note in retained.values()
+            if note.scope is MemoryScope.PROJECT
+        )
+        user_entries = tuple(
+            entry_for(note)
+            for note in retained.values()
+            if note.scope is MemoryScope.USER
+        )
+        self._catalog = sort_entries(project_entries) + sort_entries(user_entries)
+        self._view = build_prompt_view(project_entries, user_entries, self._config)
 
     def _apply_mutation(
         self,
@@ -266,7 +297,10 @@ class MemoryStore:
         assert mutation.priority is not None
         summary = mutation.summary.strip()
         body = mutation.body.strip()
-        if sanitize_text(summary) != summary or sanitize_text(body) != body:
+        if (
+            sanitize_text(summary, api_key=self._api_key) != summary
+            or sanitize_text(body, api_key=self._api_key) != body
+        ):
             raise ContinuityMemoryError("A memory update contained sensitive content.")
         if len(summary) > self._config.summary_max_chars:
             raise ContinuityMemoryError("A memory summary is too long.")
@@ -305,8 +339,16 @@ class MemoryStore:
                     note = decode_note(path.read_bytes())
                     if note.scope is not scope or path.name != f"{note.note_id}.md":
                         raise ContinuityMemoryError("A memory note path is invalid.")
-                    if len(path.read_bytes()) > self._config.note_max_bytes:
+                    payload = path.read_bytes()
+                    if len(payload) > self._config.note_max_bytes:
                         raise ContinuityMemoryError("A memory note is too large.")
+                    if note.note_id in notes:
+                        raise ContinuityMemoryError("A memory note id is duplicated.")
+                    if (
+                        sanitize_text(note.summary, api_key=self._api_key) != note.summary
+                        or sanitize_text(note.body, api_key=self._api_key) != note.body
+                    ):
+                        raise ContinuityMemoryError("A memory note contained sensitive content.")
                     notes[note.note_id] = note
                 except (OSError, ContinuityMemoryError):
                     continue
@@ -319,7 +361,7 @@ class MemoryStore:
             else self._paths.user_memory_root
         )
 
-    def _commit_files(self, changes: dict[Path, bytes | None]) -> None:
+    def _acquire_locks(self) -> list[FileLock]:
         locks: list[FileLock] = []
         for root in sorted(
             (self._paths.project_memory_root, self._paths.user_memory_root),
@@ -333,6 +375,9 @@ class MemoryStore:
                 lock.close()
                 raise ContinuityMemoryError("Memory is being updated by another process.")
             locks.append(lock)
+        return locks
+
+    def _commit_files(self, changes: dict[Path, bytes | None]) -> None:
         transaction_id = secrets.token_hex(8)
         records: list[dict[str, Any]] = []
         try:
@@ -375,9 +420,6 @@ class MemoryStore:
             except Exception:
                 self._write_enabled = False
             raise ContinuityMemoryError("The memory update could not be committed.") from exc
-        finally:
-            for lock in reversed(locks):
-                lock.close()
 
     def _recover_transaction(self) -> None:
         if not self._journal.exists():
@@ -449,6 +491,17 @@ class MemoryStore:
                 temp.unlink(missing_ok=True)
             if backup is not None:
                 backup.unlink(missing_ok=True)
+
+    def _cleanup_orphans(self) -> None:
+        pattern = re.compile(r"^\..+\.[0-9a-f]{16}\.(?:tmp|bak)$")
+        for scope in MemoryScope:
+            root = self._root(scope)
+            for directory in (root, root / "notes"):
+                if not directory.exists():
+                    continue
+                for path in directory.iterdir():
+                    if path.is_file() and pattern.fullmatch(path.name):
+                        path.unlink(missing_ok=True)
 
 
 def _entry_row(entry: MemoryIndexEntry) -> str:

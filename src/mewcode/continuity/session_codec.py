@@ -285,8 +285,15 @@ def _validate_json(value: Any) -> None:
         json.dumps(value, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError) as exc:
         raise ValueError("message content must be JSON-compatible") from exc
-    if isinstance(value, dict) and not all(isinstance(key, str) for key in value):
-        raise ValueError("message content keys must be strings")
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            if not all(isinstance(key, str) for key in current):
+                raise ValueError("message content keys must be strings")
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
 
 
 def _encode(payload: dict[str, Any]) -> bytes:

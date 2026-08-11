@@ -23,6 +23,7 @@ from .continuity import (
     SessionRepository,
 )
 from .continuity.session_codec import session_title
+from .continuity.sanitization import MemoryTurnSanitizer
 from .mcp import McpConfigLoader, McpConfigPaths, McpDiagnostic, McpError, McpRuntime
 from .permissions import (
     PermissionConfigError,
@@ -86,8 +87,11 @@ def main(argv: list[str] | None = None) -> int:
         opened_session = session_repository.open(session_request)
         session_binding = opened_session.binding
         memory_manager = MemoryManager(
-            MemoryStore(continuity_paths),
-            MemoryUpdater(provider),
+            MemoryStore(continuity_paths, api_key=profile.api_key),
+            MemoryUpdater(
+                provider,
+                sanitizer=MemoryTurnSanitizer(api_key=profile.api_key),
+            ),
         )
         context_archive = ContextArchive(workspace.root)
         _write_context_diagnostics(context_archive.start())
@@ -166,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
                 *maintenance_diagnostics,
                 *opened_session.diagnostics,
             )
-            if diagnostic.severity.value != "info"
+            if diagnostic.code not in {"created", "resumed"}
         )
         return Repl(
             conversation,

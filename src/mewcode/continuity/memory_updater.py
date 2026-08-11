@@ -71,6 +71,8 @@ class MemoryUpdater:
         try:
             async for event in self._provider.stream_reply(request):
                 if isinstance(event, ProviderTextDelta):
+                    if finish is not None:
+                        raise MemoryError("The memory updater returned data after finishing.")
                     text_parts.append(event.text)
                 elif isinstance(event, ProviderToolCall):
                     raise MemoryError("The memory updater attempted to call a tool.")

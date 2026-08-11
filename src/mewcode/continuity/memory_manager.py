@@ -16,9 +16,18 @@ class MemoryManager:
     def __init__(self, store: MemoryStore, updater: MemoryUpdater) -> None:
         self._store = store
         self._updater = updater
+        self._diagnostics: list[ContinuityDiagnostic] = []
         self._view = store.load_indexes()
         self._pending: asyncio.Task[None] | None = None
-        self._diagnostics: list[ContinuityDiagnostic] = []
+        if not store.write_enabled:
+            self._diagnostics.append(
+                ContinuityDiagnostic(
+                    ContinuityComponent.MEMORY,
+                    "memory_load_failed",
+                    DiagnosticSeverity.WARNING,
+                    "Automatic memory could not be loaded safely; updates are disabled.",
+                )
+            )
 
     def prompt_view(self) -> MemoryPromptView:
         return self._view
