@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import sys
 
+import pytest
+
 from mewcode.skills.materialization import MaterializedSkill
 from mewcode.skills.models import SkillFingerprint, SkillToolDeclaration
 from mewcode.skills.process_tool import SkillProcessTool
@@ -87,6 +89,34 @@ def test_process_tool_times_out_and_reaps_process(tmp_path: Path) -> None:
     tool = _tool(tmp_path, "import time; time.sleep(10)", timeout=1)
     result = asyncio.run(tool.execute({"value": "x"}))
     assert not result.ok and "timed out" in (result.error or "")
+
+
+def test_process_tool_cancellation_terminates_and_reaps_process(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from mewcode.skills import process_tool as process_tool_module
+
+    terminated_returncodes: list[int | None] = []
+    original_terminate = process_tool_module._terminate
+
+    async def tracking_terminate(process) -> None:
+        await original_terminate(process)
+        terminated_returncodes.append(process.returncode)
+
+    monkeypatch.setattr(process_tool_module, "_terminate", tracking_terminate)
+    tool = _tool(tmp_path, "import time; time.sleep(30)")
+
+    async def scenario() -> None:
+        task = asyncio.create_task(tool.execute({"value": "x"}))
+        await asyncio.sleep(0.1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+    assert terminated_returncodes
+    assert terminated_returncodes[0] is not None
 
 
 def test_process_tool_accepts_structured_failure(tmp_path: Path) -> None:

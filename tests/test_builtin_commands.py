@@ -180,6 +180,18 @@ def test_compact_reset_and_exit_take_exact_paths() -> None:
     assert ui.state.exit_requested is True
 
 
+def test_reset_failure_does_not_change_plan_mode() -> None:
+    class FailingRuntime(FakeRuntime):
+        async def reset_conversation(self):
+            raise RuntimeError("reset failed")
+
+    ui = FakeUI()
+    ui.state.mode = InteractionMode.PLAN
+    ui, _ = dispatch("reset", ui=ui, runtime=FailingRuntime())
+    assert ui.state.mode is InteractionMode.PLAN
+    assert ui.errors == ["Command '/reset' failed."]
+
+
 def test_review_prompt_compatibility_export_is_empty() -> None:
     assert REVIEW_PROMPT == ""
 

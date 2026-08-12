@@ -7,6 +7,7 @@ from typing import Any
 from mewcode.agent import AgentRunner, ToolScheduler
 from mewcode.prompting import PromptAdditions
 from mewcode.providers import ProviderTextDelta, ProviderToolCall
+from mewcode.providers import MessageKind
 from mewcode.skills import (
     LoadSkillTool,
     SkillCoordinator,
@@ -105,6 +106,55 @@ def test_shared_load_tool_activates_and_next_parent_iteration_sees_sop(tmp_path:
     assert "Shared focus" not in parent.calls[0].prompt.dynamic_system
     assert "Shared focus" in parent.calls[1].prompt.dynamic_system
     assert [item.name for item in runtime.active] == ["shared"]
+
+
+def test_agent_isolated_call_persists_only_paired_parent_tool_messages(
+    tmp_path: Path,
+) -> None:
+    runtime = _runtime(tmp_path)
+    child = ScriptedAsyncProvider([[ProviderTextDelta("private final")]])
+    coordinator = SkillCoordinator(
+        runtime,
+        runner_factory=lambda profile: _runner(child),
+        history_supplier=lambda: (),
+    )
+    loader = LoadSkillTool(coordinator)
+    runtime.set_global_tools(ToolRegistry([loader]))
+    parent = ScriptedAsyncProvider(
+        [
+            [
+                ProviderToolCall(
+                    ToolCallRequest(
+                        "private-1",
+                        "load_skill",
+                        {"name": "private", "input": "focus"},
+                        '{"name":"private","input":"focus"}',
+                    )
+                )
+            ],
+            [ProviderTextDelta("parent final")],
+        ]
+    )
+    run = _runner(parent).start(
+        [],
+        "review privately",
+        ToolRegistry([loader]),
+        run_view_provider=lambda: runtime.run_view(
+            {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
+        ),
+    )
+    asyncio.run(collect_async(run.events()))
+
+    messages = run.outcome.committed_history
+    assert [message.kind for message in messages] == [
+        MessageKind.USER,
+        MessageKind.TOOL_CALL,
+        MessageKind.TOOL_RESULT,
+        MessageKind.ASSISTANT,
+    ]
+    assert messages[2].content[0]["content"] == "private final"
+    assert all("Private focus" not in str(message.content) for message in messages)
+    assert len(child.calls) == 1
 
 
 def test_isolated_invocation_returns_final_reply_without_child_history_persistence(tmp_path: Path) -> None:
