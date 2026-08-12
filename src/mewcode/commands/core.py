@@ -68,6 +68,7 @@ def parse_input(raw: str) -> ParsedInput:
     token, separator, arguments = clean.partition(" ")
     return ParsedInput(
         InputKind.COMMAND,
+        text=clean,
         identifier=token[1:],
         arguments=arguments.strip() if separator else "",
     )
@@ -103,6 +104,9 @@ class CommandRegistry:
     def resolve(self, identifier: str) -> CommandDefinition | None:
         return self._index.get(identifier.casefold())
 
+    def definitions(self) -> tuple[CommandDefinition, ...]:
+        return self._definitions
+
     def public_definitions(self) -> tuple[CommandDefinition, ...]:
         return tuple(item for item in self._definitions if not item.hidden)
 
@@ -116,3 +120,26 @@ class CommandRegistry:
             if identifier.casefold().startswith(normalized)
         }
         return tuple(sorted(values, key=lambda item: (item.casefold(), item)))
+
+
+class DynamicCommandCatalog:
+    def __init__(self, static_registry: CommandRegistry) -> None:
+        self._static = static_registry
+        self._current = static_registry
+
+    def replace(self, dynamic_definitions: Iterable[CommandDefinition]) -> None:
+        self._current = CommandRegistry(
+            (*self._static.definitions(), *tuple(dynamic_definitions))
+        )
+
+    def resolve(self, identifier: str) -> CommandDefinition | None:
+        return self._current.resolve(identifier)
+
+    def definitions(self) -> tuple[CommandDefinition, ...]:
+        return self._current.definitions()
+
+    def public_definitions(self) -> tuple[CommandDefinition, ...]:
+        return self._current.public_definitions()
+
+    def completion_candidates(self, prefix: str) -> tuple[str, ...]:
+        return self._current.completion_candidates(prefix)

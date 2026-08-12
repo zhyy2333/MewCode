@@ -9,7 +9,7 @@ from mewcode.conversation import ConversationStatus
 from mewcode.permissions import PermissionMode
 from mewcode.providers import UsageSnapshot
 
-from .core import CommandRegistry, InteractionMode
+from .core import CommandRegistry, InteractionMode, ParsedInput
 
 
 @dataclass
@@ -53,9 +53,16 @@ class CommandRuntime(Protocol):
 
     def set_permission_mode(self, mode: PermissionMode) -> None: ...
 
+    async def invoke_skill(
+        self, name: str, input_text: str, raw_command: str
+    ) -> None: ...
+
+    async def reset_conversation(self) -> None: ...
+
 
 @dataclass(frozen=True)
 class CommandContext:
     registry: CommandRegistry
     ui: CommandUI
     runtime: CommandRuntime
+    invocation: ParsedInput | None = None

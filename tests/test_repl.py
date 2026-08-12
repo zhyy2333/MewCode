@@ -837,7 +837,8 @@ def test_cli_without_mcp_config_preserves_existing_tool_and_exit_behavior(monkey
         monkeypatch, McpConfigLoadResult((), (), ()), RuntimeMustNotStart
     )
     assert cli.main([]) == 0
-    assert len(captured["registry"].list()) == 6
+    assert len(captured["registry"].list()) == 7
+    assert captured["registry"].get("load_skill") is not None
 
 
 def test_cli_registers_healthy_mcp_tools_and_deferred_namespaces(monkeypatch) -> None:

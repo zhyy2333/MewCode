@@ -102,13 +102,20 @@ class McpManager:
                 )
             if not server_descriptors and session is not None:
                 diagnostics.extend(await session.close())
+                message = "server exposed no valid tools"
                 diagnostics.append(
                     McpDiagnostic(
                         config.name,
                         McpPhase.STARTUP,
-                        "server exposed no valid tools",
+                        message,
                     )
                 )
+                statuses.append(
+                    McpServerStatus(
+                        config.name, McpServerStartState.FAILED, (), message
+                    )
+                )
+                continue
             descriptors.extend(server_descriptors)
             statuses.append(
                 McpServerStatus(

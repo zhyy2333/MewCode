@@ -13,11 +13,8 @@ from .core import (
 )
 
 
-REVIEW_PROMPT = """Review the current workspace's uncommitted Git changes. Inspect the working
-tree and report only actionable findings, ordered by severity, with file and
-line references where possible. Focus on defects, behavioral regressions,
-security risks, and missing tests. Do not modify files. If there are no
-findings, say so explicitly."""
+# Compatibility export only. /review is now supplied by the built-in review Skill.
+REVIEW_PROMPT = ""
 
 
 def _no_arguments(arguments: str) -> None:
@@ -167,9 +164,11 @@ async def _status(context: CommandContext, arguments: str) -> None:
     context.ui.refresh_status()
 
 
-async def _review(context: CommandContext, arguments: str) -> None:
+async def _reset(context: CommandContext, arguments: str) -> None:
     _no_arguments(arguments)
-    await context.ui.send_user_message(REVIEW_PROMPT, read_only=True)
+    await context.runtime.reset_conversation()
+    context.ui.set_interaction_mode(InteractionMode.DEFAULT)
+    context.ui.refresh_status()
 
 
 async def _exit(context: CommandContext, arguments: str) -> None:
@@ -188,7 +187,22 @@ def create_builtin_command_registry() -> CommandRegistry:
         CommandDefinition("memory", "Show the safe memory summary.", "/memory", CommandType.LOCAL, _memory),
         CommandDefinition("permission", "Show or change permission mode.", "/permission [strict|default|allow]", CommandType.LOCAL, _permission, aliases=("permissions",), argument_hint="[strict|default|allow]"),
         CommandDefinition("status", "Show the current runtime status.", "/status", CommandType.LOCAL, _status),
-        CommandDefinition("review", "Review uncommitted workspace changes.", "/review", CommandType.PROMPT, _review),
+        CommandDefinition("reset", "Reset the current conversation state.", "/reset", CommandType.LOCAL, _reset),
         CommandDefinition("exit", "Exit MewCode.", "/exit", CommandType.LOCAL, _exit, aliases=("quit",), hidden=True),
     )
     return CommandRegistry(definitions)
+
+
+def create_skill_command_definition(name: str, description: str) -> CommandDefinition:
+    async def invoke(context: CommandContext, arguments: str) -> None:
+        raw = context.invocation.text if context.invocation is not None else f"/{name}"
+        await context.runtime.invoke_skill(name, arguments, raw)
+
+    return CommandDefinition(
+        name,
+        description,
+        f"/{name} [input]",
+        CommandType.PROMPT,
+        invoke,
+        argument_hint="[input]",
+    )

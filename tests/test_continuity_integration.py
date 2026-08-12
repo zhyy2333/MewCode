@@ -313,15 +313,15 @@ def test_command_sequence_keeps_all_local_commands_out_of_conversation() -> None
         "do",
         "help",
         "memory",
-        "permission",
-        "plan",
-        "review",
+            "permission",
+            "plan",
+            "reset",
         "session",
         "status",
     ]
 
 
-def test_plan_and_review_route_through_persistent_and_one_shot_readonly_modes() -> None:
+def test_plan_and_do_route_through_persistent_modes_without_hardcoded_review() -> None:
     terminal = ScriptedTerminal(
         ["/plan", "inspect safely", "/review", "/do", "make change", "/exit"]
     )
@@ -332,9 +332,9 @@ def test_plan_and_review_route_through_persistent_and_one_shot_readonly_modes() 
     assert result == 0
     assert conversation.sent == [
         ("inspect safely", ConversationMode.PLAN),
-        (REVIEW_PROMPT, ConversationMode.READ_ONLY),
         ("make change", ConversationMode.DEFAULT),
     ]
+    assert "Unknown command '/review'. Use /help." in terminal.errors
 
 
 def test_plan_read_only_and_review_read_only_use_only_safe_tools() -> None:
@@ -361,9 +361,7 @@ def test_plan_read_only_and_review_read_only_use_only_safe_tools() -> None:
     )
 
     asyncio.run(collect_async(conversation.send("plan it", ConversationMode.PLAN)))
-    asyncio.run(
-        collect_async(conversation.send(REVIEW_PROMPT, ConversationMode.READ_ONLY))
-    )
+    asyncio.run(collect_async(conversation.send("review workspace", ConversationMode.READ_ONLY)))
 
     assert [tool.name for tool in provider.calls[0].tools.list()] == ["inspect"]
     assert provider.calls[1].tools is None
@@ -373,7 +371,7 @@ def test_plan_read_only_and_review_read_only_use_only_safe_tools() -> None:
     assert conversation.pending_plan() is None
 
 
-def test_review_read_only_failure_keeps_safe_tool_boundary() -> None:
+def test_one_shot_read_only_failure_keeps_safe_tool_boundary() -> None:
     provider = OpenAIScriptedProvider([ProviderError("private provider detail")])
     conversation = Conversation(
         AgentRunner(
@@ -390,7 +388,7 @@ def test_review_read_only_failure_keeps_safe_tool_boundary() -> None:
     )
 
     events = asyncio.run(
-        collect_async(conversation.send(REVIEW_PROMPT, ConversationMode.READ_ONLY))
+        collect_async(conversation.send("review workspace", ConversationMode.READ_ONLY))
     )
 
     assert events[-1].reason is StopReason.STREAM_ERROR

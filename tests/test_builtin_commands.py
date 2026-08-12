@@ -46,9 +46,11 @@ class FakeUI:
 class FakeRuntime:
     def __init__(self) -> None:
         self.compactions = 0
+        self.resets = 0
         self.permission = PermissionMode.DEFAULT
 
     async def compact_context(self): self.compactions += 1
+    async def reset_conversation(self): self.resets += 1
     def session_status(self): return ConversationStatus("s-1", "safe title", True, 4, False)
     def memory_status(self): return MemoryRuntimeStatus(2, 3, 10, 100, 200, 25600, MemoryUpdateState.RUNNING)
     def context_status(self): return ContextRuntimeStatus(False, 3)
@@ -67,12 +69,12 @@ def dispatch(name: str, arguments: str = "", ui=None, runtime=None):
 def test_builtin_metadata_is_exact() -> None:
     registry = create_builtin_command_registry()
     assert [item.name for item in registry.public_definitions()] == [
-        "clear", "compact", "do", "help", "memory", "permission", "plan", "review", "session", "status"
+        "clear", "compact", "do", "help", "memory", "permission", "plan", "reset", "session", "status"
     ]
     assert registry.resolve("permissions").name == "permission"
     assert registry.resolve("quit").name == "exit"
     assert registry.resolve("exit").hidden is True
-    assert registry.resolve("review").command_type is CommandType.PROMPT
+    assert registry.resolve("reset").command_type is CommandType.LOCAL
     assert registry.resolve("plan").command_type is CommandType.UI
 
 
@@ -167,24 +169,22 @@ def test_status_includes_all_core_fields_and_na() -> None:
     assert ui.refreshes == 1
 
 
-def test_compact_review_and_exit_take_exact_paths() -> None:
+def test_compact_reset_and_exit_take_exact_paths() -> None:
     ui, runtime = dispatch("compact")
     assert runtime.compactions == 1 and ui.sent == []
-    dispatch("review", ui=ui, runtime=runtime)
-    assert ui.sent == [(REVIEW_PROMPT, True)]
+    ui.state.mode = InteractionMode.PLAN
+    dispatch("reset", ui=ui, runtime=runtime)
+    assert runtime.resets == 1
     assert ui.state.mode is InteractionMode.DEFAULT
     dispatch("quit", ui=ui, runtime=runtime)
     assert ui.state.exit_requested is True
 
 
-def test_review_prompt_is_fixed_and_has_no_runtime_interpolation() -> None:
-    first, _ = dispatch("review")
-    second, _ = dispatch("review")
-    assert first.sent == second.sent == [(REVIEW_PROMPT, True)]
-    assert "uncommitted Git changes" in REVIEW_PROMPT
+def test_review_prompt_compatibility_export_is_empty() -> None:
+    assert REVIEW_PROMPT == ""
 
 
-@pytest.mark.parametrize("name", ["compact", "clear", "plan", "do", "session", "memory", "status", "review", "exit"])
+@pytest.mark.parametrize("name", ["compact", "clear", "plan", "do", "session", "memory", "status", "reset", "exit"])
 def test_no_argument_commands_reject_arguments(name: str) -> None:
     ui, _ = dispatch(name, "extra")
     assert ui.errors and ui.errors[0].startswith("Usage: ")

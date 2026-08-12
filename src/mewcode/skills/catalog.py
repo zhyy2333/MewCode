@@ -98,6 +98,11 @@ def _validate_whitelists(
         for tool in definition.package_tools
     }
     errors: list[str] = []
+    for public_name, owner in owners.items():
+        if public_name in global_names:
+            errors.append(
+                f"Skill '{owner}' package tool '{public_name}' conflicts with a registered global tool."
+            )
     for definition in definitions.values():
         own = definition.package_tool_names
         for name in definition.tools:

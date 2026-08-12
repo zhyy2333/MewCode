@@ -95,6 +95,13 @@ class Repl:
                 if parsed.kind is InputKind.EMPTY:
                     continue
                 try:
+                    refresh = getattr(self._conversation, "refresh_skills", None)
+                    refreshed = refresh() if refresh is not None else None
+                    if refreshed is not None:
+                        for diagnostic in refreshed.diagnostics:
+                            self._terminal.write_error(
+                                f"Warning: {diagnostic.source}: {diagnostic.message}\n"
+                            )
                     if parsed.kind is InputKind.COMMAND:
                         await self._dispatcher.dispatch(parsed)
                     else:
@@ -180,6 +187,22 @@ class Repl:
         if self._permission_controller is None:
             raise CommandExecutionError("Permission controller is unavailable.")
         self._permission_controller.set_mode(mode)
+
+    async def invoke_skill(
+        self, name: str, input_text: str, raw_command: str
+    ) -> None:
+        mode = (
+            ConversationMode.PLAN
+            if self._state.mode is InteractionMode.PLAN
+            else ConversationMode.DEFAULT
+        )
+        await self._consume(
+            self._conversation.invoke_skill(name, input_text, raw_command, mode)
+        )
+        self._terminal.write("\n")
+
+    async def reset_conversation(self) -> None:
+        await self._conversation.reset()
 
     async def _consume(self, source: AsyncIterator[AgentEvent]) -> None:
         renderer = _EventRenderer()

@@ -1,10 +1,11 @@
-from .builtin import REVIEW_PROMPT, create_builtin_command_registry
+from .builtin import REVIEW_PROMPT, create_builtin_command_registry, create_skill_command_definition
 from .contracts import CommandContext, CommandRuntime, CommandUI, InteractionState
 from .core import (
     CommandDefinition,
     CommandExecutionError,
     CommandRegistrationError,
     CommandRegistry,
+    DynamicCommandCatalog,
     CommandType,
     CommandUsageError,
     InputKind,
@@ -21,6 +22,7 @@ __all__ = [
     "CommandExecutionError",
     "CommandRegistrationError",
     "CommandRegistry",
+    "DynamicCommandCatalog",
     "CommandRuntime",
     "CommandType",
     "CommandUI",
@@ -31,5 +33,6 @@ __all__ = [
     "ParsedInput",
     "REVIEW_PROMPT",
     "create_builtin_command_registry",
+    "create_skill_command_definition",
     "parse_input",
 ]

@@ -68,6 +68,16 @@ def test_messages_returns_copy() -> None:
     assert len(conversation.messages()) == 2
 
 
+def test_reset_clears_messages_and_pending_plan_in_memory() -> None:
+    provider = ScriptedAsyncProvider([[ProviderTextDelta("hello")]])
+    conversation = make_conversation(provider)
+    asyncio.run(collect_async(conversation.ask("Hi")))
+    assert conversation.messages()
+    asyncio.run(conversation.reset())
+    assert conversation.messages() == []
+    assert conversation.pending_plan() is None
+
+
 def test_conversation_status_is_safe_dynamic_and_marks_resumed() -> None:
     provider = ScriptedAsyncProvider([])
     runner = AgentRunner(

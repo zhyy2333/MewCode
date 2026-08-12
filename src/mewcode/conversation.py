@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
@@ -30,6 +30,7 @@ from .continuity import (
 from .continuity.session_codec import session_title
 from .providers import ChatMessage
 from .tools import ToolRegistry, ToolSafety
+from .skills import SkillCoordinator, SkillMode, SkillRefreshResult, SkillRuntime
 
 
 class ConversationError(RuntimeError):
@@ -72,6 +73,9 @@ class Conversation:
         instructions: InstructionSnapshot = InstructionSnapshot(),
         memory: MemoryManager | NullMemoryManager | None = None,
         resumed: bool = False,
+        skill_runtime: SkillRuntime | None = None,
+        skill_coordinator: SkillCoordinator | None = None,
+        skill_refresher: Callable[[], SkillRefreshResult] | None = None,
     ) -> None:
         self._runner = runner
         self._tools = tools
@@ -94,6 +98,10 @@ class Conversation:
         self._active_run: AgentRun | None = None
         self._last_outcome: AgentRunOutcome | None = None
         self._active_context_operation: ContextOperation | None = None
+        self._skill_runtime = skill_runtime
+        self._skill_coordinator = skill_coordinator
+        self._skill_refresher = skill_refresher
+        self._active_skill_safety = {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
 
     def messages(self) -> list[ChatMessage]:
         return list(self._messages)
@@ -129,9 +137,111 @@ class Conversation:
             else self._tools.select({ToolSafety.READ_ONLY})
         )
         agent_mode = AgentMode.PLAN if mode is ConversationMode.PLAN else AgentMode.DIRECT
+        allowed_safety = (
+            {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
+            if mode is ConversationMode.DEFAULT
+            else {ToolSafety.READ_ONLY}
+        )
+        self._active_skill_safety = allowed_safety
         context = PromptRunContext(task=text, additions=self._current_additions())
-        async for event in self._run(text, tools, agent_mode, context):
+        view_provider = (
+            (lambda: self._skill_runtime.run_view(allowed_safety))
+            if self._skill_runtime is not None
+            else None
+        )
+        async for event in self._run(
+            text, tools, agent_mode, context, run_view_provider=view_provider
+        ):
             yield event
+
+    def set_skill_coordinator(self, coordinator: SkillCoordinator) -> None:
+        self._skill_coordinator = coordinator
+
+    def current_skill_safety(self) -> set[ToolSafety]:
+        return set(self._active_skill_safety)
+
+    def skill_base_additions(self) -> PromptAdditions:
+        return self._current_additions()
+
+    def refresh_skills(self) -> SkillRefreshResult | None:
+        return self._skill_refresher() if self._skill_refresher is not None else None
+
+    async def invoke_skill(
+        self,
+        name: str,
+        input_text: str,
+        raw_command: str,
+        mode: ConversationMode = ConversationMode.DEFAULT,
+    ) -> AsyncIterator[AgentEvent]:
+        if self._skill_coordinator is None or self._skill_runtime is None:
+            raise ConversationError("Skill execution is unavailable.")
+        async for event in self._preflight():
+            yield event
+        definition = self._skill_runtime.catalog.get(name)
+        if definition is None:
+            raise ConversationError(f"Unknown Skill: {name}")
+        self._active_skill_safety = (
+            {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
+            if mode is ConversationMode.DEFAULT
+            else {ToolSafety.READ_ONLY}
+        )
+        operation = self._skill_coordinator.invoke(name, input_text)
+        async for event in operation.events():
+            yield event
+        result = operation.result
+        if not result.ok:
+            raise ConversationError(result.error or f"Skill '{name}' failed.")
+        if definition.mode is SkillMode.SHARED:
+            context = PromptRunContext(
+                task=input_text or f"Run Skill '{name}'.",
+                additions=self._current_additions(),
+            )
+            async for event in self._run(
+                raw_command,
+                self._tools,
+                AgentMode.PLAN if mode is ConversationMode.PLAN else AgentMode.DIRECT,
+                context,
+                run_view_provider=lambda: self._skill_runtime.run_view(
+                    self._active_skill_safety
+                ),
+            ):
+                yield event
+            return
+        candidate = (
+            *self._messages,
+            ChatMessage("user", raw_command),
+            ChatMessage("assistant", result.content),
+        )
+        try:
+            if self._session is not None:
+                self._session.commit_history(candidate)
+        except Exception as exc:
+            raise ConversationError("The isolated Skill result could not be persisted.") from exc
+        self._messages = list(candidate)
+        self._memory.schedule(
+            MemoryTurn(
+                self._session_id,
+                raw_command,
+                result.content,
+                self._session.now() if self._session is not None else datetime.now().astimezone(),
+            )
+        )
+
+    async def reset(self) -> None:
+        if self._active_run is not None or self._active_context_operation is not None:
+            raise ConversationError("Another conversation operation is already active.")
+        await self._memory.await_pending()
+        try:
+            if self._session is not None:
+                self._session.reset_state()
+        except Exception as exc:
+            raise ConversationError("The current conversation could not be reset.") from exc
+        self._messages = []
+        self._pending_plan = None
+        if self._skill_runtime is not None:
+            self._skill_runtime.reset(persist=False)
+        if self._context_manager is not None:
+            self._context_manager.reset_runtime_state()
 
     async def ask(self, user_text: str) -> AsyncIterator[AgentEvent]:
         async for event in self.send(user_text, ConversationMode.DEFAULT):
@@ -229,6 +339,8 @@ class Conversation:
         )
         if self._session is not None:
             diagnostics.extend(self._session.close())
+        if self._skill_runtime is not None:
+            self._skill_runtime.close()
         if self._context_manager is None:
             return tuple(diagnostics)
         diagnostics.extend(self._context_manager.close())
@@ -240,6 +352,7 @@ class Conversation:
         tools: ToolRegistry,
         mode: AgentMode,
         prompt_context: PromptRunContext,
+        run_view_provider=None,
     ) -> AsyncIterator[AgentEvent]:
         if self._active_run is not None or self._active_context_operation is not None:
             raise ConversationError("Another conversation operation is already active.")
@@ -250,6 +363,7 @@ class Conversation:
             mode,
             prompt_context,
             history_commit_sink=self._session,
+            run_view_provider=run_view_provider,
         )
         self._active_run = run
         self._last_outcome = None

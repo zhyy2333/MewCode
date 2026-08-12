@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import sys
 from pathlib import Path
+from types import MappingProxyType
 
 from .agent import AgentRunner, ToolScheduler
 from .commands import (
@@ -11,7 +12,12 @@ from .commands import (
     InteractionState,
     create_builtin_command_registry,
 )
-from .config import load_active_profile
+from .config import (
+    ProfileCatalog,
+    ProfileEntry,
+    load_active_profile,
+    load_profile_catalog,
+)
 from .context import ContextArchive, ContextConfig, ContextError, ContextManager
 from .conversation import Conversation
 from .continuity import (
@@ -51,6 +57,32 @@ from .providers import (
 from .repl import Repl
 from .terminal import PromptToolkitTerminal
 from .tools import ToolRegistry, Workspace, create_builtin_registry
+from .skills import (
+    LoadSkillTool,
+    SkillCatalogError,
+    SkillDefinitionError,
+    SkillRefreshResult,
+    SkillRoots,
+    SkillRuntime,
+    SkillCoordinator,
+    build_skill_catalog,
+    discover_sources,
+)
+from .commands import DynamicCommandCatalog, create_skill_command_definition
+
+_ORIGINAL_LOAD_ACTIVE_PROFILE = load_active_profile
+
+
+def _load_profiles() -> ProfileCatalog:
+    if load_active_profile is _ORIGINAL_LOAD_ACTIVE_PROFILE:
+        return load_profile_catalog()
+    profile = load_active_profile()
+    return ProfileCatalog(
+        profile.name,
+        MappingProxyType({profile.name: ProfileEntry(profile, "")}),
+        UsageLedger(),
+        _provider_factory=create_provider,
+    )
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -82,12 +114,26 @@ def main(argv: list[str] | None = None) -> int:
     session_binding: SessionBinding | None = None
     memory_manager: MemoryManager | None = None
     try:
-        command_registry = create_builtin_command_registry()
+        static_command_registry = create_builtin_command_registry()
+        command_registry = DynamicCommandCatalog(static_command_registry)
         interaction_state = InteractionState()
         workspace = Workspace(Path.cwd())
-        profile = load_active_profile()
-        usage_ledger = UsageLedger()
-        provider = UsageTrackingProvider(create_provider(profile), usage_ledger)
+        profile_catalog = _load_profiles()
+        profile = profile_catalog.active_profile
+        usage_ledger = profile_catalog.usage_ledger
+        provider = profile_catalog.provider()
+        skill_roots = SkillRoots.defaults(workspace.root)
+        skill_sources = discover_sources(skill_roots)
+        command_identifiers = {
+            identifier
+            for definition in static_command_registry.definitions()
+            for identifier in (definition.name, *definition.aliases)
+        }
+        pre_catalog = build_skill_catalog(
+            skill_sources,
+            system_command_identifiers=command_identifiers,
+            profiles=profile_catalog,
+        )
         continuity_paths = ContinuityPaths.for_workspace(workspace.root)
         instructions = InstructionLoader().load(continuity_paths)
         session_repository = SessionRepository(continuity_paths)
@@ -127,12 +173,42 @@ def main(argv: list[str] | None = None) -> int:
             mcp_runtime = McpRuntime(workspace.root)
             runtime_result = mcp_runtime.start(
                 config_result.servers,
-                {tool.name for tool in builtin_tools},
+                {
+                    *(tool.name for tool in builtin_tools),
+                    "load_skill",
+                    *(
+                        tool.public_name
+                        for definition in pre_catalog.definitions.values()
+                        for tool in definition.package_tools
+                    ),
+                },
             )
             mcp_tools = runtime_result.tools
             _write_mcp_diagnostics(runtime_result.diagnostics)
-        registry = ToolRegistry([*builtin_tools, *mcp_tools])
-        known_tools = {tool.name for tool in registry.list()}
+        base_registry = ToolRegistry([*builtin_tools, *mcp_tools])
+        mcp_statuses = {
+            status.server_name: (
+                status.state.value
+                if status.message is None
+                else f"{status.state.value}: {status.message}"
+            )
+            for status in (runtime_result.statuses if config_result.servers else ())
+        }
+        catalog = build_skill_catalog(
+            skill_sources,
+            system_command_identifiers=command_identifiers,
+            profiles=profile_catalog,
+            global_tool_names={*base_registry.names, "load_skill"},
+            mcp_status=mcp_statuses,
+        )
+        known_tools = {
+            *base_registry.names,
+            *(
+                tool.public_name
+                for definition in catalog.definitions.values()
+                for tool in definition.package_tools
+            ),
+        }
         permission_paths = PermissionPaths.for_workspace(workspace)
         rule_sets = PermissionConfigLoader().load(
             permission_paths,
@@ -159,6 +235,81 @@ def main(argv: list[str] | None = None) -> int:
             prompt_builder=prompt_builder,
             context_manager=context_manager,
         )
+        skill_runtime = SkillRuntime(
+            catalog,
+            workspace.root,
+            base_registry,
+            binding=opened_session.binding,
+            api_key_environment_names=profile_catalog.api_key_environment_names,
+        )
+        restore_diagnostics = skill_runtime.restore(
+            getattr(opened_session.state, "active_skills", ())
+        )
+        conversation_ref: dict[str, Conversation] = {}
+
+        def isolated_runner(profile_name: str | None) -> AgentRunner:
+            selected = profile_catalog.require(profile_name or profile_catalog.active_name)
+            isolated_context = ContextManager(
+                profile_catalog.provider(profile_name),
+                context_archive,
+                ContextConfig(selected.context_window),
+            )
+            return AgentRunner(
+                profile_catalog.provider(profile_name),
+                scheduler,
+                prompt_builder=prompt_builder,
+                context_manager=isolated_context,
+            )
+
+        coordinator = SkillCoordinator(
+            skill_runtime,
+            runner_factory=isolated_runner,
+            history_supplier=lambda: conversation_ref["value"].messages(),
+            base_additions_supplier=lambda: conversation_ref["value"].skill_base_additions(),
+            allowed_safety_supplier=lambda: conversation_ref["value"].current_skill_safety(),
+        )
+        load_skill = LoadSkillTool(coordinator)
+        registry = base_registry.merge(ToolRegistry([load_skill]))
+        skill_runtime.set_global_tools(registry)
+        command_registry.replace(
+            create_skill_command_definition(item.name, item.description)
+            for item in catalog.definitions.values()
+        )
+
+        def refresh_skills() -> SkillRefreshResult:
+            try:
+                sources = discover_sources(skill_roots)
+                fingerprint = tuple(
+                    sorted(
+                        (item.fingerprint for item in sources),
+                        key=lambda item: (item.root, item.files),
+                    )
+                )
+                result = skill_runtime.refresh(
+                    fingerprint,
+                    lambda: build_skill_catalog(
+                        sources,
+                        system_command_identifiers=command_identifiers,
+                        profiles=profile_catalog,
+                        global_tool_names=set(registry.names),
+                        mcp_status=mcp_statuses,
+                    ),
+                )
+                if result.accepted and result.changed:
+                    command_registry.replace(
+                        create_skill_command_definition(item.name, item.description)
+                        for item in skill_runtime.catalog.definitions.values()
+                    )
+                return result
+            except Exception as exc:
+                from .skills import SkillDiagnostic
+
+                return SkillRefreshResult(
+                    True,
+                    False,
+                    (SkillDiagnostic("refresh", f"Skill update was rejected: {exc}"),),
+                )
+
         conversation = Conversation(
             agent_runner,
             registry,
@@ -168,7 +319,11 @@ def main(argv: list[str] | None = None) -> int:
             instructions=instructions,
             memory=memory_manager,
             resumed=opened_session.resumed,
+            skill_runtime=skill_runtime,
+            skill_coordinator=coordinator,
+            skill_refresher=refresh_skills,
         )
+        conversation_ref["value"] = conversation
         action = "resumed" if opened_session.resumed else "created"
         title = session_title(
             opened_session.state.messages,
@@ -188,6 +343,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             if diagnostic.code not in {"created", "resumed"}
         )
+        startup_messages.extend(
+            f"skills: {diagnostic.message}"
+            for diagnostic in (*catalog.diagnostics, *restore_diagnostics)
+        )
         terminal = PromptToolkitTerminal(command_registry, interaction_state)
         return Repl(
             conversation,
@@ -201,6 +360,9 @@ def main(argv: list[str] | None = None) -> int:
             context_manager=context_manager,
         ).run()
     except CommandRegistrationError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        return 1
+    except (SkillCatalogError, SkillDefinitionError) as exc:
         sys.stderr.write(f"Error: {exc}\n")
         return 1
     except PermissionConfigError as exc:

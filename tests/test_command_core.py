@@ -6,6 +6,7 @@ from mewcode.commands.core import (
     CommandDefinition,
     CommandRegistrationError,
     CommandRegistry,
+    DynamicCommandCatalog,
     CommandType,
     InputKind,
     parse_input,
@@ -40,6 +41,16 @@ def test_parse_empty_message_and_command_arguments() -> None:
     assert parsed.kind is InputKind.COMMAND
     assert parsed.identifier == "HeLp"
     assert parsed.arguments == "Keep  CASE"
+    assert parsed.text == "/HeLp    Keep  CASE"
+
+
+def test_dynamic_command_catalog_atomically_replaces_public_commands() -> None:
+    catalog = DynamicCommandCatalog(CommandRegistry([command("help")]))
+    catalog.replace([command("sample")])
+    assert [item.name for item in catalog.public_definitions()] == ["help", "sample"]
+    assert catalog.completion_candidates("/sam") == ("/sample",)
+    catalog.replace([])
+    assert catalog.resolve("sample") is None
 
 
 def test_parse_uses_only_ascii_space_as_command_separator() -> None:
