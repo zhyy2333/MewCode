@@ -46,7 +46,8 @@ def test_section_registry_has_approved_order_and_tool_rules() -> None:
         (700, "text_output", PromptStability.STABLE),
         (800, "environment", PromptStability.DYNAMIC),
         (900, "custom_instructions", PromptStability.DYNAMIC),
-        (1000, "active_skill", PromptStability.DYNAMIC),
+        (950, "available_skills", PromptStability.DYNAMIC),
+        (1000, "active_skills", PromptStability.DYNAMIC),
         (1100, "long_term_memory", PromptStability.DYNAMIC),
     ]
 
@@ -85,7 +86,7 @@ def test_dynamic_system_optional_sections_and_stable_boundary(tmp_path) -> None:
     assert [line for line in full.dynamic_system.splitlines() if line.startswith("## ")] == [
         "## Environment",
         "## Custom Instructions",
-        "## Active Skill",
+        "## Active Skills",
         "## Long-Term Memory",
     ]
     assert full.dynamic_system.index("custom") < full.dynamic_system.index("skill")
@@ -101,5 +102,21 @@ def test_dynamic_system_omits_blank_optional_sections(tmp_path) -> None:
         "direct",
     )
     assert "## Custom Instructions" not in package.dynamic_system
-    assert "## Active Skill\nskill" in package.dynamic_system
+    assert "## Active Skills\nskill" in package.dynamic_system
+
+
+def test_available_skills_precede_active_skills(tmp_path) -> None:
+    package = _builder(tmp_path).build(
+        PromptRunContext(
+            "task",
+            additions=PromptAdditions(
+                available_skills="sample: summary",
+                active_skills="### sample\nSOP",
+            ),
+        ),
+        "direct",
+    )
+    assert package.dynamic_system.index("## Available Skills") < package.dynamic_system.index(
+        "## Active Skills"
+    )
     assert "## Long-Term Memory" not in package.dynamic_system

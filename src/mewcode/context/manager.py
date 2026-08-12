@@ -152,6 +152,10 @@ class ContextManager:
     def close(self) -> tuple[ContextStatus, ...]:
         return self._archive.close()
 
+    def reset_runtime_state(self) -> None:
+        self._estimator = TokenEstimator()
+        self._breaker = CompactionCircuitBreaker(self._config.failure_limit)
+
     async def _prepare_automatic(
         self,
         request: ModelRequest,

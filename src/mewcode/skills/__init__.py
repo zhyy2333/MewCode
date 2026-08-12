@@ -13,6 +13,9 @@ from .models import (
 )
 from .parser import parse_skill
 from .paths import SkillRoots, discover_layer, discover_sources
+from .materialization import MaterializedSkill, SkillMaterializer
+from .process_tool import SkillProcessTool, create_skill_tools
+from .runtime import ActivatedSkill, SkillRefreshResult, SkillRuntime
 
 __all__ = [
     "SkillCatalogError",
@@ -26,8 +29,15 @@ __all__ = [
     "SkillRoots",
     "SkillSource",
     "SkillToolDeclaration",
+    "ActivatedSkill",
+    "MaterializedSkill",
+    "SkillMaterializer",
+    "SkillProcessTool",
+    "SkillRefreshResult",
+    "SkillRuntime",
     "build_skill_catalog",
     "discover_layer",
     "discover_sources",
     "parse_skill",
+    "create_skill_tools",
 ]

@@ -45,7 +45,10 @@ SECTION_SPECS: tuple[PromptSectionSpec, ...] = (
     PromptSectionSpec(
         "custom_instructions", "Custom Instructions", 900, PromptStability.DYNAMIC
     ),
-    PromptSectionSpec("active_skill", "Active Skill", 1000, PromptStability.DYNAMIC),
+    PromptSectionSpec(
+        "available_skills", "Available Skills", 950, PromptStability.DYNAMIC
+    ),
+    PromptSectionSpec("active_skills", "Active Skills", 1000, PromptStability.DYNAMIC),
     PromptSectionSpec(
         "long_term_memory", "Long-Term Memory", 1100, PromptStability.DYNAMIC
     ),

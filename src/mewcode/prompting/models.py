@@ -28,20 +28,30 @@ class PromptEnvironment:
 @dataclass(frozen=True)
 class PromptAdditions:
     custom_instructions: str | None = None
+    # Kept for callers compiled against the phase-9 singular field.
     active_skill: str | None = None
     long_term_memory: str | None = None
+    available_skills: str | None = None
+    active_skills: str | None = None
 
     def merged(
         self,
         *,
         custom_instructions: str | None = None,
+        available_skills: str | None = None,
+        active_skills: str | None = None,
         active_skill: str | None = None,
         long_term_memory: str | None = None,
     ) -> PromptAdditions:
         return PromptAdditions(
-            _join(custom_instructions, self.custom_instructions),
-            _join(self.active_skill, active_skill),
-            _join(self.long_term_memory, long_term_memory),
+            custom_instructions=_join(custom_instructions, self.custom_instructions),
+            active_skill=None,
+            long_term_memory=_join(self.long_term_memory, long_term_memory),
+            available_skills=_join(self.available_skills, available_skills),
+            active_skills=_join(
+                _join(self.active_skills, self.active_skill),
+                _join(active_skills, active_skill),
+            ),
         )
 
 

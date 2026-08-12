@@ -216,7 +216,15 @@ def _validate_command_paths(command: tuple[str, ...], package: Path) -> None:
 
 
 def _looks_like_package_path(value: str) -> bool:
-    return value.startswith(".") or "/" in value or "\\" in value
+    return (
+        not value.startswith("-")
+        and (
+            value.startswith(".")
+            or "/" in value
+            or "\\" in value
+            or bool(Path(value).suffix)
+        )
+    )
 
 
 def _required_string(raw: dict[str, Any], field: str) -> str:

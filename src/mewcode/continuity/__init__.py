@@ -21,6 +21,7 @@ from .session_models import (
     SessionState,
     SessionSummary,
     StoredPlan,
+    StoredSkillActivation,
 )
 from .session_repository import SessionBinding, SessionRepository
 from .memory_models import (
@@ -78,4 +79,5 @@ __all__ = [
     "SessionState",
     "SessionSummary",
     "StoredPlan",
+    "StoredSkillActivation",
 ]

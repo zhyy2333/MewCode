@@ -32,7 +32,8 @@ class PromptBuilder:
         dynamic_content = {
             "environment": render_environment(self._environment_provider.get()),
             "custom_instructions": additions.custom_instructions,
-            "active_skill": additions.active_skill,
+            "available_skills": additions.available_skills,
+            "active_skills": _active_skills(additions),
             "long_term_memory": additions.long_term_memory,
         }
         dynamic_sections = [
@@ -54,3 +55,12 @@ class PromptBuilder:
 
 def _render_section(title: str, content: str) -> str:
     return f"## {title}\n{content}"
+
+
+def _active_skills(additions) -> str | None:
+    values = [
+        value.strip()
+        for value in (additions.active_skills, additions.active_skill)
+        if value and value.strip()
+    ]
+    return "\n\n".join(values) or None

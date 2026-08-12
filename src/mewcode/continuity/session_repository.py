@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import secrets
+import tempfile
 
 from mewcode.locking import FileLock
 from mewcode.providers import ChatMessage, MessageKind
@@ -21,6 +22,7 @@ from .paths import ContinuityPaths
 from .session_codec import (
     encode_history,
     encode_plan,
+    encode_skills,
     encode_start,
     replay_file,
     scan_file,
@@ -33,6 +35,7 @@ from .session_models import (
     SessionState,
     SessionSummary,
     StoredPlan,
+    StoredSkillActivation,
 )
 
 SESSION_ID_PATTERN = re.compile(r"^\d{8}-\d{6}-[0-9a-f]{4}$")
@@ -50,6 +53,8 @@ class SessionBinding:
         lock: FileLock,
         messages: Sequence[ChatMessage],
         pending_plan: StoredPlan | None,
+        active_skills: Sequence[StoredSkillActivation] = (),
+        created_at: datetime | None = None,
     ) -> None:
         self._repository = repository
         self.session_id = session_id
@@ -57,6 +62,8 @@ class SessionBinding:
         self._lock = lock
         self._messages = tuple(messages)
         self._pending_plan = pending_plan
+        self._active_skills = tuple(active_skills)
+        self._created_at = created_at
         self._closed = False
 
     def maintain(self, now: datetime | None = None) -> tuple[ContinuityDiagnostic, ...]:
@@ -98,6 +105,60 @@ class SessionBinding:
             return
         self._append_record(encode_plan(pending_plan, now or self._repository.now()))
         self._pending_plan = pending_plan
+
+    def commit_skills(
+        self,
+        active_skills: Sequence[StoredSkillActivation],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        self._ensure_open()
+        candidate = tuple(active_skills)
+        if candidate == self._active_skills:
+            return
+        self._append_record(encode_skills(candidate, now or self._repository.now()))
+        self._active_skills = candidate
+
+    def reset_state(self, *, now: datetime | None = None) -> None:
+        self._ensure_open()
+        current = now or self._repository.now()
+        created = self._created_at or current
+        payload = b"".join(
+            (
+                encode_start(self.session_id, created),
+                encode_history((), "replace", current),
+                encode_plan(None, current),
+                encode_skills((), current),
+            )
+        )
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w+b", dir=self._path.parent, prefix=f".{self.session_id}.",
+                suffix=".tmp", delete=False
+            ) as handle:
+                temporary = Path(handle.name)
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self._path)
+            temporary = None
+            if os.name != "nt":
+                directory_fd = os.open(self._path.parent, os.O_RDONLY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
+        except OSError as exc:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise SessionPersistenceError("The current session could not be reset.") from exc
+        self._messages = ()
+        self._pending_plan = None
+        self._active_skills = ()
 
     def close(self) -> tuple[ContinuityDiagnostic, ...]:
         if self._closed:
@@ -270,10 +331,10 @@ class SessionRepository:
             except OSError as exc:
                 lock.close()
                 raise SessionError("A new session could not be created.") from exc
-            binding = SessionBinding(self, session_id, path, lock, (), None)
+            binding = SessionBinding(self, session_id, path, lock, (), None, (), now)
             return SessionOpenResult(
                 binding,
-                SessionState(session_id, (), None, now),
+                SessionState(session_id, (), None, now, ()),
                 (_diagnostic("created", f"Created session {session_id}."),),
                 False,
             )
@@ -320,6 +381,8 @@ class SessionRepository:
                 lock,
                 replay.messages,
                 replay.pending_plan,
+                replay.active_skills,
+                replay.created_at,
             )
             if prefix != len(replay.messages):
                 binding.commit_history(valid_messages, now=now)
@@ -340,7 +403,13 @@ class SessionRepository:
             diagnostics.append(_diagnostic("resumed", f"Resumed session {session_id}."))
             return SessionOpenResult(
                 binding,
-                SessionState(session_id, tuple(valid_messages), replay.pending_plan, now),
+                SessionState(
+                    session_id,
+                    tuple(valid_messages),
+                    replay.pending_plan,
+                    now,
+                    replay.active_skills,
+                ),
                 tuple(diagnostics),
                 True,
             )

@@ -11,12 +11,13 @@ from mewcode.continuity.session_codec import (
     encode_history,
     encode_message,
     encode_plan,
+    encode_skills,
     encode_start,
     replay_file,
     session_title,
     valid_tool_prefix,
 )
-from mewcode.continuity.session_models import StoredPlan
+from mewcode.continuity.session_models import StoredPlan, StoredSkillActivation
 from mewcode.providers import ChatMessage, MessageKind
 
 NOW = datetime(2026, 8, 11, 12, tzinfo=timezone.utc)
@@ -37,6 +38,7 @@ def test_record_encoding_is_one_line() -> None:
         encode_start("20260811-120000-abcd", NOW),
         encode_history((ChatMessage("user", "hi"),), "append", NOW),
         encode_plan(StoredPlan("task", "plan"), NOW),
+        encode_skills((StoredSkillActivation("review", "focus"),), NOW),
     )
     assert all(item.endswith(b"\n") and item.count(b"\n") == 1 for item in records)
 
@@ -49,10 +51,12 @@ def test_replay_append_replace_and_plan(tmp_path: Path) -> None:
         + encode_history((ChatMessage("user", "old"),), "append", NOW)
         + encode_history((ChatMessage("user", "new"),), "replace", NOW)
         + encode_plan(StoredPlan("task", "plan"), NOW)
+        + encode_skills((StoredSkillActivation("review", "focus"),), NOW)
     )
     replay = replay_file(path, session_id)
     assert replay.messages == (ChatMessage("user", "new"),)
     assert replay.pending_plan == StoredPlan("task", "plan")
+    assert replay.active_skills == (StoredSkillActivation("review", "focus"),)
     assert replay.recoverable
 
 

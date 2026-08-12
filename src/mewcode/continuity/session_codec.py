@@ -8,7 +8,7 @@ from typing import Any
 
 from mewcode.providers import ChatMessage, MessageKind
 
-from .session_models import SessionReplay, SessionScan, StoredPlan
+from .session_models import SessionReplay, SessionScan, StoredPlan, StoredSkillActivation
 from .sanitization import sanitize_text
 
 SESSION_VERSION = 1
@@ -48,6 +48,19 @@ def encode_plan(plan: StoredPlan | None, at: datetime) -> bytes:
     )
 
 
+def encode_skills(skills: Sequence[StoredSkillActivation], at: datetime) -> bytes:
+    return _encode(
+        {
+            "version": SESSION_VERSION,
+            "type": "skill_state",
+            "at": _time(at),
+            "active_skills": [
+                {"name": item.name, "input": item.input} for item in skills
+            ],
+        }
+    )
+
+
 def encode_message(message: ChatMessage) -> dict[str, Any]:
     _validate_json(message.content)
     return {
@@ -79,6 +92,7 @@ def decode_message(payload: Any) -> ChatMessage:
 def replay_file(path: Path, session_id: str) -> SessionReplay:
     messages: list[ChatMessage] = []
     pending: StoredPlan | None = None
+    active_skills: tuple[StoredSkillActivation, ...] = ()
     created_at: datetime | None = None
     last_activity: datetime | None = None
     invalid = 0
@@ -118,6 +132,8 @@ def replay_file(path: Path, session_id: str) -> SessionReplay:
                         raise ValueError("invalid history operation")
                 elif record_type == "plan_state":
                     pending = _decode_plan(record.get("pending_plan"))
+                elif record_type == "skill_state":
+                    active_skills = _decode_skills(record.get("active_skills"))
                 else:
                     raise ValueError("unknown record")
                 last_activity = at if last_activity is None or at > last_activity else last_activity
@@ -127,6 +143,7 @@ def replay_file(path: Path, session_id: str) -> SessionReplay:
         session_id,
         tuple(messages),
         pending,
+        active_skills,
         created_at,
         last_activity,
         invalid,
@@ -173,6 +190,8 @@ def scan_file(path: Path, session_id: str) -> SessionScan:
                         raise ValueError("invalid history operation")
                 elif record_type == "plan_state":
                     _decode_plan(record.get("pending_plan"))
+                elif record_type == "skill_state":
+                    _decode_skills(record.get("active_skills"))
                 else:
                     raise ValueError("unknown record")
                 last_activity = at if last_activity is None or at > last_activity else last_activity
@@ -272,6 +291,23 @@ def _decode_plan(payload: Any) -> StoredPlan | None:
     if not isinstance(task, str) or not task.strip() or not isinstance(text, str) or not text.strip():
         raise ValueError("invalid plan")
     return StoredPlan(task, text)
+
+
+def _decode_skills(payload: Any) -> tuple[StoredSkillActivation, ...]:
+    values = _require_list(payload)
+    result: list[StoredSkillActivation] = []
+    seen: set[str] = set()
+    for item in values:
+        if not isinstance(item, dict) or set(item) != {"name", "input"}:
+            raise ValueError("invalid Skill activation")
+        name, input_text = item["name"], item["input"]
+        if not isinstance(name, str) or not name or not isinstance(input_text, str):
+            raise ValueError("invalid Skill activation")
+        if name in seen:
+            raise ValueError("duplicate Skill activation")
+        seen.add(name)
+        result.append(StoredSkillActivation(name, input_text))
+    return tuple(result)
 
 
 def _require_list(value: Any) -> list[Any]:

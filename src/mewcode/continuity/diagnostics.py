@@ -8,6 +8,7 @@ class ContinuityComponent(StrEnum):
     INSTRUCTIONS = "instructions"
     SESSION = "session"
     MEMORY = "memory"
+    SKILLS = "skills"
 
 
 class DiagnosticSeverity(StrEnum):

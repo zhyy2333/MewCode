@@ -38,6 +38,12 @@ class StoredPlan:
 
 
 @dataclass(frozen=True)
+class StoredSkillActivation:
+    name: str
+    input: str = ""
+
+
+@dataclass(frozen=True)
 class SessionSummary:
     session_id: str
     title: str
@@ -53,6 +59,7 @@ class SessionState:
     messages: tuple[ChatMessage, ...] = ()
     pending_plan: StoredPlan | None = None
     last_activity: datetime | None = None
+    active_skills: tuple[StoredSkillActivation, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -68,6 +75,7 @@ class SessionReplay:
     session_id: str
     messages: tuple[ChatMessage, ...]
     pending_plan: StoredPlan | None
+    active_skills: tuple[StoredSkillActivation, ...]
     created_at: datetime | None
     last_activity: datetime | None
     invalid_lines: int

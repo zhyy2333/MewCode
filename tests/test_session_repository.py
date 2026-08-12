@@ -13,6 +13,7 @@ from mewcode.continuity import (
     SessionPersistenceError,
     SessionRepository,
     StoredPlan,
+    StoredSkillActivation,
 )
 from mewcode.continuity.session_codec import encode_history, encode_start, replay_file
 from mewcode.providers import ChatMessage, MessageKind
@@ -42,10 +43,30 @@ def test_id_create_and_binding_roundtrip(tmp_path: Path) -> None:
     binding.commit_history((*first, ChatMessage("assistant", "done")), now=NOW)
     binding.commit_history((ChatMessage("user", "replacement"),), now=NOW)
     binding.commit_plan(StoredPlan("task", "plan"), now=NOW)
+    binding.commit_skills((StoredSkillActivation("review", "focus"),), now=NOW)
     binding.close()
     resumed = repo.open(SessionOpenRequest(SessionOpenMode.RESUME, opened.state.session_id))
     assert resumed.state.messages == (ChatMessage("user", "replacement"),)
     assert resumed.state.pending_plan == StoredPlan("task", "plan")
+    assert resumed.state.active_skills == (StoredSkillActivation("review", "focus"),)
+    resumed.binding.close()
+
+
+def test_reset_state_atomically_rewrites_same_session(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    opened = repo.open(SessionOpenRequest(SessionOpenMode.NEW))
+    session_id = opened.state.session_id
+    opened.binding.commit_history((ChatMessage("user", "old"),), now=NOW)
+    opened.binding.commit_plan(StoredPlan("task", "plan"), now=NOW)
+    opened.binding.commit_skills((StoredSkillActivation("review", "x"),), now=NOW)
+    opened.binding.reset_state(now=NOW + timedelta(minutes=1))
+    opened.binding.close()
+
+    resumed = repo.open(SessionOpenRequest(SessionOpenMode.RESUME, session_id), NOW + timedelta(minutes=2))
+    assert resumed.state.session_id == session_id
+    assert resumed.state.messages == ()
+    assert resumed.state.pending_plan is None
+    assert resumed.state.active_skills == ()
     resumed.binding.close()
 
 
