@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from mewcode.config import load_active_profile
+from mewcode.config import load_active_profile, load_profile_catalog
 from mewcode.providers import ConfigError, ProviderProfile, ThinkingMode
 
 
@@ -277,3 +277,61 @@ profiles:
         load_active_profile(config_path)
 
     assert "super-secret" not in str(exc_info.value)
+
+
+def test_profile_catalog_validates_every_profile_and_tracks_key_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FIRST_KEY", "first-secret")
+    monkeypatch.setenv("SECOND_KEY", "second-secret")
+    config_path = tmp_path / "config.yaml"
+    write_config(
+        config_path,
+        """
+active: first
+profiles:
+  - name: first
+    protocol: openai
+    model: one
+    base_url: https://one.test
+    api_key: env:FIRST_KEY
+  - name: second
+    protocol: anthropic
+    model: two
+    base_url: https://two.test
+    api_key: env:SECOND_KEY
+""",
+    )
+
+    catalog = load_profile_catalog(config_path)
+
+    assert catalog.active_profile.name == "first"
+    assert catalog.require("second").model == "two"
+    assert catalog.api_key_environment_names == frozenset({"FIRST_KEY", "SECOND_KEY"})
+
+
+def test_profile_catalog_rejects_invalid_inactive_profile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("FIRST_KEY", "secret")
+    config_path = tmp_path / "config.yaml"
+    write_config(
+        config_path,
+        """
+active: first
+profiles:
+  - name: first
+    protocol: openai
+    model: one
+    base_url: https://one.test
+    api_key: env:FIRST_KEY
+  - name: broken
+    protocol: openai
+    model: two
+    base_url: https://two.test
+    api_key: env:MISSING_KEY
+""",
+    )
+
+    with pytest.raises(ConfigError, match="MISSING_KEY"):
+        load_profile_catalog(config_path)

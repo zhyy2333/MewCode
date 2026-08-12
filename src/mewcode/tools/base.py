@@ -131,7 +131,11 @@ def _matches_json_type(value: Any, expected: str) -> bool:
 
 class ToolRegistry:
     def __init__(self, tools: Iterable[Tool]) -> None:
-        self._tools = {tool.name: tool for tool in tools}
+        self._tools: dict[str, Tool] = {}
+        for tool in tools:
+            if tool.name in self._tools:
+                raise ValueError(f"Duplicate tool name: {tool.name}")
+            self._tools[tool.name] = tool
 
     def get(self, name: str) -> Tool | None:
         return self._tools.get(name)
@@ -139,8 +143,28 @@ class ToolRegistry:
     def list(self) -> list[Tool]:
         return list(self._tools.values())
 
-    def select(self, safety: set[ToolSafety]) -> ToolRegistry:
+    @property
+    def names(self) -> tuple[str, ...]:
+        return tuple(self._tools)
+
+    def merge(self, *others: ToolRegistry) -> ToolRegistry:
+        return ToolRegistry(
+            tool for registry in (self, *others) for tool in registry.list()
+        )
+
+    def select_names(self, names: Iterable[str]) -> ToolRegistry:
+        selected = set(names)
+        return ToolRegistry(tool for tool in self.list() if tool.name in selected)
+
+    def without(self, names: Iterable[str]) -> ToolRegistry:
+        excluded = set(names)
+        return ToolRegistry(tool for tool in self.list() if tool.name not in excluded)
+
+    def select_safety(self, safety: set[ToolSafety]) -> ToolRegistry:
         return ToolRegistry(tool for tool in self.list() if tool.safety in safety)
+
+    def select(self, safety: set[ToolSafety]) -> ToolRegistry:
+        return self.select_safety(safety)
 
     def validate_call(self, request: ToolCallRequest) -> ValidatedToolCall | ToolResult:
         tool = self.get(request.name)

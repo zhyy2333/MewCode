@@ -14,6 +14,7 @@ from .models import (
     McpError,
     McpPhase,
     McpServerConfig,
+    McpServerStatus,
     McpTimeouts,
     McpTransportError,
 )
@@ -25,6 +26,7 @@ from .transport import DefaultMcpTransportFactory, McpTransportFactory
 class McpRuntimeStartResult:
     tools: tuple[McpTool, ...]
     diagnostics: tuple[McpDiagnostic, ...]
+    statuses: tuple[McpServerStatus, ...] = ()
 
 
 class McpRuntime:
@@ -54,7 +56,7 @@ class McpRuntime:
             raise RuntimeError("MCP runtime can only be started once.")
         self._started = True
         if not configs:
-            return McpRuntimeStartResult((), ())
+            return McpRuntimeStartResult((), (), ())
         self._thread = threading.Thread(
             target=self._run_loop,
             name="mewcode-mcp",
@@ -80,6 +82,7 @@ class McpRuntime:
         return McpRuntimeStartResult(
             tuple(McpTool(descriptor, self) for descriptor in result.descriptors),
             result.diagnostics,
+            result.statuses,
         )
 
     async def call_tool(

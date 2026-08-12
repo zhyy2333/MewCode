@@ -11,6 +11,8 @@ from .models import (
     McpManagerStartResult,
     McpPhase,
     McpServerConfig,
+    McpServerStartState,
+    McpServerStatus,
     McpTimeouts,
     McpToolDescriptor,
     McpUnavailableError,
@@ -42,6 +44,7 @@ class McpManager:
         )
         diagnostics: list[McpDiagnostic] = []
         descriptors: list[McpToolDescriptor] = []
+        statuses: list[McpServerStatus] = []
         accepted = set(reserved_tool_names)
         for config, outcome in zip(configs, outcomes, strict=True):
             session = self._sessions.get(config.name)
@@ -53,6 +56,11 @@ class McpManager:
                 )
                 diagnostics.append(
                     McpDiagnostic(config.name, McpPhase.STARTUP, message)
+                )
+                statuses.append(
+                    McpServerStatus(
+                        config.name, McpServerStartState.FAILED, (), message
+                    )
                 )
                 if session is not None:
                     diagnostics.extend(await session.close())
@@ -102,9 +110,17 @@ class McpManager:
                     )
                 )
             descriptors.extend(server_descriptors)
+            statuses.append(
+                McpServerStatus(
+                    config.name,
+                    McpServerStartState.READY,
+                    tuple(item.public_name for item in server_descriptors),
+                )
+            )
         return McpManagerStartResult(
             tuple(sorted(descriptors, key=lambda item: item.public_name)),
             tuple(diagnostics),
+            tuple(statuses),
         )
 
     async def call_tool(
@@ -146,4 +162,3 @@ class McpManager:
         self._sessions[config.name] = session
         tools = await session.start()
         return tools, session.diagnostics
-

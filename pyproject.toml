@@ -14,7 +14,14 @@ dependencies = [
     "openai>=2.49.0",
     "prompt-toolkit>=3.0,<4",
     "PyYAML",
+    "jsonschema>=4,<5",
 ]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/mewcode"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/src", "/tests", "/README.md", "/pyproject.toml"]
 
 [project.optional-dependencies]
 dev = [

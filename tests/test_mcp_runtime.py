@@ -6,7 +6,13 @@ import threading
 
 import pytest
 
-from mewcode.mcp.models import McpDiagnostic, McpPhase, McpTimeouts, StdioServerConfig
+from mewcode.mcp.models import (
+    McpDiagnostic,
+    McpPhase,
+    McpServerStartState,
+    McpTimeouts,
+    StdioServerConfig,
+)
 from mewcode.mcp.runtime import McpRuntime
 
 
@@ -75,6 +81,10 @@ def test_runtime_returns_healthy_tools_after_partial_server_failure(tmp_path: Pa
     runtime = McpRuntime(tmp_path, timeouts=McpTimeouts(.2, .2, .2), transport_factory=Factory(transports))
     result = runtime.start((StdioServerConfig("bad", "x"), StdioServerConfig("good", "x")), set())
     assert [tool.name for tool in result.tools] == ["good__echo"] and result.diagnostics
+    assert {status.server_name: status.state for status in result.statuses} == {
+        "bad": McpServerStartState.FAILED,
+        "good": McpServerStartState.READY,
+    }
     runtime.close()
 
 

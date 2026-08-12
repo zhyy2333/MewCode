@@ -1,0 +1,13 @@
+{
+  "name": "git_snapshot",
+  "description": "Return a bounded read-only snapshot of Git status and uncommitted diffs.",
+  "parameters": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {},
+    "additionalProperties": false
+  },
+  "command": ["python", "scripts/git_snapshot.py"],
+  "safety": "read_only",
+  "timeout_seconds": 60
+}

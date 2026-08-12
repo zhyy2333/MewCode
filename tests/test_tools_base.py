@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
+import pytest
+
 from mewcode.tools import (
     PermissionTargetKind,
     ToolCallRequest,
@@ -220,6 +222,20 @@ def test_registry_selects_safety_view_and_blocks_other_tools() -> None:
     )
     assert result.ok is False
     assert result.error == "Unknown tool: raising"
+
+
+def test_registry_rejects_duplicate_names_and_composes_views() -> None:
+    with pytest.raises(ValueError, match="Duplicate tool name: echo"):
+        ToolRegistry([EchoTool(), EchoTool()])
+
+    first = ToolRegistry([EchoTool()])
+    second = ToolRegistry([RaisingTool()])
+    merged = first.merge(second)
+
+    assert merged.names == ("echo", "raising")
+    assert merged.select_names({"raising"}).names == ("raising",)
+    assert merged.without({"echo"}).names == ("raising",)
+    assert merged.select_safety({ToolSafety.READ_ONLY}).names == ("echo",)
 
 
 def test_builtin_registry_has_three_tools_in_each_safety_class(tmp_path) -> None:

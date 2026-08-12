@@ -98,6 +98,19 @@ class McpSessionState(StrEnum):
     CLOSED = "closed"
 
 
+class McpServerStartState(StrEnum):
+    READY = "ready"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class McpServerStatus:
+    server_name: str
+    state: McpServerStartState
+    tool_names: tuple[str, ...] = ()
+    message: str | None = None
+
+
 @dataclass(frozen=True)
 class McpToolDescriptor:
     server_name: str
@@ -118,4 +131,4 @@ class McpCallResult:
 class McpManagerStartResult:
     descriptors: tuple[McpToolDescriptor, ...]
     diagnostics: tuple[McpDiagnostic, ...]
-
+    statuses: tuple[McpServerStatus, ...] = ()

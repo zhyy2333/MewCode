@@ -1,12 +1,22 @@
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from types import MappingProxyType
+from typing import Any, Callable, Mapping, cast
 
 import yaml
 
-from .providers import ConfigError, ProviderProfile, ThinkingMode
+from .providers import (
+    ConfigError,
+    LLMProvider,
+    ProviderProfile,
+    ThinkingMode,
+    UsageLedger,
+    UsageTrackingProvider,
+    create_provider,
+)
 
 DEFAULT_CONFIG_PATH = Path.home() / ".mewcode" / "config.yaml"
 SUPPORTED_PROTOCOLS = {"anthropic", "openai"}
@@ -16,6 +26,68 @@ MIN_CONTEXT_WINDOW = 21_193
 
 
 def load_active_profile(path: Path = DEFAULT_CONFIG_PATH) -> ProviderProfile:
+    active, profiles = _read_config(path)
+    selected = _find_profile(profiles, active)
+    return _parse_profile(selected)
+
+
+@dataclass(frozen=True)
+class ProfileEntry:
+    profile: ProviderProfile
+    api_key_env: str
+
+
+@dataclass
+class ProfileCatalog:
+    active_name: str
+    entries: Mapping[str, ProfileEntry]
+    usage_ledger: UsageLedger = field(default_factory=UsageLedger)
+    _providers: dict[str, LLMProvider] = field(default_factory=dict, init=False, repr=False)
+    _provider_factory: Callable[[ProviderProfile], LLMProvider] = field(
+        default=create_provider, repr=False
+    )
+
+    @property
+    def active_profile(self) -> ProviderProfile:
+        return self.require(self.active_name)
+
+    @property
+    def api_key_environment_names(self) -> frozenset[str]:
+        return frozenset(entry.api_key_env for entry in self.entries.values())
+
+    def require(self, name: str) -> ProviderProfile:
+        entry = self.entries.get(name)
+        if entry is None:
+            raise ConfigError(f"Profile '{name}' was not found in profiles.")
+        return entry.profile
+
+    def provider(self, name: str | None = None) -> LLMProvider:
+        selected = name or self.active_name
+        provider = self._providers.get(selected)
+        if provider is None:
+            provider = UsageTrackingProvider(
+                self._provider_factory(self.require(selected)), self.usage_ledger
+            )
+            self._providers[selected] = provider
+        return provider
+
+
+def load_profile_catalog(path: Path = DEFAULT_CONFIG_PATH) -> ProfileCatalog:
+    active, profiles = _read_config(path)
+    entries: dict[str, ProfileEntry] = {}
+    for index, item in enumerate(profiles):
+        if not isinstance(item, dict):
+            raise ConfigError(f"Profile at index {index} must be a YAML object.")
+        profile, env_name = _parse_profile_entry(item)
+        if profile.name in entries:
+            raise ConfigError(f"Duplicate profile name '{profile.name}'.")
+        entries[profile.name] = ProfileEntry(profile, env_name)
+    if active not in entries:
+        raise ConfigError(f"Active profile '{active}' was not found in profiles.")
+    return ProfileCatalog(active, MappingProxyType(entries))
+
+
+def _read_config(path: Path) -> tuple[str, list[Any]]:
     if not path.exists():
         raise ConfigError(
             f"Config file not found at {path}. Create it from examples/config.yaml."
@@ -36,8 +108,7 @@ def load_active_profile(path: Path = DEFAULT_CONFIG_PATH) -> ProviderProfile:
     if not isinstance(profiles, list):
         raise ConfigError("Config field 'profiles' must be a list.")
 
-    selected = _find_profile(profiles, active)
-    return _parse_profile(selected)
+    return active, profiles
 
 
 def _find_profile(profiles: list[Any], active: str) -> dict[str, Any]:
@@ -48,6 +119,10 @@ def _find_profile(profiles: list[Any], active: str) -> dict[str, Any]:
 
 
 def _parse_profile(raw: dict[str, Any]) -> ProviderProfile:
+    return _parse_profile_entry(raw)[0]
+
+
+def _parse_profile_entry(raw: dict[str, Any]) -> tuple[ProviderProfile, str]:
     missing = [field for field in REQUIRED_PROFILE_FIELDS if field not in raw]
     if missing:
         fields = ", ".join(missing)
@@ -65,7 +140,7 @@ def _parse_profile(raw: dict[str, Any]) -> ProviderProfile:
     thinking = _parse_thinking_mode(raw)
     context_window = _parse_context_window(raw)
 
-    api_key = _resolve_api_key(api_key_ref)
+    api_key, env_name = _resolve_api_key(api_key_ref)
     return ProviderProfile(
         name=name,
         protocol=cast(Any, protocol),
@@ -74,7 +149,7 @@ def _parse_profile(raw: dict[str, Any]) -> ProviderProfile:
         api_key=api_key,
         thinking=thinking,
         context_window=context_window,
-    )
+    ), env_name
 
 
 def _parse_thinking_mode(raw: dict[str, Any]) -> ThinkingMode:
@@ -118,7 +193,7 @@ def _require_string(raw: dict[str, Any], field: str) -> str:
     return value.strip()
 
 
-def _resolve_api_key(value: str) -> str:
+def _resolve_api_key(value: str) -> tuple[str, str]:
     prefix = "env:"
     if not value.startswith(prefix) or len(value) == len(prefix):
         raise ConfigError("Profile field 'api_key' must use env:VAR_NAME format.")
@@ -130,4 +205,4 @@ def _resolve_api_key(value: str) -> str:
     api_key = os.environ.get(env_name)
     if not api_key:
         raise ConfigError(f"Environment variable '{env_name}' is not set or empty.")
-    return api_key
+    return api_key, env_name
