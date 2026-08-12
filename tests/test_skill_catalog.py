@@ -67,3 +67,39 @@ def test_missing_and_cross_skill_tools_are_fatal(tmp_path: Path) -> None:
             discover_sources(SkillRoots(root, tmp_path / "u", tmp_path / "b")),
             global_tool_names={"read_file"},
         )
+
+
+def test_missing_mcp_tool_reports_server_status(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    _skill(root, "sample", "sample", "[remote__lookup]")
+    with pytest.raises(SkillCatalogError) as caught:
+        build_skill_catalog(
+            discover_sources(SkillRoots(root, tmp_path / "u", tmp_path / "b")),
+            global_tool_names={"read_file"},
+            mcp_status={"remote": "failed to start"},
+        )
+    message = str(caught.value)
+    assert "sample" in message
+    assert "remote__lookup" in message
+    assert "failed to start" in message
+
+
+def test_package_static_error_is_isolated_as_definition_warning(tmp_path: Path) -> None:
+    root = tmp_path / "project"
+    _skill(root, "valid", "valid")
+    package = root / "broken"
+    package.mkdir(parents=True)
+    (package / "SKILL.md").write_text(
+        "---\nname: broken\ndescription: broken\ntools: []\nmode: shared\n---\nBody",
+        encoding="utf-8",
+    )
+    link = package / "linked.txt"
+    try:
+        link.symlink_to(root / "valid.md")
+    except OSError:
+        pytest.skip("symbolic links are unavailable")
+    catalog = build_skill_catalog(
+        discover_sources(SkillRoots(root, tmp_path / "u", tmp_path / "b"))
+    )
+    assert tuple(catalog.definitions) == ("valid",)
+    assert catalog.diagnostics and "Symbolic" in catalog.diagnostics[0].message

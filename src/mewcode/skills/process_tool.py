@@ -143,6 +143,8 @@ def _resolve_command(command: tuple[str, ...], package: Path) -> tuple[str, ...]
         if index == 0:
             if path.is_absolute():
                 resolved.append(str(path))
+            elif argument.startswith(".") or "/" in argument or "\\" in argument:
+                resolved.append(str(ensure_package_path(package, argument)))
             else:
                 resolved.append(argument)
             continue

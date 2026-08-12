@@ -38,7 +38,7 @@ profiles:
     context_window: 128000
 ```
 
-`context_window` 可省略；旧配置无需迁移，MewCode 会统一采用保守的 128000 Token 默认值。需要为兼容模型设置更小窗口时，可以在活动 Profile 中显式填写不小于 21193 的整数。
+`context_window` 可省略；旧配置无需迁移，MewCode 会统一采用保守的 128000 Token 默认值。需要为兼容模型设置更小窗口时，可以在 Profile 中显式填写不小于 21193 的整数。启动时会完整校验所有 Profile（包括非活动项）及其 API Key 环境变量；独立 Skill 可以按名称复用其中一个 Profile。
 
 ### MCP Server
 
@@ -117,13 +117,83 @@ python -m mewcode
 | `/memory` | 显示项目/用户记忆条数、索引容量和后台更新状态，不显示记忆正文 |
 | `/permission [strict\|default\|allow]` | 查询或切换当前权限模式；兼容别名为 `/permissions` |
 | `/status` | 显示模式、会话、权限、Token、上下文和记忆的核心摘要 |
-| `/review` | 让 AI 以单次强制只读方式审查当前工作区未提交的 Git 改动 |
+| `/reset` | 原子清空当前会话消息、待执行计划和 Skill 激活状态，并恢复 `[DEFAULT]` |
+
+所有有效 Skill 也会自动注册为 `/<skill-name> [input]`，因此内置的 `/commit`、`/review` 和 `/test` 会与系统命令一起出现在帮助和补全中。
 
 `/exit` 及其兼容别名 `/quit` 仍可退出，但作为隐藏兼容命令不出现在帮助和补全中。命令名称大小写不敏感；未知命令会提示使用 `/help`，不会发送给 AI。
 
 输入命令前缀后可按 Tab 补全：单个匹配直接补齐，多个匹配显示候选菜单，光标进入参数区域后不再提供命令名候选。底部状态栏始终显示共享模式标记 `[DEFAULT]` 或 `[PLAN]`。
 
-`/status` 的 Token 数据覆盖当前进程内当前会话的全部模型调用，包括普通对话、PLAN、review、上下文压缩和自动记忆更新；Provider 未报告的累计字段显示为 `n/a`，不会用估算值代替。
+`/status` 的 Token 数据覆盖当前进程内当前会话的全部模型调用，包括普通对话、PLAN、Skill、上下文压缩和自动记忆更新；Provider 未报告的累计字段显示为 `n/a`，不会用估算值代替。
+
+## Skill 系统
+
+Skill 把可复用 AI 工作流保存为 YAML frontmatter 加 Markdown SOP。系统按项目级 `<workspace>/.mewcode/skills/`、用户级 `~/.mewcode/skills/`、内置资源的顺序发现，同名定义按“项目＞用户＞内置”选择。每层同时识别 `<name>.md` 和 `<name>/SKILL.md`；目录包只以 `SKILL.md` 为入口。高层定义无效时回退低层有效版本，单个解析错误只警告；同层有效重名、系统命令冲突、缺失白名单工具或无效 Profile 会拒绝启动。
+
+名称必须是小写 kebab-case。定义字段严格且不接受未知字段：
+
+```markdown
+---
+name: explain-change
+description: Explain the current change for a reviewer.
+tools:
+  - read_file
+  - search_code
+mode: shared
+---
+Explain the change with this focus: {{input}}
+```
+
+`name`、`description`、`tools`、`mode` 必填，`mode` 只能是 `shared` 或 `isolated`。共享模式禁止 `history` 和 `model`；独立模式必须提供非负整数 `history`，并可用 `model` 填写现有 Profile 名称。正文只替换字面量 `{{input}}`；没有占位符时，调用参数仍作为任务内容提供。
+
+启动时模型只看到 Skill 名称和一句说明。Agent 需要使用时调用始终可见的系统工具 `load_skill`：
+
+- `shared` 在当前会话激活，完整 SOP 按激活顺序常驻 `Active Skills`，同名再次调用只替换最新参数渲染结果而不移动顺序。
+- `isolated` 每次新建临时 Direct 对话，从主历史复制最近 `history` 个完整轮次，不拆开工具链；它继承环境、人工指令、长期记忆和共享 SOP，只追加本次独立 SOP。最终回复直接回流，内部消息和工具调用不写入主历史。
+
+直接调用共享斜杠命令会把原始命令保存为该轮用户消息，随后保存正常 Agent 回复与工具链。直接调用独立命令只保存原始斜杠消息和独立最终回复；主 Agent 自主调用独立 Skill 时，主历史保存 `load_skill` 调用、最终回复工具结果和主 Agent 后续回复。
+
+没有共享 Skill 激活时，主对话仍能看到当前模式允许的全部注册工具。一旦有共享 Skill 激活，工具集收窄为各共享白名单并集，再与 DEFAULT/PLAN/READ_ONLY 的安全上限取交集；`load_skill` 始终保留。独立运行使用“共享白名单并集＋当前独立白名单”后再取安全交集，不改变主对话工具集。所有实际工具仍经过现有权限系统。
+
+### 目录包专属工具
+
+目录型 Skill 可在 `tools/*.json` 中为每个工具放一个严格声明，实现文件通常位于 `scripts/`：
+
+```json
+{
+  "name": "check",
+  "description": "Check the selected files.",
+  "parameters": {
+    "type": "object",
+    "properties": {"path": {"type": "string"}},
+    "required": ["path"]
+  },
+  "command": ["python", "scripts/check.py"],
+  "safety": "read_only",
+  "timeout_seconds": 60
+}
+```
+
+局部名称统一公开为 `<skill-name>__<tool-name>`，frontmatter 的 `tools` 也填写完整公开名；Skill 只能引用全局工具和自己的包工具，不能依赖其他 Skill 的包工具。`safety` 必须为 `read_only` 或 `side_effect`，并以完整公开名进入工具级权限判断。
+
+`command` 是 argv 字符串数组，解释器由作者显式填写，MewCode 不经过 shell。包内路径安全解析到激活时的临时只读版本副本；子进程 cwd 是工作区，环境提供 `MEWCODE_SKILL_DIR` 和 `MEWCODE_WORKSPACE_ROOT`，并移除所有 Profile API Key 环境变量。
+
+调用参数以一个 JSON 对象写入 stdin。stdout 必须且只能是一个 JSON 对象，包含布尔 `ok` 和字符串 `content`，可选字符串 `error` 与对象 `metadata`。非零退出、超时、非法 JSON、字段错误或超量 I/O 会成为结构化工具失败；stderr 只保留有界内部诊断。超时默认 60 秒，可配置 1–600 秒，超时和取消都会终止子进程。
+
+### 热更新、恢复与内置样板
+
+每次处理新的非空输入或斜杠命令前，MewCode 比较 Skill 文件元数据；无变化不重读，有变化才重建完整候选。成功更新会按名称把激活项绑定到当前最高有效版本并用最后原始参数重渲染；定义全部消失时自动失活。候选出现全局错误时整批拒绝，旧目录、命令、SOP、工具和物化包继续工作，不使用后台监听线程。
+
+会话只持久化激活名称、顺序和最后原始参数，恢复时用当前文件重新解析，不保存旧 SOP 或工具实例。`/reset` 使用同一会话 ID 原子清空消息、旧计划和所有激活 Skill，并恢复 DEFAULT；人工指令、长期记忆和权限模式不变，重启不会恢复 reset 前历史。`/clear` 仍只清终端显示。
+
+内置样板如下：
+
+- `commit`：共享模式，检查 Git 改动、运行相称验证、只暂存相关安全文件并创建一次提交；无改动、验证失败或范围不明时不提交。
+- `review`：独立模式、history 0、只读最小工具集，只审查当前工作区；它替代了旧的硬编码 `/review`。
+- `test`：共享模式，识别项目测试方式并运行与参数或未提交改动匹配的测试，只运行和报告，不修改产品代码。
+
+本阶段不包含 Skill 市场、远程安装、版本管理、依赖解析、签名、后台 watcher、通用 OS 沙箱、参数级权限目标或 `{{input}}` 之外的模板语法。
 
 ## 项目指令、会话与长期记忆
 
@@ -153,7 +223,7 @@ python -m mewcode
 
 ## 结构化系统提示与缓存
 
-每次模型请求都使用同一套结构化系统提示。稳定前缀依次包含 Identity、System Constraints、Task Mode、Action Execution、Tool Use、Tone and Style 和 Text Output；Environment、自动发现的项目/用户指令、调用方提供的自定义指令、已激活 Skill 内容、长期记忆以及当次 `<system-reminder>` 位于稳定边界之后。
+每次模型请求都使用同一套结构化系统提示。稳定前缀依次包含 Identity、System Constraints、Task Mode、Action Execution、Tool Use、Tone and Style 和 Text Output；Environment、自动发现的项目/用户指令、Skill 目录、已激活共享 Skill 内容、长期记忆以及当次 `<system-reminder>` 位于稳定边界之后。
 
 Plan 和 Execute 模式按一次 Agent Run 内的真实模型调用次数注入提醒：第 1, 5, 9, 13, 17 次使用完整指令，其余调用使用精简提醒。Direct Mode 不增加模式提醒。提醒使用系统语义，不会作为用户消息写入对话历史。
 
@@ -163,7 +233,7 @@ Plan 和 Execute 模式按一次 Agent Run 内的真实模型调用次数注入�
 tokens: in=... out=... total=... cache-read=... cache-write=... cumulative=... cumulative-cache-read=... cumulative-cache-write=...
 ```
 
-MCP 工具来自启动时静态快照，不会改变结构化提示的运行时边界。MewCode 仍不会自动激活 Skill；只有人工指令和有界记忆索引会自动加入动态 Prompt。
+MCP 工具来自启动时静态快照，不会改变结构化提示的运行时边界。Skill 只有在用户调用斜杠命令或 Agent 调用 `load_skill` 后才激活；未激活 SOP 和专属工具 schema 不进入模型请求。
 
 ## 上下文管理
 
@@ -192,7 +262,7 @@ mew> /do
 mew> 按刚才的分析实现并验证
 ```
 
-`/do` 只把持续模式切回 DEFAULT，不会自动执行或改写旧版本会话中保存的计划。`/review` 与持续模式无关：它始终使用固定审查请求和只读工具执行一次，完成或失败后都保持原来的 `[DEFAULT]` 或 `[PLAN]` 状态。
+`/do` 只把持续模式切回 DEFAULT，不会自动执行或改写旧版本会话中保存的计划。内置 `/review` 是独立只读 Skill；在 PLAN 中调用时仍受只读安全上限约束，完成或失败后不会改变持续模式。
 
 当前阶段不包含网络请求限制、资源配额、审计日志和自动化质量评估。
 

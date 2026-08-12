@@ -51,8 +51,17 @@ def discover_layer(root: Path, layer: SkillLayer) -> tuple[SkillSource, ...]:
     if not root.is_dir():
         raise SkillDefinitionError(f"Skill root is not a directory: {root}")
     candidates: list[tuple[str, Path, Path | None]] = []
+    invalid_links: list[tuple[str, Path, Path | None, str]] = []
     for child in sorted(root.iterdir(), key=lambda item: (item.name.casefold(), item.name)):
         if child.is_symlink():
+            if child.suffix == ".md":
+                invalid_links.append(
+                    (child.stem, child, None, f"Symbolic Skill entry is not allowed: {child}")
+                )
+            elif child.is_dir():
+                invalid_links.append(
+                    (child.name, child / "SKILL.md", child, f"Symbolic Skill package is not allowed: {child}")
+                )
             continue
         if child.is_file() and child.suffix == ".md":
             candidates.append((child.stem, child, None))
@@ -60,21 +69,42 @@ def discover_layer(root: Path, layer: SkillLayer) -> tuple[SkillSource, ...]:
             entry = child / "SKILL.md"
             if entry.is_file() and not entry.is_symlink():
                 candidates.append((child.name, entry, child))
-    if len(candidates) > MAX_SKILLS_PER_LAYER:
+    if len(candidates) + len(invalid_links) > MAX_SKILLS_PER_LAYER:
         raise SkillDefinitionError(
             f"Skill layer '{root}' exceeds {MAX_SKILLS_PER_LAYER} entries."
         )
-    result = [
-        SkillSource(
-            layer=layer,
-            root=root.resolve(),
-            entry_path=entry.resolve(),
-            package_dir=package.resolve() if package else None,
-            entry_name=name,
-            fingerprint=fingerprint_source(root, entry, package),
+    result: list[SkillSource] = []
+    for name, entry, package in candidates:
+        try:
+            fingerprint = fingerprint_source(root, entry, package)
+            error = None
+        except (OSError, SkillDefinitionError) as exc:
+            fingerprint = SkillFingerprint(str(root.resolve()), ())
+            error = str(exc)
+        result.append(
+            SkillSource(
+                layer=layer,
+                root=root.resolve(),
+                entry_path=entry.resolve(),
+                package_dir=package.resolve() if package else None,
+                entry_name=name,
+                fingerprint=fingerprint,
+                discovery_error=error,
+            )
         )
-        for name, entry, package in candidates
-    ]
+    for name, entry, package, error in invalid_links:
+        result.append(
+            SkillSource(
+                layer=layer,
+                root=root.resolve(),
+                entry_path=entry.absolute(),
+                package_dir=package.absolute() if package else None,
+                entry_name=name,
+                fingerprint=SkillFingerprint(str(root.resolve()), ()),
+                discovery_error=error,
+            )
+        )
+    result.sort(key=lambda item: (item.entry_name.casefold(), item.entry_name, str(item.entry_path)))
     return tuple(result)
 
 

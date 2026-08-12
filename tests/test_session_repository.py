@@ -70,6 +70,45 @@ def test_reset_state_atomically_rewrites_same_session(tmp_path: Path) -> None:
     resumed.binding.close()
 
 
+@pytest.mark.parametrize("failure_point", ["fsync", "replace"])
+def test_reset_state_failure_keeps_disk_and_memory_unchanged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    repo = _repo(tmp_path)
+    opened = repo.open(SessionOpenRequest(SessionOpenMode.NEW))
+    messages = (ChatMessage("user", "old"),)
+    plan = StoredPlan("task", "plan")
+    skills = (StoredSkillActivation("review", "focus"),)
+    opened.binding.commit_history(messages, now=NOW)
+    opened.binding.commit_plan(plan, now=NOW)
+    opened.binding.commit_skills(skills, now=NOW)
+
+    if failure_point == "fsync":
+        monkeypatch.setattr(
+            "mewcode.continuity.session_repository.os.fsync",
+            lambda _fd: (_ for _ in ()).throw(OSError("fsync failed")),
+        )
+    else:
+        monkeypatch.setattr(
+            "mewcode.continuity.session_repository.os.replace",
+            lambda _source, _target: (_ for _ in ()).throw(OSError("replace failed")),
+        )
+
+    with pytest.raises(SessionPersistenceError, match="could not be reset"):
+        opened.binding.reset_state(now=NOW + timedelta(minutes=1))
+
+    assert opened.binding._messages == messages
+    assert opened.binding._pending_plan == plan
+    assert opened.binding._active_skills == skills
+    replayed = replay_file(opened.binding._path, opened.state.session_id)
+    assert replayed.messages == messages
+    assert replayed.pending_plan == plan
+    assert replayed.active_skills == skills
+    opened.binding.close()
+
+
 def test_same_second_collision_retries(tmp_path: Path) -> None:
     repo = _repo(tmp_path, ["abcd", "abcd", "ef01"])
     first = repo.open(SessionOpenRequest(SessionOpenMode.NEW))

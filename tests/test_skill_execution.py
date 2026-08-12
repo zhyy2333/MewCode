@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
+from typing import Any
 
 from mewcode.agent import AgentRunner, ToolScheduler
 from mewcode.prompting import PromptAdditions
@@ -14,7 +15,14 @@ from mewcode.skills import (
     build_skill_catalog,
     discover_sources,
 )
-from mewcode.tools import ToolCallRequest, ToolRegistry, ToolSafety
+from mewcode.tools import (
+    PermissionTargetKind,
+    ToolCallRequest,
+    ToolPermissionSpec,
+    ToolRegistry,
+    ToolResult,
+    ToolSafety,
+)
 from tests.fakes import AllowAllPermissionController, ScriptedAsyncProvider, collect_async
 
 
@@ -44,6 +52,19 @@ def _runner(provider, controller=None):
 class RejectEvaluationController:
     def evaluate(self, call):
         raise AssertionError("load_skill must not request its own permission")
+
+
+class NamedTool:
+    description = "Named test tool."
+    parameters_schema = {"type": "object", "properties": {}}
+    permission_spec = ToolPermissionSpec(None, PermissionTargetKind.TOOL)
+
+    def __init__(self, name: str, safety: ToolSafety) -> None:
+        self.name = name
+        self.safety = safety
+
+    async def execute(self, arguments: dict[str, Any]) -> ToolResult:
+        return ToolResult(True, self.name, "ok")
 
 
 def test_shared_load_tool_activates_and_next_parent_iteration_sees_sop(tmp_path: Path) -> None:
@@ -106,6 +127,21 @@ def test_isolated_invocation_returns_final_reply_without_child_history_persisten
     assert "instructions" in child.calls[0].prompt.dynamic_system
 
 
+def test_isolated_final_reply_is_bounded_before_parent_tool_result(tmp_path: Path) -> None:
+    runtime = _runtime(tmp_path)
+    child = ScriptedAsyncProvider([[ProviderTextDelta("x" * 25_000)]])
+    coordinator = SkillCoordinator(
+        runtime,
+        runner_factory=lambda profile: _runner(child),
+        history_supplier=lambda: (),
+    )
+    operation = coordinator.invoke("private")
+    asyncio.run(collect_async(operation.events()))
+    assert operation.result.ok
+    assert len(operation.result.content) < 25_000
+    assert operation.result.metadata == {"truncated": True}
+
+
 def test_run_view_uses_shared_union_plus_current_isolated_and_safety(tmp_path: Path) -> None:
     runtime = _runtime(tmp_path)
     coordinator = SkillCoordinator(
@@ -123,6 +159,49 @@ def test_run_view_uses_shared_union_plus_current_isolated_and_safety(tmp_path: P
     assert isolated.tools.names == ("load_skill",)
     assert "Private" not in main.additions.active_skills
     assert "Private" in isolated.additions.active_skills
+
+
+def test_run_view_whitelist_union_and_mode_intersection(tmp_path: Path) -> None:
+    roots = SkillRoots(tmp_path / "skills", tmp_path / "user", tmp_path / "builtin")
+    _skill(roots.project, "first", "shared", "First", "[read-one]")
+    _skill(roots.project, "second", "shared", "Second", "[write-two]")
+    _skill(roots.project, "private", "isolated", "Private", "[write-three]")
+    names = {"read-one", "write-two", "write-three"}
+    catalog = build_skill_catalog(discover_sources(roots), global_tool_names=names)
+    runtime = SkillRuntime(catalog, tmp_path, ToolRegistry([]))
+    coordinator = SkillCoordinator(
+        runtime,
+        runner_factory=lambda profile: _runner(ScriptedAsyncProvider([])),
+        history_supplier=lambda: (),
+    )
+    loader = LoadSkillTool(coordinator)
+    runtime.set_global_tools(
+        ToolRegistry(
+            [
+                NamedTool("read-one", ToolSafety.READ_ONLY),
+                NamedTool("write-two", ToolSafety.SIDE_EFFECT),
+                NamedTool("write-three", ToolSafety.SIDE_EFFECT),
+                loader,
+            ]
+        )
+    )
+
+    all_safety = {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
+    assert runtime.run_view(all_safety).tools.names == (
+        "read-one", "write-two", "write-three", "load_skill"
+    )
+    runtime.activate("first")
+    runtime.activate("second")
+    assert runtime.run_view(all_safety).tools.names == (
+        "read-one", "write-two", "load_skill"
+    )
+    assert runtime.run_view({ToolSafety.READ_ONLY}).tools.names == (
+        "read-one", "load_skill"
+    )
+    runtime.activate("private")
+    assert runtime.run_view(all_safety, isolated_name="private").tools.names == (
+        "read-one", "write-two", "write-three", "load_skill"
+    )
 
 
 def test_isolated_nesting_depth_is_bounded(tmp_path: Path) -> None:

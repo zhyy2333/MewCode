@@ -40,6 +40,8 @@ _TOOL_FIELDS = frozenset(
 
 
 def parse_skill(source: SkillSource) -> SkillDefinition:
+    if source.discovery_error is not None:
+        raise SkillDefinitionError(source.discovery_error)
     metadata, body_offset, body_size = _read_frontmatter(source.entry_path)
     unknown = set(metadata) - _SKILL_FIELDS
     if unknown:
@@ -203,6 +205,8 @@ def _validate_command_paths(command: tuple[str, ...], package: Path) -> None:
     first = Path(command[0])
     if first.is_absolute() and (not first.exists() or not first.is_file()):
         raise SkillDefinitionError(f"Executable does not exist: {command[0]}")
+    if not first.is_absolute() and _looks_like_package_path(command[0]):
+        ensure_package_path(package, command[0])
     for index, argument in enumerate(command):
         if index == 0 and not Path(argument).is_absolute():
             continue

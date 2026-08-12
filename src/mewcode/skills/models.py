@@ -66,6 +66,7 @@ class SkillSource:
     package_dir: Path | None
     entry_name: str
     fingerprint: SkillFingerprint
+    discovery_error: str | None = None
 
     @property
     def label(self) -> str:

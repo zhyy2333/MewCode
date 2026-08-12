@@ -89,3 +89,44 @@ def test_refresh_rebinds_fallback_and_rejects_bad_candidate(tmp_path: Path) -> N
     old = runtime.catalog
     result = runtime.refresh((object(),), lambda: (_ for _ in ()).throw(RuntimeError("bad")))
     assert not result.accepted and runtime.catalog is old
+
+
+def test_refresh_unchanged_skips_rebuild_and_disappearance_deactivates_once(
+    tmp_path: Path,
+) -> None:
+    roots = SkillRoots(tmp_path / "p", tmp_path / "u", tmp_path / "b")
+    _write(roots.project, "sample", "Body {{input}}")
+    binding = Binding()
+    runtime = SkillRuntime(_catalog(roots), tmp_path, ToolRegistry([]), binding=binding)
+    runtime.activate("sample", "focus")
+
+    unchanged = runtime.refresh(
+        runtime.catalog.fingerprint,
+        lambda: (_ for _ in ()).throw(AssertionError("catalog must not be rebuilt")),
+    )
+    assert not unchanged.changed and unchanged.accepted
+
+    (roots.project / "sample.md").unlink()
+    candidate = _catalog(roots)
+    removed = runtime.refresh(candidate.fingerprint, lambda: candidate)
+    assert removed.changed and removed.accepted
+    assert runtime.active == ()
+    assert binding.values[-1] == ()
+    assert sum("disappeared" in item.message for item in removed.diagnostics) == 1
+
+    again = runtime.refresh(candidate.fingerprint, lambda: candidate)
+    assert not again.changed and again.diagnostics == ()
+
+
+def test_activation_rejects_same_length_body_change_before_refresh(tmp_path: Path) -> None:
+    roots = SkillRoots(tmp_path / "p", tmp_path / "u", tmp_path / "b")
+    _write(roots.project, "sample", "Body one")
+    runtime = SkillRuntime(_catalog(roots), tmp_path, ToolRegistry([]))
+    path = roots.project / "sample.md"
+    text = path.read_text(encoding="utf-8")
+    path.write_text(text.replace("Body one", "Body two"), encoding="utf-8")
+    import pytest
+    from mewcode.skills import SkillDefinitionError
+
+    with pytest.raises(SkillDefinitionError, match="changed before"):
+        runtime.activate("sample")

@@ -7,7 +7,7 @@ from typing import Protocol
 from mewcode.agent import AgentEvent, AgentMode, AgentRun, AgentRunner
 from mewcode.prompting import PromptAdditions, PromptRunContext
 from mewcode.providers import ChatMessage
-from mewcode.tools import ToolResult, ToolSafety
+from mewcode.tools import ToolResult, ToolSafety, truncate_text
 
 from .history import project_recent_turns
 from .models import MAX_ISOLATED_DEPTH, SkillDefinitionError, SkillMode
@@ -112,8 +112,12 @@ class SkillInvocation:
                 yield event
             outcome = run.outcome
             if outcome.completed:
+                content, truncated = truncate_text(outcome.final_text)
                 self._result = ToolResult(
-                    True, "load_skill", outcome.final_text
+                    True,
+                    "load_skill",
+                    content,
+                    metadata={"truncated": True} if truncated else {},
                 )
             else:
                 self._result = ToolResult(

@@ -272,6 +272,22 @@ class SkillRuntime:
 
 def _read_body(definition: SkillDefinition) -> str:
     body = definition.body
+    from .paths import fingerprint_source
+
+    try:
+        current = fingerprint_source(
+            definition.source.root,
+            definition.source.entry_path,
+            definition.source.package_dir,
+        )
+    except (OSError, SkillDefinitionError) as exc:
+        raise SkillDefinitionError(
+            f"Skill '{definition.name}' changed before activation; retry after refresh."
+        ) from exc
+    if current != body.fingerprint:
+        raise SkillDefinitionError(
+            f"Skill '{definition.name}' changed before activation; retry after refresh."
+        )
     try:
         with body.path.open("rb") as handle:
             handle.seek(body.byte_offset)

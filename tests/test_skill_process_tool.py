@@ -69,6 +69,20 @@ def test_process_tool_converts_invalid_json_and_nonzero_exit(tmp_path: Path) -> 
     assert not failed.ok and "code 3" in (failed.error or "")
 
 
+def test_process_tool_rejects_extra_result_fields_and_hides_stderr(tmp_path: Path) -> None:
+    tool = _tool(
+        tmp_path,
+        """import json, sys
+print("sensitive diagnostic", file=sys.stderr)
+print(json.dumps({"ok": True, "content": "value", "unexpected": True}))
+""",
+    )
+    result = asyncio.run(tool.execute({"value": "x"}))
+    assert not result.ok and result.error == "Skill tool result has invalid fields."
+    assert "sensitive diagnostic" not in result.error
+    assert "sensitive diagnostic" not in result.content
+
+
 def test_process_tool_times_out_and_reaps_process(tmp_path: Path) -> None:
     tool = _tool(tmp_path, "import time; time.sleep(10)", timeout=1)
     result = asyncio.run(tool.execute({"value": "x"}))

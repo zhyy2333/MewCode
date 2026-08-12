@@ -105,3 +105,27 @@ def test_tool_command_cannot_escape_package(tmp_path: Path) -> None:
 
     with pytest.raises(SkillDefinitionError, match="escapes"):
         parse_skill(discover_layer(package.parent, SkillLayer.PROJECT)[0])
+
+
+def test_relative_executable_path_is_validated_as_package_file(tmp_path: Path) -> None:
+    package = tmp_path / "skills" / "audit"
+    (package / "tools").mkdir(parents=True)
+    (package / "scripts").mkdir()
+    (package / "SKILL.md").write_text(
+        "---\nname: audit\ndescription: Audit\ntools: [audit__check]\nmode: shared\n---\nAudit",
+        encoding="utf-8",
+    )
+    (package / "tools" / "check.json").write_text(
+        json.dumps(
+            {
+                "name": "check",
+                "description": "Check",
+                "parameters": {"type": "object"},
+                "command": ["scripts/missing.py"],
+                "safety": "read_only",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SkillDefinitionError, match="does not exist"):
+        parse_skill(discover_layer(package.parent, SkillLayer.PROJECT)[0])
