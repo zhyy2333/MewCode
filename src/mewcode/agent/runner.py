@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncIterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 from pathlib import Path
 from typing import Callable, Protocol
@@ -14,6 +14,7 @@ from mewcode.context import (
     ContextManager,
 )
 from mewcode.prompting import (
+    PromptAdditions,
     PromptBuilder,
     PromptEnvironmentProvider,
     PromptPhase,
@@ -54,6 +55,15 @@ class HistoryCommitSink(Protocol):
 
 class _HistoryCommitError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class AgentRunView:
+    tools: ToolRegistry
+    additions: PromptAdditions | None = None
+
+
+RunViewProvider = Callable[[], AgentRunView]
 
 
 @dataclass(frozen=True)
@@ -112,6 +122,7 @@ class AgentRun:
         prompt_context: PromptRunContext,
         context_manager: ContextManager | None,
         history_commit_sink: HistoryCommitSink | None,
+        run_view_provider: RunViewProvider | None = None,
     ) -> None:
         self._run_id = run_id
         self._mode = mode
@@ -125,6 +136,7 @@ class AgentRun:
         self._prompt_context = prompt_context
         self._context_manager = context_manager
         self._history_commit_sink = history_commit_sink
+        self._run_view_provider = run_view_provider
         self._state = _State.NEW
         self._outcome: AgentRunOutcome | None = None
         self._cancel_requested = asyncio.Event()
@@ -179,7 +191,22 @@ class AgentRun:
                 )
                 collector = StreamCollector(self._run_id, iteration)
                 try:
-                    request_tools = None if plan_finalizing else self._tools
+                    iteration_tools = self._tools
+                    iteration_context = self._prompt_context
+                    if self._run_view_provider is not None:
+                        view = self._run_view_provider()
+                        iteration_tools = view.tools
+                        if view.additions is not None:
+                            iteration_context = replace(
+                                iteration_context,
+                                additions=iteration_context.additions.merged(
+                                    custom_instructions=getattr(view.additions, "custom_instructions", None),
+                                    available_skills=getattr(view.additions, "available_skills", None),
+                                    active_skills=getattr(view.additions, "active_skills", None),
+                                    long_term_memory=getattr(view.additions, "long_term_memory", None),
+                                ),
+                            )
+                    request_tools = None if plan_finalizing else iteration_tools
                     max_output_tokens = (
                         self._config.plan_final_max_tokens
                         if plan_finalizing
@@ -191,7 +218,7 @@ class AgentRun:
                         else PromptPhase.ACTIVE
                     )
                     prompt = self._prompt_builder.build(
-                        self._prompt_context,
+                        iteration_context,
                         self._mode.value,
                         phase,
                         iteration,
@@ -393,7 +420,7 @@ class AgentRun:
                     return
 
                 all_unknown = all(
-                    self._tools.get(request.name) is None
+                    iteration_tools.get(request.name) is None
                     for request in response.tool_calls
                 )
                 consecutive_unknown = consecutive_unknown + 1 if all_unknown else 0
@@ -402,7 +429,7 @@ class AgentRun:
                     self._run_id,
                     iteration,
                     response.tool_calls,
-                    self._tools,
+                    iteration_tools,
                 )
                 self._active_schedule = schedule
                 try:
@@ -613,6 +640,7 @@ class AgentRunner:
         mode: AgentMode = AgentMode.DIRECT,
         prompt_context: PromptRunContext | None = None,
         history_commit_sink: HistoryCommitSink | None = None,
+        run_view_provider: RunViewProvider | None = None,
     ) -> AgentRun:
         return AgentRun(
             run_id=self._id_factory(),
@@ -627,4 +655,5 @@ class AgentRunner:
             prompt_context=prompt_context or PromptRunContext(task=user_text),
             context_manager=self._context_manager,
             history_commit_sink=history_commit_sink,
+            run_view_provider=run_view_provider,
         )

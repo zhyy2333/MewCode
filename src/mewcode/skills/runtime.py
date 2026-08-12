@@ -8,7 +8,8 @@ from typing import Protocol
 
 from mewcode.continuity import StoredSkillActivation
 from mewcode.prompting import PromptAdditions
-from mewcode.tools import Tool, ToolRegistry
+from mewcode.tools import Tool, ToolRegistry, ToolSafety
+from mewcode.agent import AgentRunView
 
 from .materialization import MaterializedSkill, SkillMaterializer
 from .models import (
@@ -179,6 +180,43 @@ class SkillRuntime:
             tool for item in self._active.values() for tool in item.tools
         )
         return self._global_tools.merge(package_tools)
+
+    def set_global_tools(self, tools: ToolRegistry) -> None:
+        self._global_tools = tools
+
+    def run_view(
+        self,
+        allowed_safety: set[ToolSafety],
+        *,
+        isolated_name: str | None = None,
+        loader_tool: Tool | None = None,
+    ) -> AgentRunView:
+        shared = tuple(
+            item for item in self._active.values() if item.definition.mode is SkillMode.SHARED
+        )
+        isolated = self._active.get(isolated_name) if isolated_name is not None else None
+        scoped = (*shared, *((isolated,) if isolated is not None else ()))
+        package_registry = ToolRegistry(tool for item in scoped for tool in item.tools)
+        base = self._global_tools
+        if loader_tool is not None:
+            base = base.without({"load_skill"}).merge(ToolRegistry([loader_tool]))
+        combined = base.merge(package_registry)
+        if scoped:
+            names = {
+                name for item in scoped for name in item.definition.tools
+            }
+            names.add("load_skill")
+            combined = combined.select_names(names)
+        safe = combined.select_safety(allowed_safety)
+        loader = combined.select_names({"load_skill"})
+        if loader.names and "load_skill" not in safe.names:
+            safe = safe.merge(loader)
+        additions = self.prompt_additions()
+        if isolated is not None:
+            additions = additions.merged(
+                active_skills=f"### {isolated.name}\n{isolated.rendered_sop}"
+            )
+        return AgentRunView(safe, additions)
 
     def reset(self, *, persist: bool = True) -> None:
         if persist and self._binding is not None:

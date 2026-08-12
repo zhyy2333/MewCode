@@ -16,6 +16,9 @@ from .paths import SkillRoots, discover_layer, discover_sources
 from .materialization import MaterializedSkill, SkillMaterializer
 from .process_tool import SkillProcessTool, create_skill_tools
 from .runtime import ActivatedSkill, SkillRefreshResult, SkillRuntime
+from .history import project_recent_turns
+from .execution import SkillCoordinator, SkillInvocation
+from .control import LoadSkillTool
 
 __all__ = [
     "SkillCatalogError",
@@ -35,9 +38,13 @@ __all__ = [
     "SkillProcessTool",
     "SkillRefreshResult",
     "SkillRuntime",
+    "SkillCoordinator",
+    "SkillInvocation",
+    "LoadSkillTool",
     "build_skill_catalog",
     "discover_layer",
     "discover_sources",
     "parse_skill",
     "create_skill_tools",
+    "project_recent_turns",
 ]

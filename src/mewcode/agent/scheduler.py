@@ -27,6 +27,7 @@ from .events import (
     AgentProgress,
     AgentToolResult,
 )
+from .control import AgentControlOperation, AgentControlTool
 
 
 class ToolScheduleStateError(RuntimeError):
@@ -66,6 +67,7 @@ class ToolSchedule:
         self._cancel_requested = asyncio.Event()
         self._active_tasks: set[asyncio.Task[ToolExecution]] = set()
         self._active_challenge: PermissionChallenge | None = None
+        self._active_control: AgentControlOperation | None = None
 
     async def events(self) -> AsyncIterator[AgentEvent]:
         if self._state is not _State.NEW:
@@ -94,6 +96,24 @@ class ToolSchedule:
                     validated = self._registry.validate_call(request)
                     if isinstance(validated, ToolResult):
                         execution = ToolExecution(index, request, validated)
+                        completed.append(execution)
+                        yield self._result_event(execution)
+                        continue
+
+                    if isinstance(validated.tool, AgentControlTool):
+                        operation = validated.tool.control_operation(request.arguments)
+                        self._active_control = operation
+                        try:
+                            async for event in operation.events():
+                                yield event
+                            execution = ToolExecution(index, request, operation.result)
+                        except asyncio.CancelledError:
+                            self._cancel_requested.set()
+                            await operation.cancel()
+                            execution = ToolExecution(index, request, _cancelled_result(request))
+                        finally:
+                            if self._active_control is operation:
+                                self._active_control = None
                         completed.append(execution)
                         yield self._result_event(execution)
                         continue
@@ -174,6 +194,8 @@ class ToolSchedule:
                 challenge.cancel()
             except RuntimeError:
                 pass
+        if self._active_control is not None:
+            await self._active_control.cancel()
         for task in list(self._active_tasks):
             task.cancel()
         if self._active_tasks:

@@ -16,6 +16,7 @@ from .events import (
 from .scheduler import ToolSchedule, ToolScheduleStateError, ToolScheduler
 from .streaming import StreamCollector, StreamStateError
 from .runner import (
+    AgentRunView,
     AgentRun,
     AgentRunConfig,
     AgentRunOutcome,
@@ -23,6 +24,7 @@ from .runner import (
     AgentRunner,
     HistoryCommitSink,
 )
+from .control import AgentControlOperation, AgentControlTool
 
 __all__ = [
     "AgentEvent",
@@ -33,6 +35,9 @@ __all__ = [
     "AgentPermissionRequest",
     "AgentProgress",
     "AgentRun",
+    "AgentRunView",
+    "AgentControlOperation",
+    "AgentControlTool",
     "AgentRunConfig",
     "AgentRunOutcome",
     "AgentRunStateError",
