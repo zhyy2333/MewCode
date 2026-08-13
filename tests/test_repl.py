@@ -36,6 +36,7 @@ from mewcode.providers import (
     ConfigError,
     ProviderError,
     ProviderProfile,
+    RequestBoundaryProvider,
     TokenUsage,
     UsageTrackingProvider,
 )
@@ -816,7 +817,9 @@ def test_main_prompt_builder_normal_path_wires_agent_components(monkeypatch) -> 
     )
 
     assert cli.main(["--permission-mode", "strict"]) == 7
-    assert isinstance(created["provider"], UsageTrackingProvider)
+    assert created["provider"].__class__.__name__ == "HookedProvider"
+    assert isinstance(created["provider"]._provider, RequestBoundaryProvider)
+    assert isinstance(created["provider"]._provider._provider, UsageTrackingProvider)
     assert created["repl_runtime"]["usage_ledger"] is not None
     assert created["continuity"]["resumed"] is False
     tracked = created["provider"]
@@ -943,7 +946,8 @@ def test_cli_without_mcp_config_preserves_existing_tool_and_exit_behavior(monkey
         monkeypatch, McpConfigLoadResult((), (), ()), RuntimeMustNotStart
     )
     assert cli.main([]) == 0
-    assert len(captured["registry"].list()) == 7
+    assert len(captured["registry"].list()) == 8
+    assert captured["registry"].names[-1] == "agent"
     assert captured["registry"].get("load_skill") is not None
 
 
@@ -966,6 +970,7 @@ def test_cli_registers_healthy_mcp_tools_and_deferred_namespaces(monkeypatch) ->
         def __init__(self, root): pass
         def start(self, configs, reserved):
             assert "read_file" in reserved
+            assert "agent" in reserved
             return McpRuntimeStartResult((remote,), ())
         def close(self): return ()
 

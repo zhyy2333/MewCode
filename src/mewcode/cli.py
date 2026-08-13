@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import inspect
 import sys
+from collections.abc import Sequence
 from pathlib import Path
 from types import MappingProxyType
 
@@ -51,6 +52,7 @@ from .prompting import PromptBuilder, PromptEnvironmentProvider
 from .providers import (
     ConfigError,
     ProviderError,
+    RequestBoundaryProvider,
     UsageLedger,
     UsageTrackingProvider,
     create_provider,
@@ -80,6 +82,18 @@ from .skills import (
     discover_sources,
 )
 from .commands import DynamicCommandCatalog, create_skill_command_definition
+from .subagents import (
+    AgentCatalogError,
+    AgentDefinitionError,
+    AgentDefinitionRoots,
+    AgentTool,
+    SubagentCoordinator,
+    SubagentNotificationQueue,
+    SubagentRuntimeFactory,
+    SubagentTaskManager,
+    build_agent_catalog,
+    discover_agent_sources,
+)
 
 _ORIGINAL_LOAD_ACTIVE_PROFILE = load_active_profile
 
@@ -118,6 +132,22 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_agent_catalog(
+    workspace: Workspace,
+    profiles: ProfileCatalog,
+    base_registry: ToolRegistry,
+    *,
+    plugin_roots: Sequence[Path] = (),
+):
+    roots = AgentDefinitionRoots.defaults(workspace.root, plugin_roots)
+    return build_agent_catalog(
+        discover_agent_sources(roots),
+        profile_names=profiles,
+        base_tool_names=base_registry.names,
+        globally_forbidden_names={"agent", "load_skill"},
+    )
+
+
 def _optional_keyword(factory, name: str, value: object) -> dict[str, object]:
     try:
         parameters = inspect.signature(factory).parameters
@@ -133,6 +163,7 @@ def main(argv: list[str] | None = None) -> int:
     session_binding: SessionBinding | None = None
     memory_manager: MemoryManager | None = None
     hook_runtime: HookRuntime | None = None
+    task_manager: SubagentTaskManager | None = None
     try:
         static_command_registry = create_builtin_command_registry()
         command_registry = DynamicCommandCatalog(static_command_registry)
@@ -207,12 +238,12 @@ def main(argv: list[str] | None = None) -> int:
 
         def hooked_provider(name: str | None = None):
             selected = name or profile_catalog.active_name
-            if not hook_catalog.rules:
-                return profile_catalog.provider(selected)
             wrapped = hooked_providers.get(selected)
             if wrapped is None:
                 wrapped = HookedProvider(
-                    profile_catalog.provider(selected), hook_runtime, selected
+                    RequestBoundaryProvider(profile_catalog.provider(selected)),
+                    hook_runtime,
+                    selected,
                 )
                 hooked_providers[selected] = wrapped
             return wrapped
@@ -248,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     *(tool.name for tool in builtin_tools),
                     "load_skill",
+                    "agent",
                     *(
                         tool.public_name
                         for definition in pre_catalog.definitions.values()
@@ -258,6 +290,11 @@ def main(argv: list[str] | None = None) -> int:
             mcp_tools = runtime_result.tools
             _write_mcp_diagnostics(runtime_result.diagnostics)
         base_registry = ToolRegistry([*builtin_tools, *mcp_tools])
+        agent_catalog = _load_agent_catalog(
+            workspace,
+            profile_catalog,
+            base_registry,
+        )
         mcp_statuses = {
             status.server_name: (
                 status.state.value
@@ -270,7 +307,7 @@ def main(argv: list[str] | None = None) -> int:
             skill_sources,
             system_command_identifiers=command_identifiers,
             profiles=profile_catalog,
-            global_tool_names={*base_registry.names, "load_skill"},
+            global_tool_names={*base_registry.names, "load_skill", "agent"},
             mcp_status=mcp_statuses,
         )
         known_tools = {
@@ -309,6 +346,14 @@ def main(argv: list[str] | None = None) -> int:
             scheduler,
             prompt_builder=prompt_builder,
             context_manager=context_manager,
+            **_optional_keyword(
+                AgentRunner, "profile_name", profile_catalog.active_name
+            ),
+            **_optional_keyword(
+                AgentRunner,
+                "permission_mode_supplier",
+                lambda: permission_controller.mode,
+            ),
             **_optional_keyword(AgentRunner, "hook_runtime", hook_runtime),
         )
         skill_runtime = SkillRuntime(
@@ -336,6 +381,12 @@ def main(argv: list[str] | None = None) -> int:
                 scheduler,
                 prompt_builder=prompt_builder,
                 context_manager=isolated_context,
+                **_optional_keyword(AgentRunner, "profile_name", selected.name),
+                **_optional_keyword(
+                    AgentRunner,
+                    "permission_mode_supplier",
+                    lambda: permission_controller.mode,
+                ),
                 **_optional_keyword(AgentRunner, "hook_runtime", hook_runtime),
             )
 
@@ -347,7 +398,27 @@ def main(argv: list[str] | None = None) -> int:
             allowed_safety_supplier=lambda: conversation_ref["value"].current_skill_safety(),
         )
         load_skill = LoadSkillTool(coordinator)
-        registry = base_registry.merge(ToolRegistry([load_skill]))
+        subagent_runtime_factory = SubagentRuntimeFactory(
+            provider_supplier=lambda name: hooked_provider(name),
+            prompt_builder=prompt_builder,
+            workspace=workspace,
+            hook_runtime=hook_runtime,
+            context_config_factory=lambda name: ContextConfig(
+                profile_catalog.require(name).context_window
+            ),
+        )
+        notifications = SubagentNotificationQueue()
+        task_manager = SubagentTaskManager(notifications)
+        subagent_coordinator = SubagentCoordinator(
+            agent_catalog,
+            subagent_runtime_factory,
+            base_registry,
+            rule_store,
+            background_capable_names=base_registry.names,
+            additions_supplier=lambda: conversation_ref["value"].skill_base_additions(),
+        )
+        agent_tool = AgentTool(subagent_coordinator, task_manager)
+        registry = base_registry.merge(ToolRegistry([load_skill, agent_tool]))
         skill_runtime.set_global_tools(registry)
         command_registry.replace(
             create_skill_command_definition(item.name, item.description)
@@ -401,6 +472,7 @@ def main(argv: list[str] | None = None) -> int:
             skill_coordinator=coordinator,
             skill_refresher=refresh_skills,
             hook_runtime=hook_runtime,
+            task_manager=task_manager,
         )
         conversation_ref["value"] = conversation
         action = "resumed" if opened_session.resumed else "created"
@@ -426,6 +498,10 @@ def main(argv: list[str] | None = None) -> int:
             f"skills: {diagnostic.message}"
             for diagnostic in (*catalog.diagnostics, *restore_diagnostics)
         )
+        startup_messages.extend(
+            f"agents: {diagnostic.message}"
+            for diagnostic in agent_catalog.diagnostics
+        )
         terminal = PromptToolkitTerminal(command_registry, interaction_state)
         return Repl(
             conversation,
@@ -444,7 +520,7 @@ def main(argv: list[str] | None = None) -> int:
     except CommandRegistrationError as exc:
         sys.stderr.write(f"Error: {exc}\n")
         return 1
-    except (SkillCatalogError, SkillDefinitionError) as exc:
+    except (SkillCatalogError, SkillDefinitionError, AgentCatalogError, AgentDefinitionError) as exc:
         sys.stderr.write(f"Error: {exc}\n")
         return 1
     except PermissionConfigError as exc:
@@ -478,6 +554,11 @@ def main(argv: list[str] | None = None) -> int:
                     sys.stderr.write(f"Warning: {diagnostic.message}\n")
             except Exception:
                 sys.stderr.write("Warning: automatic memory shutdown failed.\n")
+        if task_manager is not None:
+            try:
+                asyncio.run(task_manager.close())
+            except Exception:
+                sys.stderr.write("Warning: subagent task shutdown failed.\n")
         if session_binding is not None:
             session_binding.close()
         if context_archive is not None:

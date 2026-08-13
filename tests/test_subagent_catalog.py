@@ -206,3 +206,23 @@ def test_selected_prompt_total_limit_is_enforced_after_selection(
 
     monkeypatch.setattr(catalog_module, "MAX_SELECTED_PROMPT_BYTES", 10)
     assert list(_catalog(roots).definitions) == ["first", "second"]
+
+
+def test_default_builtin_root_loads_read_only_explore_role(tmp_path: Path) -> None:
+    roots = AgentDefinitionRoots.defaults(tmp_path)
+    catalog = build_agent_catalog(
+        discover_agent_sources(roots),
+        profile_names={"main"},
+        base_tool_names={
+            "read_file",
+            "find_files",
+            "search_code",
+            "write_file",
+        },
+    )
+    explore = catalog.definitions["explore"]
+    assert explore.source.layer is AgentDefinitionLayer.BUILTIN
+    assert explore.tools == ("read_file", "find_files", "search_code")
+    assert explore.model == "inherit"
+    assert explore.permission_mode is PermissionMode.DEFAULT
+    assert "read-only codebase investigator" in explore.system_prompt

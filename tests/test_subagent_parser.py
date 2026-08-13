@@ -124,3 +124,19 @@ def test_exact_file_limit_is_read_before_yaml_validation(tmp_path: Path) -> None
     assert len(payload.encode("utf-8")) == MAX_DEFINITION_FILE_BYTES
     path.write_bytes(payload.encode("utf-8"))
     assert parse_agent_definition(_source(path)).system_prompt.startswith("x")
+
+
+def test_documented_code_reviewer_example_parses_with_read_only_tools() -> None:
+    path = Path(__file__).resolve().parents[1] / "examples" / "agents" / "code-reviewer.md"
+    source = AgentDefinitionSource(
+        AgentDefinitionLayer.PROJECT,
+        path.parent,
+        path,
+        "code-reviewer",
+        "example",
+    )
+    definition = parse_agent_definition(source)
+    assert definition.tools == ("read_file", "find_files", "search_code")
+    assert definition.disallowed_tools == ()
+    assert definition.model == "inherit"
+    assert "severity order" in definition.system_prompt
