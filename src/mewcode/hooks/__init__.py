@@ -1,6 +1,7 @@
 from .conditions import HookConditionMatcher
 from .config import HookConfigError, HookConfigLoader, HookPaths
 from .events import EVENT_FIELDS, is_allowed_field, make_event
+from .trust import WorkspaceIdentity, WorkspaceTrustStore, workspace_identity
 from .models import (
     DEFAULT_HOOK_LIMITS,
     AgentHookAction,

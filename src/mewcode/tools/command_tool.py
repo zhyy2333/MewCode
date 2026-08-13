@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import asyncio
-import os
-import signal
-import subprocess
 from typing import Any
+
+from mewcode.processes import ProcessRequest, run_shell
 
 from .base import (
     DEFAULT_TOOL_CONTENT_LIMIT,
@@ -19,7 +17,6 @@ from .workspace import Workspace
 
 DEFAULT_COMMAND_TIMEOUT_SECONDS = 30
 MAX_COMMAND_TIMEOUT_SECONDS = 120
-PROCESS_STOP_TIMEOUT_SECONDS = 1.0
 
 class RunCommandTool:
     name = "run_command"
@@ -78,29 +75,18 @@ class RunCommandTool:
             )
 
         try:
-            process_options: dict[str, Any]
-            if os.name == "nt":
-                process_options = {
-                    "creationflags": subprocess.CREATE_NEW_PROCESS_GROUP
-                }
-            else:
-                process_options = {"start_new_session": True}
-            process = await asyncio.create_subprocess_shell(
-                command,
-                cwd=self._workspace.root,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                **process_options,
+            result = await run_shell(
+                ProcessRequest(
+                    command=command,
+                    cwd=self._workspace.root,
+                    timeout_seconds=timeout,
+                    stdout_limit=max(self._content_limit * 4, 1024 * 1024),
+                    stderr_limit=max(self._content_limit * 4, 1024 * 1024),
+                )
             )
         except OSError as exc:
             return ToolResult(False, self.name, "", str(exc))
-
-        try:
-            stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                process.communicate(), timeout=timeout
-            )
-        except TimeoutError:
-            await _stop_process(process)
+        if result.timed_out:
             return ToolResult(
                 ok=False,
                 tool_name=self.name,
@@ -113,20 +99,13 @@ class RunCommandTool:
                     "stderr": "",
                 },
             )
-        except asyncio.CancelledError:
-            await _stop_process(process)
-            raise
-
-        await process.wait()
-        _close_process_transport(process)
-        await asyncio.sleep(0)
         stdout, stdout_truncated = truncate_text(
-            _decode_output(stdout_bytes), self._content_limit
+            _decode_output(result.stdout), self._content_limit
         )
         stderr, stderr_truncated = truncate_text(
-            _decode_output(stderr_bytes), self._content_limit
+            _decode_output(result.stderr), self._content_limit
         )
-        return_code = process.returncode if process.returncode is not None else -1
+        return_code = result.exit_code
         content = _format_command_content(return_code, stdout, stderr)
         return ToolResult(
             ok=return_code == 0,
@@ -138,67 +117,10 @@ class RunCommandTool:
                 "stdout": stdout,
                 "stderr": stderr,
                 "timed_out": False,
-                "truncated": stdout_truncated or stderr_truncated,
+                "truncated": stdout_truncated or stderr_truncated or result.output_exceeded,
                 "cwd": str(self._workspace.root),
             },
         )
-
-
-async def _stop_process(process: asyncio.subprocess.Process) -> None:
-    try:
-        if process.returncode is None:
-            if os.name == "nt":
-                await _stop_windows_process_tree(process.pid)
-            else:
-                try:
-                    os.killpg(process.pid, signal.SIGTERM)
-                except ProcessLookupError:
-                    pass
-            try:
-                await asyncio.wait_for(
-                    process.wait(), timeout=PROCESS_STOP_TIMEOUT_SECONDS
-                )
-            except TimeoutError:
-                if os.name == "nt":
-                    try:
-                        process.kill()
-                    except ProcessLookupError:
-                        pass
-                else:
-                    try:
-                        os.killpg(process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                await process.wait()
-    finally:
-        _close_process_transport(process)
-        await asyncio.sleep(0)
-
-
-async def _stop_windows_process_tree(pid: int) -> None:
-    try:
-        killer = await asyncio.create_subprocess_exec(
-            "taskkill",
-            "/PID",
-            str(pid),
-            "/T",
-            "/F",
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
-        )
-        await asyncio.wait_for(
-            killer.communicate(), timeout=PROCESS_STOP_TIMEOUT_SECONDS
-        )
-    except (OSError, TimeoutError):
-        pass
-
-
-def _close_process_transport(process: asyncio.subprocess.Process) -> None:
-    transport = getattr(process, "_transport", None)
-    if transport is not None:
-        transport.close()
-
-
 def _decode_output(value: bytes | None) -> str:
     if value is None:
         return ""
