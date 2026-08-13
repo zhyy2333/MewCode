@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from mewcode.tools import PermissionTargetKind
+from mewcode.matching import escape_exact_glob
 
 
 class PermissionMode(StrEnum):
@@ -51,12 +52,7 @@ class PermissionSource(StrEnum):
 
 
 def escape_exact_pattern(value: str) -> str:
-    escaped: list[str] = []
-    for character in value:
-        if character in {"\\", "*", "?", "[", "]"}:
-            escaped.append("\\")
-        escaped.append(character)
-    return "".join(escaped)
+    return escape_exact_glob(value)
 
 
 @dataclass(frozen=True)

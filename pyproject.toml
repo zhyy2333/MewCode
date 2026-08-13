@@ -15,6 +15,7 @@ dependencies = [
     "prompt-toolkit>=3.0,<4",
     "PyYAML",
     "jsonschema>=4,<5",
+    "regex>=2024.11.6,<2027",
 ]
 
 [tool.hatch.build.targets.wheel]
