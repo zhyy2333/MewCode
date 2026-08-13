@@ -6,6 +6,7 @@ from .models import (
     PermissionEffect,
     PermissionMode,
     PermissionOutcome,
+    PermissionPreflight,
     PermissionSource,
 )
 from .rules import PermissionRuleStore
@@ -35,6 +36,19 @@ class PermissionController:
         built = self._target_builder.build(call)
         if isinstance(built, PermissionDecision):
             return built
+
+        return self.evaluate_preflight(PermissionPreflight(call, built))
+
+    def preflight(
+        self, call: ValidatedToolCall
+    ) -> PermissionPreflight | PermissionDecision:
+        built = self._target_builder.build(call)
+        if isinstance(built, PermissionDecision):
+            return built
+        return PermissionPreflight(call, built)
+
+    def evaluate_preflight(self, preflight: PermissionPreflight) -> PermissionDecision:
+        built = preflight.target
 
         match = self._rule_store.match(built)
         if match is not None and match.rule.effect == PermissionEffect.DENY:

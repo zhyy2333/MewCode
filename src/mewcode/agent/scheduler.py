@@ -10,7 +10,10 @@ from mewcode.permissions import (
     PermissionController,
     PermissionDecision,
     PermissionOutcome,
+    PermissionPreflight,
 )
+from mewcode.hooks import HookEvent, HookRuntime, make_event
+from mewcode.matching import MatchSubjectKind
 from mewcode.tools import (
     ToolCallRequest,
     ToolExecution,
@@ -41,7 +44,7 @@ class _State(Enum):
     FAILED = auto()
 
 
-PreparedCall = tuple[int, ValidatedToolCall]
+PreparedCall = tuple[int, ValidatedToolCall, PermissionPreflight | None]
 
 
 class ToolSchedule:
@@ -54,6 +57,7 @@ class ToolSchedule:
         permission_controller: PermissionController,
         max_read_concurrency: int,
         prompt_id_factory: Callable[[], str],
+        hook_runtime: HookRuntime | None = None,
     ) -> None:
         self._run_id = run_id
         self._iteration = iteration
@@ -62,6 +66,7 @@ class ToolSchedule:
         self._permission_controller = permission_controller
         self._max_read_concurrency = max_read_concurrency
         self._prompt_id_factory = prompt_id_factory
+        self._hook_runtime = hook_runtime
         self._state = _State.NEW
         self._executions: tuple[ToolExecution, ...] | None = None
         self._cancel_requested = asyncio.Event()
@@ -96,6 +101,30 @@ class ToolSchedule:
                     validated = self._registry.validate_call(request)
                     if isinstance(validated, ToolResult):
                         execution = ToolExecution(index, request, validated)
+                        await self._dispatch_after(execution, "failure")
+                        completed.append(execution)
+                        yield self._result_event(execution)
+                        continue
+
+                    preflight, hard_decision = self._preflight(validated)
+                    if hard_decision is not None:
+                        yield self._decision_event(request, hard_decision)
+                        execution = ToolExecution(
+                            index,
+                            request,
+                            _permission_denied_result(request, hard_decision),
+                        )
+                        await self._dispatch_after(execution, "denied")
+                        completed.append(execution)
+                        yield self._result_event(execution)
+                        continue
+
+                    hook_denial = await self._dispatch_before(validated, preflight)
+                    if hook_denial is not None:
+                        execution = ToolExecution(
+                            index, request, _hook_denied_result(request, hook_denial)
+                        )
+                        await self._dispatch_after(execution, "denied", preflight)
                         completed.append(execution)
                         yield self._result_event(execution)
                         continue
@@ -114,11 +143,18 @@ class ToolSchedule:
                         finally:
                             if self._active_control is operation:
                                 self._active_control = None
+                        await self._dispatch_after(
+                            execution,
+                            "cancelled"
+                            if execution.result.metadata.get("cancelled")
+                            else ("success" if execution.result.ok else "failure"),
+                            preflight,
+                        )
                         completed.append(execution)
                         yield self._result_event(execution)
                         continue
 
-                    decision = self._permission_controller.evaluate(validated)
+                    decision = self._evaluate_preflight(validated, preflight)
                     if decision.outcome == PermissionOutcome.ASK:
                         assert decision.target is not None
                         challenge = PermissionChallenge(
@@ -140,6 +176,9 @@ class ToolSchedule:
                             execution = ToolExecution(
                                 index, request, _cancelled_result(request)
                             )
+                            await self._dispatch_after(
+                                execution, "cancelled", preflight
+                            )
                             completed.append(execution)
                             yield self._result_event(execution)
                             continue
@@ -155,10 +194,11 @@ class ToolSchedule:
                         execution = ToolExecution(
                             index, request, _permission_denied_result(request, decision)
                         )
+                        await self._dispatch_after(execution, "denied", preflight)
                         completed.append(execution)
                         yield self._result_event(execution)
                     else:
-                        prepared.append((index, validated))
+                        prepared.append((index, validated, preflight))
 
                 if prepared:
                     if self._is_read_batch(batch):
@@ -166,8 +206,8 @@ class ToolSchedule:
                             completed.append(execution)
                             yield self._result_event(execution)
                     else:
-                        index, validated = prepared[0]
-                        execution = await self._run_serial(index, validated)
+                        index, validated, preflight = prepared[0]
+                        execution = await self._run_serial(index, validated, preflight)
                         completed.append(execution)
                         yield self._result_event(execution)
                 yield AgentProgress(
@@ -238,8 +278,8 @@ class ToolSchedule:
     ) -> AsyncIterator[ToolExecution]:
         semaphore = asyncio.Semaphore(self._max_read_concurrency)
         tasks = {
-            asyncio.create_task(self._run_one(index, call, semaphore))
-            for index, call in batch
+            asyncio.create_task(self._run_one(index, call, semaphore, preflight))
+            for index, call, preflight in batch
         }
         yielded_indexes: set[int] = set()
         self._active_tasks.update(tasks)
@@ -266,9 +306,12 @@ class ToolSchedule:
             self._active_tasks.difference_update(tasks)
 
     async def _run_serial(
-        self, index: int, call: ValidatedToolCall
+        self,
+        index: int,
+        call: ValidatedToolCall,
+        preflight: PermissionPreflight | None,
     ) -> ToolExecution:
-        task = asyncio.create_task(self._run_one(index, call, None))
+        task = asyncio.create_task(self._run_one(index, call, None, preflight))
         self._active_tasks.add(task)
         try:
             return await task
@@ -280,6 +323,7 @@ class ToolSchedule:
         index: int,
         call: ValidatedToolCall,
         semaphore: asyncio.Semaphore | None,
+        preflight: PermissionPreflight | None,
     ) -> ToolExecution:
         try:
             if self._cancel_requested.is_set():
@@ -294,7 +338,106 @@ class ToolSchedule:
         except asyncio.CancelledError:
             self._cancel_requested.set()
             result = _cancelled_result(call.request)
-        return ToolExecution(index=index, request=call.request, result=result)
+        execution = ToolExecution(index=index, request=call.request, result=result)
+        await self._dispatch_after(
+            execution,
+            "cancelled"
+            if result.metadata.get("cancelled")
+            else ("success" if result.ok else "failure"),
+            preflight,
+        )
+        return execution
+
+    def _preflight(
+        self, call: ValidatedToolCall
+    ) -> tuple[PermissionPreflight | None, PermissionDecision | None]:
+        method = getattr(self._permission_controller, "preflight", None)
+        if method is None:
+            return None, None
+        result = method(call)
+        if isinstance(result, PermissionDecision):
+            return None, result
+        return result, None
+
+    def _evaluate_preflight(
+        self,
+        call: ValidatedToolCall,
+        preflight: PermissionPreflight | None,
+    ) -> PermissionDecision:
+        method = getattr(self._permission_controller, "evaluate_preflight", None)
+        if preflight is not None and method is not None:
+            return method(preflight)
+        return self._permission_controller.evaluate(call)
+
+    async def _dispatch_before(
+        self,
+        call: ValidatedToolCall,
+        preflight: PermissionPreflight | None,
+    ) -> str | None:
+        if self._hook_runtime is None:
+            return None
+        target = preflight.target if preflight is not None else None
+        event = make_event(
+            HookEvent.TOOL_BEFORE,
+            workspace=self._hook_runtime.workspace,
+            session_id=self._hook_runtime.session_id,
+            resumed=self._hook_runtime.resumed,
+            values={
+                "tool": {
+                    "call_id": call.request.id,
+                    "name": call.request.name,
+                    "arguments": call.request.arguments,
+                    "target": {
+                        "kind": target.kind.value if target is not None else None,
+                        "value": target.value if target is not None else None,
+                    },
+                }
+            },
+            match_kinds={
+                "tool.target.value": (
+                    MatchSubjectKind.PATH
+                    if target is not None
+                    and target.kind.value in {"path", "path_glob"}
+                    else MatchSubjectKind.TEXT
+                )
+            },
+        )
+        result = await self._hook_runtime.dispatch(event)
+        if result.decision is not None and result.decision.deny:
+            return result.decision.reason or "Hook denied this tool call."
+        return None
+
+    async def _dispatch_after(
+        self,
+        execution: ToolExecution,
+        status: str,
+        preflight: PermissionPreflight | None = None,
+    ) -> None:
+        if self._hook_runtime is None:
+            return
+        target = preflight.target if preflight is not None else None
+        event = make_event(
+            HookEvent.TOOL_AFTER,
+            workspace=self._hook_runtime.workspace,
+            session_id=self._hook_runtime.session_id,
+            resumed=self._hook_runtime.resumed,
+            values={
+                "tool": {
+                    "call_id": execution.request.id,
+                    "name": execution.request.name,
+                    "arguments": execution.request.arguments,
+                    "target": {
+                        "kind": target.kind.value if target is not None else None,
+                        "value": target.value if target is not None else None,
+                    },
+                    "status": status,
+                    "ok": execution.result.ok,
+                    "result_summary": execution.result.summary(),
+                    "error": (execution.result.error or "")[:4096],
+                }
+            },
+        )
+        await self._hook_runtime.dispatch(event)
 
     async def _cancel_tasks(self) -> None:
         self._cancel_requested.set()
@@ -331,12 +474,14 @@ class ToolScheduler:
         permission_controller: PermissionController,
         max_read_concurrency: int = 4,
         prompt_id_factory: Callable[[], str] | None = None,
+        hook_runtime: HookRuntime | None = None,
     ) -> None:
         if max_read_concurrency < 1:
             raise ValueError("max_read_concurrency must be at least 1")
         self._permission_controller = permission_controller
         self._max_read_concurrency = max_read_concurrency
         self._prompt_id_factory = prompt_id_factory or (lambda: str(uuid4()))
+        self._hook_runtime = hook_runtime
 
     def schedule(
         self,
@@ -353,6 +498,7 @@ class ToolScheduler:
             permission_controller=self._permission_controller,
             max_read_concurrency=self._max_read_concurrency,
             prompt_id_factory=self._prompt_id_factory,
+            hook_runtime=self._hook_runtime,
         )
 
 
@@ -382,5 +528,20 @@ def _permission_denied_result(
                 "outcome": decision.outcome.value,
                 "source": decision.source.value,
             },
+        },
+    )
+
+
+def _hook_denied_result(request: ToolCallRequest, reason: str) -> ToolResult:
+    bounded = reason[:2048]
+    return ToolResult(
+        ok=False,
+        tool_name=request.name,
+        content="",
+        error=f"Hook denied this tool call: {bounded}",
+        metadata={
+            "tool_call_id": request.id,
+            "hook_denied": True,
+            "hook_reason": bounded,
         },
     )

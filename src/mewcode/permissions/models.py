@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass
 from enum import StrEnum
 
-from mewcode.tools import PermissionTargetKind
+from mewcode.tools import PermissionTargetKind, ValidatedToolCall
 from mewcode.matching import escape_exact_glob
 
 
@@ -100,6 +100,12 @@ class PermissionDecision:
     source: PermissionSource
     reason: str
     match: PermissionMatch | None = None
+
+
+@dataclass(frozen=True)
+class PermissionPreflight:
+    call: ValidatedToolCall
+    target: PermissionTarget
 
 
 class PermissionChallenge:
