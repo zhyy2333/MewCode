@@ -120,6 +120,48 @@ def test_http_non_2xx_is_isolated(tmp_path: Path) -> None:
     assert "secret body" not in outcome.summary
 
 
+@pytest.mark.parametrize(
+    "error",
+    [
+        httpx.ConnectError("offline"),
+        httpx.ReadTimeout("slow"),
+    ],
+)
+def test_http_network_and_timeout_fail_open(tmp_path: Path, error: Exception) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise error
+
+    async def scenario():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            return await HookActionExecutor(tmp_path, http_client=client).execute(
+                _rule(HttpHookAction("https://example.test/h")),
+                _envelope(tmp_path),
+                expects_decision=False,
+            )
+
+    outcome = asyncio.run(scenario())
+    assert outcome.kind is HookOutcomeKind.FAILURE
+    assert outcome.decision is None
+
+
+def test_http_oversized_response_is_bounded(tmp_path: Path) -> None:
+    async def scenario():
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                lambda _request: httpx.Response(200, content=b"x" * (70 * 1024))
+            )
+        ) as client:
+            return await HookActionExecutor(tmp_path, http_client=client).execute(
+                _rule(HttpHookAction("https://example.test/h")),
+                _envelope(tmp_path),
+                expects_decision=False,
+            )
+
+    outcome = asyncio.run(scenario())
+    assert outcome.kind is HookOutcomeKind.FAILURE
+    assert "limit" in outcome.summary
+
+
 def test_prompt_and_agent_do_not_start_external_work(tmp_path: Path) -> None:
     executor = HookActionExecutor(tmp_path)
     prompt = asyncio.run(

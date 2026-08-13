@@ -23,6 +23,7 @@ from mewcode.hooks.models import (
     HookRule,
     HookRuleKey,
     HookSource,
+    HookLimits,
     PromptHookAction,
 )
 from mewcode.hooks.runtime import HookRuntime
@@ -84,6 +85,24 @@ def test_sequence_failure_continues_and_first_deny_stops(tmp_path: Path) -> None
     executor, result = asyncio.run(scenario())
     assert executor.calls == [0, 1]
     assert result.decision == HookDecision(True, "no")
+
+
+def test_executor_exception_does_not_skip_later_rule(tmp_path: Path) -> None:
+    async def scenario():
+        executor = FakeExecutor(
+            [RuntimeError("hook bug"), HookActionOutcome(HookOutcomeKind.SUCCESS)]
+        )
+        runtime = HookRuntime(
+            _catalog(*[_rule(i, CommandHookAction("x")) for i in range(2)]),
+            executor,
+            workspace=tmp_path,
+            session_id="s",
+            project_trusted=True,
+        )
+        await runtime.dispatch(_event(tmp_path))
+        return executor.calls
+
+    assert asyncio.run(scenario()) == [0, 1]
 
 
 def test_not_matched_prompt_order_and_consume_once(tmp_path: Path) -> None:
@@ -164,6 +183,35 @@ def test_diagnostic_is_lazy_bounded_and_redacted(tmp_path: Path) -> None:
     assert "[redacted] failed" in text
 
 
+def test_diagnostic_rotation_keeps_three_history_files(tmp_path: Path) -> None:
+    path = tmp_path / "hooks.jsonl"
+    limits = HookLimits(log_bytes=300, log_backups=3)
+    logger = HookDiagnosticLogger(path, limits=limits)
+    rule = _rule(0, CommandHookAction("x"))
+    runtime = HookRuntime(
+        _catalog(rule),
+        FakeExecutor(
+            [HookActionOutcome(HookOutcomeKind.FAILURE, summary="x" * 180)] * 10
+        ),
+        workspace=tmp_path,
+        session_id="s",
+        project_trusted=True,
+        diagnostics=logger,
+        limits=limits,
+    )
+
+    async def scenario() -> None:
+        for _ in range(10):
+            await runtime.dispatch(_event(tmp_path))
+
+    asyncio.run(scenario())
+    files = [path, *(path.with_name(f"hooks.jsonl.{i}") for i in range(1, 4))]
+    assert all(item.exists() for item in files)
+    for item in files:
+        for line in item.read_text(encoding="utf-8").splitlines():
+            __import__("json").loads(line)
+
+
 def test_scope_restores_after_nested_binding(tmp_path: Path) -> None:
     runtime = HookRuntime.empty(tmp_path, "s")
     assert runtime.scope == {}
@@ -173,3 +221,88 @@ def test_scope_restores_after_nested_binding(tmp_path: Path) -> None:
             assert runtime.scope["iteration"] == 2
         assert "iteration" not in runtime.scope
     assert runtime.scope == {}
+
+
+def test_scope_is_isolated_between_concurrent_runs(tmp_path: Path) -> None:
+    runtime = HookRuntime.empty(tmp_path, "s")
+
+    async def worker(run_id: str, iteration: int):
+        with runtime.bind_scope(run_id=run_id):
+            runtime.update_scope(iteration=iteration)
+            await asyncio.sleep(0)
+            return runtime.scope
+
+    async def scenario():
+        return await asyncio.gather(worker("a", 1), worker("b", 2))
+
+    first, second = asyncio.run(scenario())
+    assert first == {"run_id": "a", "iteration": 1}
+    assert second == {"run_id": "b", "iteration": 2}
+    assert runtime.scope == {}
+
+
+def test_prompt_and_background_limits_are_bounded(tmp_path: Path) -> None:
+    async def scenario():
+        gate = asyncio.Event()
+        executor = FakeExecutor(gate=gate)
+        limits = HookLimits(prompt_consume_bytes=5, background_tasks=1, close_timeout_seconds=0.01)
+        prompt_rules = (
+            _rule(0, PromptHookAction("1234")),
+            _rule(1, PromptHookAction("5678")),
+        )
+        background_rules = (
+            _rule(2, CommandHookAction("x", control=HookExecutionControl(background=True))),
+            _rule(3, CommandHookAction("x", control=HookExecutionControl(background=True))),
+        )
+        runtime = HookRuntime(
+            _catalog(*prompt_rules, *background_rules),
+            executor,
+            workspace=tmp_path,
+            session_id="s",
+            project_trusted=True,
+            limits=limits,
+        )
+        await runtime.dispatch(_event(tmp_path))
+        prompts = runtime.consume_prompt_context()
+        gate.set()
+        await runtime.close()
+        return prompts, executor.calls
+
+    prompts, calls = asyncio.run(scenario())
+    assert prompts == ("1234",)
+    assert calls == [2]
+
+
+def test_once_resets_only_for_new_runtime_process_state(tmp_path: Path) -> None:
+    rule = _rule(
+        0,
+        CommandHookAction("x", control=HookExecutionControl(once=True)),
+    )
+
+    async def scenario():
+        first_executor = FakeExecutor([HookActionOutcome(HookOutcomeKind.FAILURE)])
+        first = HookRuntime(
+            _catalog(rule),
+            first_executor,
+            workspace=tmp_path,
+            session_id="s",
+            project_trusted=True,
+        )
+        await first.dispatch(_event(tmp_path))
+        await first.dispatch(_event(tmp_path))
+        await first.close()
+        second_executor = FakeExecutor()
+        second = HookRuntime(
+            _catalog(rule),
+            second_executor,
+            workspace=tmp_path,
+            session_id="s",
+            project_trusted=True,
+        )
+        await second.dispatch(_event(tmp_path))
+        await second.close()
+        return first_executor.calls, second_executor.calls
+
+    first_calls, second_calls = asyncio.run(scenario())
+    assert first_calls == [0]
+    assert second_calls == [0]

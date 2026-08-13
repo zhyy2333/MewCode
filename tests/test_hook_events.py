@@ -25,6 +25,8 @@ def test_base_event_is_read_only_and_normalized(tmp_path: Path) -> None:
     assert event.values["workspace"]["root"] == str(tmp_path.resolve())
     with pytest.raises(TypeError):
         event.values["event"] = "changed"  # type: ignore[index]
+    with pytest.raises(TypeError):
+        event.values["session"]["id"] = "changed"  # type: ignore[index]
 
 
 def test_external_envelope_is_bounded_and_marks_tool_arguments(tmp_path: Path) -> None:

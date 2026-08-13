@@ -53,7 +53,10 @@ class HookedProvider:
             workspace=self._runtime.workspace,
             session_id=self._runtime.session_id,
             resumed=self._runtime.resumed,
-            values={"message": base},
+            values={
+                "turn": {"id": scope.get("turn_id"), "mode": scope.get("mode")},
+                "message": base,
+            },
         )
         await self._runtime.dispatch(before)
         prompts = self._runtime.consume_prompt_context()
@@ -104,7 +107,10 @@ class HookedProvider:
                 workspace=self._runtime.workspace,
                 session_id=self._runtime.session_id,
                 resumed=self._runtime.resumed,
-                values={"message": after_values},
+                values={
+                    "turn": {"id": scope.get("turn_id"), "mode": scope.get("mode")},
+                    "message": after_values,
+                },
             )
             await self._runtime.dispatch(after)
 

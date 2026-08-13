@@ -94,6 +94,7 @@ class ToolSchedule:
                 for index, request in batch:
                     if self._cancel_requested.is_set():
                         execution = ToolExecution(index, request, _cancelled_result(request))
+                        await self._dispatch_after(execution, "cancelled")
                         completed.append(execution)
                         yield self._result_event(execution)
                         continue
@@ -377,12 +378,14 @@ class ToolSchedule:
         if self._hook_runtime is None:
             return None
         target = preflight.target if preflight is not None else None
+        scope = self._hook_runtime.scope
         event = make_event(
             HookEvent.TOOL_BEFORE,
             workspace=self._hook_runtime.workspace,
             session_id=self._hook_runtime.session_id,
             resumed=self._hook_runtime.resumed,
             values={
+                "turn": {"id": scope.get("turn_id"), "mode": scope.get("mode")},
                 "tool": {
                     "call_id": call.request.id,
                     "name": call.request.name,
@@ -416,12 +419,14 @@ class ToolSchedule:
         if self._hook_runtime is None:
             return
         target = preflight.target if preflight is not None else None
+        scope = self._hook_runtime.scope
         event = make_event(
             HookEvent.TOOL_AFTER,
             workspace=self._hook_runtime.workspace,
             session_id=self._hook_runtime.session_id,
             resumed=self._hook_runtime.resumed,
             values={
+                "turn": {"id": scope.get("turn_id"), "mode": scope.get("mode")},
                 "tool": {
                     "call_id": execution.request.id,
                     "name": execution.request.name,

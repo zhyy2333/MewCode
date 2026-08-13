@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 
 from mewcode.hooks.trust import WorkspaceTrustStore, workspace_identity
 
@@ -52,3 +53,21 @@ def test_write_failure_keeps_old_file(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.setattr("mewcode.hooks.trust.os.replace", fail_replace)
     assert store.write(tmp_path / "two", True) is False
     assert path.read_bytes() == old
+
+
+def test_concurrent_writes_preserve_all_workspaces(tmp_path: Path) -> None:
+    store = WorkspaceTrustStore(tmp_path / "trust.json")
+    workspaces = [tmp_path / f"work-{index}" for index in range(8)]
+    for workspace in workspaces:
+        workspace.mkdir()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(
+            pool.map(
+                lambda item: store.write(item[1], item[0] % 2 == 0),
+                enumerate(workspaces),
+            )
+        )
+    assert all(results)
+    assert [store.read(path) for path in workspaces] == [
+        index % 2 == 0 for index in range(8)
+    ]

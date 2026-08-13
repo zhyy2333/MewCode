@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+import time
 from typing import Callable
 
 from mewcode.locking import FileLock
@@ -62,7 +63,12 @@ class WorkspaceTrustStore:
         identity = workspace_identity(workspace)
         lock = self._lock_factory(self._lock_path)
         try:
-            with lock:
+            deadline = time.monotonic() + 2.0
+            while not lock.acquire():
+                if time.monotonic() >= deadline:
+                    raise OSError("timed out acquiring Hook trust lock")
+                time.sleep(0.01)
+            try:
                 try:
                     records = self._read_records()
                 except FileNotFoundError:
@@ -88,6 +94,8 @@ class WorkspaceTrustStore:
                     ],
                 }
                 self._atomic_write(payload)
+            finally:
+                lock.close()
             self.last_diagnostic = None
             return True
         except OSError as exc:

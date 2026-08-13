@@ -421,7 +421,13 @@ class ContextManager:
                 workspace=self._hook_runtime.workspace,
                 session_id=self._hook_runtime.session_id,
                 resumed=self._hook_runtime.resumed,
-                values={"compaction": values},
+                values={
+                    "turn": {
+                        "id": self._hook_runtime.scope.get("turn_id"),
+                        "mode": self._hook_runtime.scope.get("mode"),
+                    },
+                    "compaction": values,
+                },
             )
         )
 

@@ -27,6 +27,7 @@ COMMON_EVENT_FIELDS = frozenset(
         "session.resumed",
     }
 )
+TURN_SCOPE_FIELDS = frozenset({"turn.id", "turn.mode"})
 
 EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
     {
@@ -36,7 +37,7 @@ EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
         | {"turn.id", "turn.mode", "turn.input_summary"},
         HookEvent.TURN_END: COMMON_EVENT_FIELDS
         | {"turn.id", "turn.mode", "turn.input_summary", "turn.status"},
-        HookEvent.MESSAGE_BEFORE: COMMON_EVENT_FIELDS
+        HookEvent.MESSAGE_BEFORE: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
         | {
             "message.id",
             "message.component",
@@ -47,7 +48,7 @@ EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
             "message.tool_count",
             "message.max_output_tokens",
         },
-        HookEvent.MESSAGE_AFTER: COMMON_EVENT_FIELDS
+        HookEvent.MESSAGE_AFTER: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
         | {
             "message.id",
             "message.component",
@@ -62,7 +63,7 @@ EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
             "message.response_summary",
             "message.error",
         },
-        HookEvent.TOOL_BEFORE: COMMON_EVENT_FIELDS
+        HookEvent.TOOL_BEFORE: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
         | {
             "tool.call_id",
             "tool.name",
@@ -70,7 +71,7 @@ EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
             "tool.target.kind",
             "tool.target.value",
         },
-        HookEvent.TOOL_AFTER: COMMON_EVENT_FIELDS
+        HookEvent.TOOL_AFTER: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
         | {
             "tool.call_id",
             "tool.name",
@@ -82,12 +83,12 @@ EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
             "tool.result_summary",
             "tool.error",
         },
-        HookEvent.COMPACT_BEFORE: COMMON_EVENT_FIELDS
+        HookEvent.COMPACT_BEFORE: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
         | {
             "compaction.mode",
             "compaction.message_count_before",
         },
-        HookEvent.COMPACT_AFTER: COMMON_EVENT_FIELDS
+        HookEvent.COMPACT_AFTER: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
         | {
             "compaction.mode",
             "compaction.status",
@@ -138,13 +139,21 @@ def make_event(
         "session": MappingProxyType({"id": session_id, "resumed": resumed}),
     }
     if values:
-        tree.update(values)
+        tree.update({key: _freeze(value) for key, value in values.items()})
     return HookEventContext(
         event=event,
         occurred_at=timestamp,
         values=MappingProxyType(tree),
         match_kinds=MappingProxyType(dict(match_kinds or {})),
     )
+
+
+def _freeze(value: object) -> object:
+    if isinstance(value, Mapping):
+        return MappingProxyType({str(key): _freeze(child) for key, child in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze(child) for child in value)
+    return value
 
 
 def serialize_event(

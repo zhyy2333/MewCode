@@ -187,6 +187,8 @@ class AgentRun:
                 else self._config.max_iterations
             )
             for iteration in range(1, loop_limit + 1):
+                if self._hook_runtime is not None:
+                    self._hook_runtime.update_scope(iteration=iteration)
                 if self._cancel_requested.is_set():
                     yield self._finish(
                         StopReason.CANCELLED,

@@ -22,6 +22,7 @@ from mewcode.hooks.models import (
     HookRule,
     HookRuleKey,
     HookSource,
+    PromptHookAction,
 )
 from mewcode.hooks.provider import HookedProvider
 from mewcode.hooks.runtime import HookRuntime
@@ -223,6 +224,81 @@ def test_manual_compact_force_replaces_history_without_adding_command(tmp_path: 
     session_dir = archive.session_dir
     assert asyncio.run(conversation.close()) == ()
     assert session_dir is not None and not session_dir.exists()
+
+
+def test_compact_before_prompt_reaches_summary_and_after_is_paired(tmp_path: Path) -> None:
+    class Executor:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def execute(self, rule, envelope, *, expects_decision):
+            self.events.append(json.loads(envelope.encoded)["event"])
+            return HookActionOutcome(HookOutcomeKind.SUCCESS)
+
+        async def close(self):
+            return None
+
+    before = HookRule(
+        HookRuleKey(HookSource.USER, Path("h"), 0),
+        HookEvent.COMPACT_BEFORE,
+        None,
+        PromptHookAction("summary-only-context"),
+    )
+    after = HookRule(
+        HookRuleKey(HookSource.USER, Path("h"), 1),
+        HookEvent.COMPACT_AFTER,
+        None,
+        CommandHookAction("ignored"),
+    )
+    executor = Executor()
+    runtime = HookRuntime(
+        HookCatalog(
+            (before, after),
+            MappingProxyType(
+                {HookEvent.COMPACT_BEFORE: (before,), HookEvent.COMPACT_AFTER: (after,)}
+            ),
+        ),
+        executor,
+        workspace=tmp_path,
+        session_id="s",
+        project_trusted=True,
+    )
+    base = ScriptedAsyncProvider(
+        [
+            *[[ProviderTextDelta(f"answer-{index}")] for index in range(5)],
+            [ProviderTextDelta(summary_response(".mewcode/context/session/history-000001.json"))],
+        ]
+    )
+    provider = HookedProvider(base, runtime, "main")
+    archive = ContextArchive(tmp_path, session_id_factory=lambda: "session")
+    archive.start()
+    manager = ContextManager(
+        provider,
+        archive,
+        ContextConfig(128_000, recent_tokens=1, recent_messages=2),
+        hook_runtime=runtime,
+    )
+    conversation = Conversation(
+        AgentRunner(
+            provider,
+            ToolScheduler(AllowAllPermissionController(), hook_runtime=runtime),
+            context_manager=manager,
+            hook_runtime=runtime,
+        ),
+        ToolRegistry([]),
+        context_manager=manager,
+        hook_runtime=runtime,
+    )
+    for index in range(5):
+        asyncio.run(collect_async(conversation.ask(f"question-{index}")))
+    asyncio.run(collect_async(conversation.compact()))
+    assert "summary-only-context" in base.calls[-1].prompt.dynamic_system
+    assert all(
+        "summary-only-context" not in call.prompt.dynamic_system
+        for call in base.calls[:-1]
+    )
+    assert executor.events == ["system.compact.after"]
+    asyncio.run(conversation.close())
 
 
 def test_stable_prefix_second_turn_includes_previous_context() -> None:

@@ -7,6 +7,7 @@ from types import MappingProxyType
 import pytest
 
 from mewcode.hooks.models import (
+    CommandHookAction,
     HookCatalog,
     HookEvent,
     HookRule,
@@ -67,6 +68,59 @@ def test_provider_error_propagates(tmp_path: Path) -> None:
     hooked = HookedProvider(provider, HookRuntime.empty(tmp_path, "s"), "main")
     with pytest.raises(ProviderError):
         asyncio.run(collect_async(hooked.stream_reply(ModelRequest(PromptPackage("", ""), ()))))
+
+
+def test_provider_failure_emits_one_system_error_and_paired_after(tmp_path: Path) -> None:
+    class Executor:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def execute(self, rule, envelope, *, expects_decision):
+            import json
+
+            event = json.loads(envelope.encoded)["event"]
+            self.events.append(event)
+            if event == "system.error":
+                raise RuntimeError("Hook failure must not recurse")
+            from mewcode.hooks import HookActionOutcome, HookOutcomeKind
+
+            return HookActionOutcome(HookOutcomeKind.SUCCESS)
+
+        async def close(self):
+            return None
+
+    rules = tuple(
+        HookRule(
+            HookRuleKey(HookSource.USER, Path("h"), index),
+            event,
+            None,
+            CommandHookAction("ignored"),
+        )
+        for index, event in enumerate((HookEvent.SYSTEM_ERROR, HookEvent.MESSAGE_AFTER))
+    )
+    executor = Executor()
+    runtime = HookRuntime(
+        HookCatalog(
+            rules,
+            MappingProxyType(
+                {event: tuple(rule for rule in rules if rule.event is event) for event in (HookEvent.SYSTEM_ERROR, HookEvent.MESSAGE_AFTER)}
+            ),
+        ),
+        executor,
+        workspace=tmp_path,
+        session_id="s",
+        project_trusted=True,
+    )
+    hooked = HookedProvider(
+        ScriptedAsyncProvider([ProviderError("failed")]), runtime, "main"
+    )
+    with pytest.raises(ProviderError):
+        asyncio.run(
+            collect_async(
+                hooked.stream_reply(ModelRequest(PromptPackage("", ""), ()))
+            )
+        )
+    assert executor.events == ["system.error", "message.after"]
 
 
 def test_delegate_message_conversion(tmp_path: Path) -> None:

@@ -93,6 +93,10 @@ class HookRuntime:
     def scope(self) -> dict[str, object]:
         return dict(_scope.get())
 
+    def update_scope(self, **values: object) -> None:
+        current = _scope.get()
+        current.update({key: value for key, value in values.items() if value is not None})
+
     @contextmanager
     def bind_scope(self, **values: object) -> Iterator[None]:
         merged = dict(_scope.get())
@@ -159,6 +163,9 @@ class HookRuntime:
             except asyncio.CancelledError:
                 self._record(event, rule, HookOutcomeKind.CANCELLED, "action cancelled")
                 raise
+            except Exception:
+                self._record(event, rule, HookOutcomeKind.FAILURE, "action execution failed")
+                continue
             self._record(event, rule, outcome.kind, outcome.summary, outcome.duration_ms)
             if (
                 event.event is HookEvent.TOOL_BEFORE

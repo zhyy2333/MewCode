@@ -135,3 +135,23 @@ def test_import_has_no_side_effect(tmp_path: Path, monkeypatch: pytest.MonkeyPat
 
     assert hooks.HookCatalog.empty().rules == ()
     assert list(tmp_path.iterdir()) == []
+
+
+def test_repeated_load_has_stable_keys_and_event_order(tmp_path: Path) -> None:
+    paths = HookPaths.for_workspace(tmp_path / "work", user_home=tmp_path / "home")
+    _write(
+        paths.user,
+        """hooks:
+- event: turn.end
+  action: {type: prompt, content: first}
+- event: session.start
+  action: {type: prompt, content: second}
+- event: turn.end
+  action: {type: prompt, content: third}
+""",
+    )
+    first = HookConfigLoader().load(paths)
+    second = HookConfigLoader().load(paths)
+    assert first.rules == second.rules
+    assert tuple(first.by_event) == tuple(second.by_event)
+    assert [rule.key.index for rule in first.by_event[HookEvent.TURN_END]] == [0, 2]
