@@ -1,6 +1,10 @@
 from .conditions import HookConditionMatcher
 from .config import HookConfigError, HookConfigLoader, HookPaths
-from .events import EVENT_FIELDS, is_allowed_field, make_event
+from .events import EVENT_FIELDS, is_allowed_field, make_event, serialize_event
+from .actions import HookActionExecutor
+from .diagnostics import HookDiagnosticLogger
+from .provider import HookedProvider
+from .runtime import HookRuntime
 from .trust import WorkspaceIdentity, WorkspaceTrustStore, workspace_identity
 from .models import (
     DEFAULT_HOOK_LIMITS,

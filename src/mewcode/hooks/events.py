@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 from mewcode.matching import MatchSubjectKind
 
-from .models import HookEvent, HookEventContext
+from .models import (
+    DEFAULT_HOOK_LIMITS,
+    HookEvent,
+    HookEventContext,
+    HookLimits,
+    SerializedHookEnvelope,
+)
 
 
 COMMON_EVENT_FIELDS = frozenset(
@@ -137,4 +144,77 @@ def make_event(
         occurred_at=timestamp,
         values=MappingProxyType(tree),
         match_kinds=MappingProxyType(dict(match_kinds or {})),
+    )
+
+
+def serialize_event(
+    event: HookEventContext,
+    limits: HookLimits = DEFAULT_HOOK_LIMITS,
+) -> SerializedHookEnvelope:
+    truncated: list[str] = []
+
+    def convert(value: object, path: str, depth: int) -> object:
+        if depth > 16:
+            truncated.append(path)
+            return "[truncated:depth]"
+        if value is None or isinstance(value, (bool, int, float)):
+            return value
+        if isinstance(value, str):
+            encoded = value.encode("utf-8")
+            if len(encoded) <= 64 * 1024:
+                return value
+            truncated.append(path)
+            return encoded[: 64 * 1024].decode("utf-8", errors="ignore") + "…[truncated]"
+        if isinstance(value, Mapping):
+            result: dict[str, object] = {}
+            for position, (key, child) in enumerate(value.items()):
+                child_path = f"{path}.{key}" if path else str(key)
+                if position >= 256:
+                    truncated.append(path or "$")
+                    break
+                result[str(key)] = convert(child, child_path, depth + 1)
+            return result
+        if isinstance(value, (list, tuple)):
+            result = []
+            for position, child in enumerate(value):
+                if position >= 256:
+                    truncated.append(path or "$")
+                    break
+                result.append(convert(child, f"{path}.{position}", depth + 1))
+            return result
+        truncated.append(path)
+        return f"[unsupported:{type(value).__name__}]"
+
+    value = convert(event.values, "", 0)
+    assert isinstance(value, dict)
+
+    def encode() -> bytes:
+        value["truncated_fields"] = sorted(set(item for item in truncated if item))
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+
+    encoded = encode()
+    if len(encoded) > limits.envelope_bytes:
+        # Tool arguments are the only intentionally large internal branch. Preserve
+        # its presence while replacing its external copy deterministically.
+        tool = value.get("tool")
+        if isinstance(tool, dict) and "arguments" in tool:
+            tool["arguments"] = "[truncated:envelope_budget]"
+            truncated.append("tool.arguments")
+            encoded = encode()
+    if len(encoded) > limits.envelope_bytes:
+        # Fall back to a bounded metadata envelope instead of emitting invalid JSON.
+        value = {
+            "schema_version": event.values.get("schema_version", 1),
+            "event": event.event.value,
+            "occurred_at": event.values.get("occurred_at"),
+            "truncated_fields": ["$"],
+        }
+        encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        truncated = ["$"]
+    return SerializedHookEnvelope(
+        value=MappingProxyType(value),
+        encoded=encoded,
+        truncated_fields=tuple(sorted(set(truncated))),
     )
