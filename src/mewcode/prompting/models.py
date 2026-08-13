@@ -28,6 +28,7 @@ class PromptEnvironment:
 @dataclass(frozen=True)
 class PromptAdditions:
     custom_instructions: str | None = None
+    agent_role: str | None = None
     # Kept for callers compiled against the phase-9 singular field.
     active_skill: str | None = None
     long_term_memory: str | None = None
@@ -38,6 +39,7 @@ class PromptAdditions:
         self,
         *,
         custom_instructions: str | None = None,
+        agent_role: str | None = None,
         available_skills: str | None = None,
         active_skills: str | None = None,
         active_skill: str | None = None,
@@ -45,6 +47,7 @@ class PromptAdditions:
     ) -> PromptAdditions:
         return PromptAdditions(
             custom_instructions=_join(custom_instructions, self.custom_instructions),
+            agent_role=_join(self.agent_role, agent_role),
             active_skill=None,
             long_term_memory=_join(self.long_term_memory, long_term_memory),
             available_skills=_join(self.available_skills, available_skills),

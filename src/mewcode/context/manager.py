@@ -136,9 +136,19 @@ class ContextManager:
     ) -> ToolCompactionResult:
         return self._tool_compactor.compact(executions)
 
-    def prepare(self, request: ModelRequest) -> ContextOperation:
+    def prepare(
+        self,
+        request: ModelRequest,
+        *,
+        preserve_prefix: bool = False,
+    ) -> ContextOperation:
         state = _OperationState()
-        return ContextOperation(self._prepare_automatic(request, state), state)
+        source = (
+            self._prepare_preserved(request, state)
+            if preserve_prefix
+            else self._prepare_automatic(request, state)
+        )
+        return ContextOperation(source, state)
 
     def compact(self, messages: Sequence[ChatMessage]) -> ContextOperation:
         state = _OperationState()
@@ -305,6 +315,32 @@ class ContextManager:
             len(compacted.messages),
             changed=True,
         )
+
+    async def _prepare_preserved(
+        self,
+        request: ModelRequest,
+        state: _OperationState,
+    ) -> AsyncIterator[ContextStatus]:
+        estimate = self._estimator.estimate(request)
+        if estimate.input_tokens < self._main_boundary(request):
+            state.outcome = ContextPreparation(
+                request,
+                request.messages,
+                estimate.footprint,
+            )
+            return
+        message = (
+            "The preserved request prefix cannot fit within the safe context boundary."
+        )
+        state.outcome = ContextPreparation(
+            None,
+            request.messages,
+            estimate.footprint,
+            error=message,
+            failure_kind=ContextFailureKind.CAPACITY,
+        )
+        if False:
+            yield ContextStatus(ContextStatusKind.COMPACTION_FAILED, message)
 
     async def _prepare_manual(
         self,

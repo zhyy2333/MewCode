@@ -46,6 +46,7 @@ def test_section_registry_has_approved_order_and_tool_rules() -> None:
         (700, "text_output", PromptStability.STABLE),
         (800, "environment", PromptStability.DYNAMIC),
         (900, "custom_instructions", PromptStability.DYNAMIC),
+        (925, "agent_role", PromptStability.DYNAMIC),
         (950, "available_skills", PromptStability.DYNAMIC),
         (1000, "active_skills", PromptStability.DYNAMIC),
         (1100, "long_term_memory", PromptStability.DYNAMIC),
@@ -78,6 +79,7 @@ def test_dynamic_system_optional_sections_and_stable_boundary(tmp_path) -> None:
     base = builder.build(PromptRunContext("task"), "direct")
     additions = PromptAdditions(
         custom_instructions="custom",
+        agent_role="role",
         active_skill="skill",
         long_term_memory="memory",
     )
@@ -86,10 +88,12 @@ def test_dynamic_system_optional_sections_and_stable_boundary(tmp_path) -> None:
     assert [line for line in full.dynamic_system.splitlines() if line.startswith("## ")] == [
         "## Environment",
         "## Custom Instructions",
+        "## Agent Role",
         "## Active Skills",
         "## Long-Term Memory",
     ]
-    assert full.dynamic_system.index("custom") < full.dynamic_system.index("skill")
+    assert full.dynamic_system.index("custom") < full.dynamic_system.index("role")
+    assert full.dynamic_system.index("role") < full.dynamic_system.index("skill")
     assert full.dynamic_system.index("skill") < full.dynamic_system.index("memory")
 
 
@@ -120,3 +124,18 @@ def test_available_skills_precede_active_skills(tmp_path) -> None:
         "## Active Skills"
     )
     assert "## Long-Term Memory" not in package.dynamic_system
+
+
+def test_agent_role_merge_is_dynamic_and_persists_across_iterations(tmp_path) -> None:
+    additions = PromptAdditions(agent_role="base role").merged(agent_role="task role")
+    context = PromptRunContext("task", additions=additions)
+    builder = _builder(tmp_path)
+
+    first = builder.build(context, "direct", iteration=1)
+    second = builder.build(context, "direct", iteration=2)
+    without_role = builder.build(PromptRunContext("task"), "direct")
+
+    assert first.stable_system == without_role.stable_system == second.stable_system
+    assert "## Agent Role\nbase role\n\ntask role" in first.dynamic_system
+    assert "## Agent Role\nbase role\n\ntask role" in second.dynamic_system
+    assert "## Agent Role" not in without_role.dynamic_system

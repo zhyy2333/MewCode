@@ -28,16 +28,19 @@ COMMON_EVENT_FIELDS = frozenset(
     }
 )
 TURN_SCOPE_FIELDS = frozenset({"turn.id", "turn.mode"})
+TASK_SCOPE_FIELDS = frozenset(
+    {"task.id", "task.parent_run_id", "task.component"}
+)
 
 EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
     {
-        HookEvent.SESSION_START: COMMON_EVENT_FIELDS,
-        HookEvent.SESSION_END: COMMON_EVENT_FIELDS | {"session.status"},
-        HookEvent.TURN_START: COMMON_EVENT_FIELDS
+        HookEvent.SESSION_START: COMMON_EVENT_FIELDS | TASK_SCOPE_FIELDS,
+        HookEvent.SESSION_END: COMMON_EVENT_FIELDS | TASK_SCOPE_FIELDS | {"session.status"},
+        HookEvent.TURN_START: COMMON_EVENT_FIELDS | TASK_SCOPE_FIELDS
         | {"turn.id", "turn.mode", "turn.input_summary"},
-        HookEvent.TURN_END: COMMON_EVENT_FIELDS
+        HookEvent.TURN_END: COMMON_EVENT_FIELDS | TASK_SCOPE_FIELDS
         | {"turn.id", "turn.mode", "turn.input_summary", "turn.status"},
-        HookEvent.MESSAGE_BEFORE: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
+        HookEvent.MESSAGE_BEFORE: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS | TASK_SCOPE_FIELDS
         | {
             "message.id",
             "message.component",
@@ -48,7 +51,7 @@ EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
             "message.tool_count",
             "message.max_output_tokens",
         },
-        HookEvent.MESSAGE_AFTER: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
+        HookEvent.MESSAGE_AFTER: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS | TASK_SCOPE_FIELDS
         | {
             "message.id",
             "message.component",
@@ -63,7 +66,7 @@ EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
             "message.response_summary",
             "message.error",
         },
-        HookEvent.TOOL_BEFORE: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
+        HookEvent.TOOL_BEFORE: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS | TASK_SCOPE_FIELDS
         | {
             "tool.call_id",
             "tool.name",
@@ -71,7 +74,7 @@ EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
             "tool.target.kind",
             "tool.target.value",
         },
-        HookEvent.TOOL_AFTER: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
+        HookEvent.TOOL_AFTER: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS | TASK_SCOPE_FIELDS
         | {
             "tool.call_id",
             "tool.name",
@@ -83,12 +86,12 @@ EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
             "tool.result_summary",
             "tool.error",
         },
-        HookEvent.COMPACT_BEFORE: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
+        HookEvent.COMPACT_BEFORE: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS | TASK_SCOPE_FIELDS
         | {
             "compaction.mode",
             "compaction.message_count_before",
         },
-        HookEvent.COMPACT_AFTER: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS
+        HookEvent.COMPACT_AFTER: COMMON_EVENT_FIELDS | TURN_SCOPE_FIELDS | TASK_SCOPE_FIELDS
         | {
             "compaction.mode",
             "compaction.status",
@@ -97,7 +100,7 @@ EVENT_FIELDS: Mapping[HookEvent, frozenset[str]] = MappingProxyType(
             "compaction.message_count_after",
             "compaction.error",
         },
-        HookEvent.SYSTEM_ERROR: COMMON_EVENT_FIELDS
+        HookEvent.SYSTEM_ERROR: COMMON_EVENT_FIELDS | TASK_SCOPE_FIELDS
         | {
             "error.id",
             "error.component",

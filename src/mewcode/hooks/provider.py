@@ -59,7 +59,15 @@ class HookedProvider:
             },
         )
         await self._runtime.dispatch(before)
-        prompts = self._runtime.consume_prompt_context()
+        task_id_value = scope.get("subagent_task_id")
+        task_id = task_id_value if isinstance(task_id_value, str) else None
+        preserve_fork_prefix = bool(scope.get("preserve_fork_prefix", False))
+        prompts = self._runtime.consume_prompt_context(
+            task_id,
+            preserve_fork_prefix=preserve_fork_prefix,
+        )
+        if preserve_fork_prefix:
+            self._runtime.update_scope(preserve_fork_prefix=False)
         actual_request = request
         if prompts:
             section = "## Hook Context\n\n" + "\n\n".join(prompts)

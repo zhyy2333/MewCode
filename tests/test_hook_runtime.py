@@ -215,6 +215,38 @@ def test_diagnostic_rotation_keeps_three_history_files(tmp_path: Path) -> None:
 def test_scope_restores_after_nested_binding(tmp_path: Path) -> None:
     runtime = HookRuntime.empty(tmp_path, "s")
     assert runtime.scope == {}
+
+
+def test_subagent_scope_is_bounded_and_serialized_without_task_content(
+    tmp_path: Path,
+) -> None:
+    envelopes = []
+
+    class RecordingExecutor(FakeExecutor):
+        async def execute(self, rule, envelope, *, expects_decision):
+            envelopes.append(envelope)
+            return HookActionOutcome(HookOutcomeKind.SUCCESS)
+
+    runtime = HookRuntime(
+        _catalog(_rule(0, CommandHookAction("x"))),
+        RecordingExecutor(),
+        workspace=tmp_path,
+        session_id="s",
+        project_trusted=True,
+    )
+
+    with runtime.bind_scope(
+        subagent_task_id="t" * 200,
+        parent_run_id="parent-run",
+        component="subagent",
+    ):
+        asyncio.run(runtime.dispatch(_event(tmp_path)))
+
+    payload = envelopes[0].value
+    assert payload["task"]["id"] == "t" * 128
+    assert payload["task"]["parent_run_id"] == "parent-run"
+    assert payload["task"]["component"] == "subagent"
+    assert "task_text" not in str(payload)
     with runtime.bind_scope(turn_id="t", component="agent"):
         assert runtime.scope["turn_id"] == "t"
         with runtime.bind_scope(iteration=2):
@@ -271,6 +303,62 @@ def test_prompt_and_background_limits_are_bounded(tmp_path: Path) -> None:
     prompts, calls = asyncio.run(scenario())
     assert prompts == ("1234",)
     assert calls == [2]
+
+
+def test_prompt_queues_are_partitioned_by_subagent_task(tmp_path: Path) -> None:
+    rule = _rule(0, PromptHookAction("queued"))
+    runtime = HookRuntime(
+        _catalog(rule),
+        FakeExecutor(),
+        workspace=tmp_path,
+        session_id="s",
+        project_trusted=True,
+    )
+
+    async def scenario() -> tuple[tuple[str, ...], ...]:
+        await runtime.dispatch(_event(tmp_path))
+        with runtime.bind_scope(subagent_task_id="a"):
+            await runtime.dispatch(_event(tmp_path))
+        with runtime.bind_scope(subagent_task_id="b"):
+            await runtime.dispatch(_event(tmp_path))
+        return (
+            runtime.consume_prompt_context("b"),
+            runtime.consume_prompt_context(),
+            runtime.consume_prompt_context("a"),
+        )
+
+    assert asyncio.run(scenario()) == (("queued",), ("queued",), ("queued",))
+
+
+def test_task_prompt_budget_preserve_and_cleanup(tmp_path: Path) -> None:
+    rules = (
+        _rule(0, PromptHookAction("1234")),
+        _rule(1, PromptHookAction("5678")),
+    )
+    runtime = HookRuntime(
+        _catalog(*rules),
+        FakeExecutor(),
+        workspace=tmp_path,
+        session_id="s",
+        project_trusted=True,
+        limits=HookLimits(prompt_consume_bytes=5),
+    )
+
+    async def scenario() -> tuple[tuple[str, ...], tuple[str, ...]]:
+        with runtime.bind_scope(subagent_task_id="task"):
+            await runtime.dispatch(_event(tmp_path))
+        preserved = runtime.consume_prompt_context(
+            "task", preserve_fork_prefix=True
+        )
+        queued = runtime.consume_prompt_context("task")
+        with runtime.bind_scope(subagent_task_id="cleanup"):
+            await runtime.dispatch(_event(tmp_path))
+        runtime.cleanup_task_prompts("cleanup")
+        assert runtime.consume_prompt_context("cleanup") == ()
+        await runtime.close()
+        return preserved, queued
+
+    assert asyncio.run(scenario()) == ((), ("1234",))
 
 
 def test_once_resets_only_for_new_runtime_process_state(tmp_path: Path) -> None:

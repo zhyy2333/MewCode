@@ -49,6 +49,8 @@ class PermissionSource(StrEnum):
     MODE = "mode"
     USER_CONFIRMATION = "user_confirmation"
     CONFIG_ERROR = "config_error"
+    SUBAGENT_POLICY = "subagent_policy"
+    SUBAGENT_NON_INTERACTIVE = "subagent_non_interactive"
 
 
 def escape_exact_pattern(value: str) -> str:

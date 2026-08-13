@@ -39,10 +39,10 @@ class ContextArchive:
     def session_dir(self) -> Path | None:
         return self._session_dir
 
-    def start(self) -> tuple[ContextStatus, ...]:
+    def start(self, *, skip_stale_cleanup: bool = False) -> tuple[ContextStatus, ...]:
         if self._session_dir is not None:
             return ()
-        warnings = list(self._cleanup_stale_sessions())
+        warnings = [] if skip_stale_cleanup else list(self._cleanup_stale_sessions())
         self._context_root.mkdir(parents=True, exist_ok=True)
         session_dir = self._context_root / self._session_id_factory()
         session_dir.mkdir(parents=False, exist_ok=False)

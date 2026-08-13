@@ -326,3 +326,45 @@ def test_operation_is_single_use_and_outcome_is_guarded(tmp_path: Path) -> None:
     with pytest.raises(ContextError, match="only be consumed once"):
         asyncio.run(collect_async(operation.statuses()))
     archive.close()
+
+
+def test_preserve_prefix_checks_capacity_without_compaction(tmp_path: Path) -> None:
+    provider = ScriptedAsyncProvider([])
+    archive, manager = started_manager(tmp_path, provider)
+    small = request((ChatMessage("user", "hello"),))
+
+    statuses, outcome = consume(manager.prepare(small, preserve_prefix=True))
+    assert statuses == []
+    assert outcome.request is small
+    assert outcome.messages is small.messages
+
+    large = request(large_history())
+    statuses, outcome = consume(manager.prepare(large, preserve_prefix=True))
+    assert statuses == []
+    assert outcome.request is None
+    assert outcome.messages is large.messages
+    assert outcome.failure_kind.value == "capacity"
+    assert provider.calls == []
+    archive.close()
+
+
+def test_task_archives_skip_process_wide_stale_cleanup(tmp_path: Path) -> None:
+    stale = tmp_path / ".mewcode" / "context" / "stale"
+    stale.mkdir(parents=True)
+    first = ContextArchive(tmp_path, session_id_factory=lambda: "task-a")
+    second = ContextArchive(tmp_path, session_id_factory=lambda: "task-b")
+
+    first.start(skip_stale_cleanup=True)
+    second.start(skip_stale_cleanup=True)
+
+    assert stale.exists()
+    assert first.session_dir is not None and first.session_dir.exists()
+    assert second.session_dir is not None and second.session_dir.exists()
+    first.close()
+    assert second.session_dir is not None and second.session_dir.exists()
+    second.close()
+
+    root = ContextArchive(tmp_path, session_id_factory=lambda: "root")
+    root.start()
+    assert not stale.exists()
+    root.close()

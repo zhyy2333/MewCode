@@ -22,6 +22,7 @@ from mewcode.prompting import (
     PromptRunContext,
 )
 from mewcode.providers import (
+    CaptureOnlyRequestBoundary,
     DEFAULT_MAX_TOKENS,
     ChatMessage,
     LLMProvider,
@@ -29,8 +30,12 @@ from mewcode.providers import (
     ProviderError,
     ProviderFinishReason,
     TokenUsage,
+    ProviderRequestBoundary,
+    RequestSnapshotSlot,
+    bind_request_boundary,
 )
-from mewcode.tools import ToolRegistry
+from mewcode.permissions import PermissionMode
+from mewcode.tools import ToolRegistry, ToolSafety
 
 from .events import (
     AgentContextStatus,
@@ -42,6 +47,7 @@ from .events import (
 )
 from .scheduler import ToolSchedule, ToolScheduler
 from .streaming import StreamCollector
+from .control import AgentControlContext, ForkRequestSeed
 
 PLAN_FINAL_MAX_TOKENS = 8192
 
@@ -65,6 +71,7 @@ class AgentRunView:
 
 
 RunViewProvider = Callable[[], AgentRunView]
+RequestBoundaryFactory = Callable[[RequestSnapshotSlot], ProviderRequestBoundary]
 
 
 @dataclass(frozen=True)
@@ -125,6 +132,13 @@ class AgentRun:
         history_commit_sink: HistoryCommitSink | None,
         run_view_provider: RunViewProvider | None = None,
         hook_runtime: HookRuntime | None = None,
+        profile_name: str = "default",
+        permission_mode_supplier: Callable[[], PermissionMode] | None = None,
+        allowed_safety: frozenset[ToolSafety] = frozenset(
+            {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
+        ),
+        seed_request: ForkRequestSeed | None = None,
+        request_boundary_factory: RequestBoundaryFactory | None = None,
     ) -> None:
         self._run_id = run_id
         self._mode = mode
@@ -140,6 +154,15 @@ class AgentRun:
         self._history_commit_sink = history_commit_sink
         self._run_view_provider = run_view_provider
         self._hook_runtime = hook_runtime
+        self._profile_name = profile_name
+        self._permission_mode_supplier = permission_mode_supplier or (
+            lambda: PermissionMode.DEFAULT
+        )
+        self._allowed_safety = allowed_safety
+        self._seed_request = seed_request
+        self._request_boundary_factory = request_boundary_factory or (
+            lambda slot: CaptureOnlyRequestBoundary(slot)
+        )
         self._state = _State.NEW
         self._outcome: AgentRunOutcome | None = None
         self._cancel_requested = asyncio.Event()
@@ -153,7 +176,11 @@ class AgentRun:
             raise AgentRunStateError("An agent run can only be consumed once.")
         self._state = _State.RUNNING
         self._consumer_task = asyncio.current_task()
-        working_messages = self._history + [self._user_message]
+        working_messages = (
+            list(self._seed_request.request.messages) + [self._user_message]
+            if self._seed_request is not None
+            else self._history + [self._user_message]
+        )
         new_messages: list[ChatMessage] = []
         user_committed = False
         cumulative_usage = TokenUsage.zero()
@@ -182,9 +209,13 @@ class AgentRun:
                 message=f"{self._mode.value} run started",
             )
             loop_limit = (
-                self._config.plan_max_investigation_iterations + 1
-                if self._mode is AgentMode.PLAN
-                else self._config.max_iterations
+                self._seed_request.max_iterations
+                if self._seed_request is not None
+                else (
+                    self._config.plan_max_investigation_iterations + 1
+                    if self._mode is AgentMode.PLAN
+                    else self._config.max_iterations
+                )
             )
             for iteration in range(1, loop_limit + 1):
                 if self._hook_runtime is not None:
@@ -217,12 +248,15 @@ class AgentRun:
                                 iteration_context,
                                 additions=iteration_context.additions.merged(
                                     custom_instructions=getattr(view.additions, "custom_instructions", None),
+                                    agent_role=getattr(view.additions, "agent_role", None),
                                     available_skills=getattr(view.additions, "available_skills", None),
                                     active_skills=getattr(view.additions, "active_skills", None),
                                     long_term_memory=getattr(view.additions, "long_term_memory", None),
                                 ),
                             )
                     request_tools = None if plan_finalizing else iteration_tools
+                    if self._seed_request is not None and iteration == 1:
+                        request_tools = self._seed_request.request.tools
                     max_output_tokens = (
                         self._config.plan_final_max_tokens
                         if plan_finalizing
@@ -233,21 +267,34 @@ class AgentRun:
                         if plan_finalizing
                         else PromptPhase.ACTIVE
                     )
-                    prompt = self._prompt_builder.build(
-                        iteration_context,
-                        self._mode.value,
-                        phase,
-                        iteration,
+                    prompt = (
+                        self._seed_request.request.prompt
+                        if self._seed_request is not None
+                        else self._prompt_builder.build(
+                            iteration_context,
+                            self._mode.value,
+                            phase,
+                            iteration,
+                        )
                     )
                     model_request = ModelRequest(
                         prompt=prompt,
                         messages=tuple(working_messages),
                         tools=request_tools,
-                        max_output_tokens=max_output_tokens,
+                        max_output_tokens=(
+                            self._seed_request.request.max_output_tokens
+                            if self._seed_request is not None and iteration == 1
+                            else max_output_tokens
+                        ),
                     )
                     request_footprint = None
                     if self._context_manager is not None:
-                        operation = self._context_manager.prepare(model_request)
+                        operation = self._context_manager.prepare(
+                            model_request,
+                            preserve_prefix=(
+                                self._seed_request is not None and iteration == 1
+                            ),
+                        )
                         async for status in operation.statuses():
                             yield AgentContextStatus(
                                 self._run_id,
@@ -288,9 +335,12 @@ class AgentRun:
                             return
                         model_request = preparation.request
                         request_footprint = preparation.footprint
-                    source = self._provider.stream_reply(model_request)
-                    async for event in collector.events(source, cumulative_usage):
-                        yield event
+                    snapshot_slot = RequestSnapshotSlot()
+                    boundary = self._request_boundary_factory(snapshot_slot)
+                    with bind_request_boundary(boundary):
+                        source = self._provider.stream_reply(model_request)
+                        async for event in collector.events(source, cumulative_usage):
+                            yield event
                 except asyncio.CancelledError:
                     self._cancel_requested.set()
                     yield self._finish(
@@ -441,11 +491,27 @@ class AgentRun:
                 )
                 consecutive_unknown = consecutive_unknown + 1 if all_unknown else 0
 
+                parent_request = snapshot_slot.request
+                control_context = (
+                    AgentControlContext(
+                        run_id=self._run_id,
+                        iteration=iteration,
+                        mode=self._mode,
+                        profile_name=self._profile_name,
+                        permission_mode=self._permission_mode_supplier(),
+                        max_iterations=loop_limit,
+                        allowed_safety=self._allowed_safety,
+                        parent_request=parent_request,
+                    )
+                    if parent_request is not None
+                    else None
+                )
                 schedule = self._scheduler.schedule(
                     self._run_id,
                     iteration,
                     response.tool_calls,
                     iteration_tools,
+                    control_context,
                 )
                 self._active_schedule = schedule
                 try:
@@ -643,6 +709,12 @@ class AgentRunner:
         id_factory: Callable[[], str] | None = None,
         context_manager: ContextManager | None = None,
         hook_runtime: HookRuntime | None = None,
+        profile_name: str = "default",
+        permission_mode_supplier: Callable[[], PermissionMode] | None = None,
+        allowed_safety: frozenset[ToolSafety] = frozenset(
+            {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
+        ),
+        request_boundary_factory: RequestBoundaryFactory | None = None,
     ) -> None:
         self._provider = provider
         self._scheduler = scheduler
@@ -653,6 +725,12 @@ class AgentRunner:
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._context_manager = context_manager
         self._hook_runtime = hook_runtime
+        self._profile_name = profile_name
+        self._permission_mode_supplier = permission_mode_supplier or (
+            lambda: PermissionMode.DEFAULT
+        )
+        self._allowed_safety = allowed_safety
+        self._request_boundary_factory = request_boundary_factory
 
     def start(
         self,
@@ -663,7 +741,18 @@ class AgentRunner:
         prompt_context: PromptRunContext | None = None,
         history_commit_sink: HistoryCommitSink | None = None,
         run_view_provider: RunViewProvider | None = None,
+        seed_request: ForkRequestSeed | None = None,
+        allowed_safety: frozenset[ToolSafety] | None = None,
     ) -> AgentRun:
+        if seed_request is not None:
+            if not user_text.strip():
+                raise ValueError("A fork task must not be empty.")
+            if seed_request.profile_name != self._profile_name:
+                raise ValueError(
+                    "The fork request profile does not match this AgentRunner."
+                )
+            if allowed_safety is None:
+                allowed_safety = seed_request.allowed_safety
         return AgentRun(
             run_id=self._id_factory(),
             mode=mode,
@@ -679,4 +768,11 @@ class AgentRunner:
             history_commit_sink=history_commit_sink,
             run_view_provider=run_view_provider,
             hook_runtime=self._hook_runtime,
+            profile_name=self._profile_name,
+            permission_mode_supplier=self._permission_mode_supplier,
+            allowed_safety=(
+                self._allowed_safety if allowed_safety is None else allowed_safety
+            ),
+            seed_request=seed_request,
+            request_boundary_factory=self._request_boundary_factory,
         )

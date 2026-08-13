@@ -11,6 +11,7 @@ from mewcode.permissions import (
     PermissionDecision,
     PermissionOutcome,
     PermissionPreflight,
+    PermissionSource,
 )
 from mewcode.hooks import HookEvent, HookRuntime, make_event
 from mewcode.matching import MatchSubjectKind
@@ -30,7 +31,13 @@ from .events import (
     AgentProgress,
     AgentToolResult,
 )
-from .control import AgentControlOperation, AgentControlTool
+from .control import (
+    AgentControlContext,
+    AgentControlOperation,
+    AgentControlTool,
+    AllowAllToolExecutionPolicy,
+    ToolExecutionPolicy,
+)
 
 
 class ToolScheduleStateError(RuntimeError):
@@ -58,6 +65,8 @@ class ToolSchedule:
         max_read_concurrency: int,
         prompt_id_factory: Callable[[], str],
         hook_runtime: HookRuntime | None = None,
+        policy: ToolExecutionPolicy | None = None,
+        control_context: AgentControlContext | None = None,
     ) -> None:
         self._run_id = run_id
         self._iteration = iteration
@@ -67,6 +76,8 @@ class ToolSchedule:
         self._max_read_concurrency = max_read_concurrency
         self._prompt_id_factory = prompt_id_factory
         self._hook_runtime = hook_runtime
+        self._policy = policy or AllowAllToolExecutionPolicy()
+        self._control_context = control_context
         self._state = _State.NEW
         self._executions: tuple[ToolExecution, ...] | None = None
         self._cancel_requested = asyncio.Event()
@@ -120,6 +131,25 @@ class ToolSchedule:
                         yield self._result_event(execution)
                         continue
 
+                    policy_decision = self._policy.evaluate(validated, preflight)
+                    if not policy_decision.allowed:
+                        denied = PermissionDecision(
+                            PermissionOutcome.DENY,
+                            preflight.target if preflight is not None else None,
+                            PermissionSource.SUBAGENT_POLICY,
+                            policy_decision.reason or "Subagent tool policy denied this call.",
+                        )
+                        yield self._decision_event(request, denied)
+                        execution = ToolExecution(
+                            index,
+                            request,
+                            _permission_denied_result(request, denied),
+                        )
+                        await self._dispatch_after(execution, "denied", preflight)
+                        completed.append(execution)
+                        yield self._result_event(execution)
+                        continue
+
                     hook_denial = await self._dispatch_before(validated, preflight)
                     if hook_denial is not None:
                         execution = ToolExecution(
@@ -131,7 +161,10 @@ class ToolSchedule:
                         continue
 
                     if isinstance(validated.tool, AgentControlTool):
-                        operation = validated.tool.control_operation(request.arguments)
+                        operation = validated.tool.control_operation(
+                            request.arguments,
+                            self._control_context,
+                        )
                         self._active_control = operation
                         try:
                             async for event in operation.events():
@@ -480,6 +513,7 @@ class ToolScheduler:
         max_read_concurrency: int = 4,
         prompt_id_factory: Callable[[], str] | None = None,
         hook_runtime: HookRuntime | None = None,
+        policy: ToolExecutionPolicy | None = None,
     ) -> None:
         if max_read_concurrency < 1:
             raise ValueError("max_read_concurrency must be at least 1")
@@ -487,6 +521,7 @@ class ToolScheduler:
         self._max_read_concurrency = max_read_concurrency
         self._prompt_id_factory = prompt_id_factory or (lambda: str(uuid4()))
         self._hook_runtime = hook_runtime
+        self._policy = policy or AllowAllToolExecutionPolicy()
 
     def schedule(
         self,
@@ -494,6 +529,7 @@ class ToolScheduler:
         iteration: int,
         requests: Sequence[ToolCallRequest],
         registry: ToolRegistry,
+        control_context: AgentControlContext | None = None,
     ) -> ToolSchedule:
         return ToolSchedule(
             run_id=run_id,
@@ -504,6 +540,8 @@ class ToolScheduler:
             max_read_concurrency=self._max_read_concurrency,
             prompt_id_factory=self._prompt_id_factory,
             hook_runtime=self._hook_runtime,
+            policy=self._policy,
+            control_context=control_context,
         )
 
 

@@ -7,17 +7,20 @@ from pathlib import Path
 import pytest
 
 from mewcode.agent import (
+    AgentControlContext,
     AgentContextStatus,
     AgentMode,
     AgentProgress,
     AgentRunConfig,
     AgentRunStateError,
     AgentStopped,
+    AgentSubagentProgress,
     AgentTextDelta,
     AgentTokenUsage,
     AgentToolCall,
     AgentToolResult,
     AgentRunner,
+    ForkRequestSeed,
     StopReason,
     ToolScheduler,
 )
@@ -27,7 +30,7 @@ from mewcode.context import (
     ContextConfig,
     ContextManager,
 )
-from mewcode.prompting import PromptAdditions, PromptRunContext
+from mewcode.prompting import PromptAdditions, PromptPackage, PromptRunContext
 from mewcode.providers import (
     ChatMessage,
     ModelResponse,
@@ -40,7 +43,10 @@ from mewcode.providers import (
     ProviderToolCall,
     ProviderUsage,
     TokenUsage,
+    RequestBoundaryProvider,
 )
+from mewcode.permissions import PermissionMode
+from mewcode.tools import PermissionTargetKind, ToolPermissionSpec
 from mewcode.tools import ToolExecution, ToolRegistry, ToolResult, ToolSafety
 
 from tests.fakes import (
@@ -59,6 +65,37 @@ def _runner(provider, *, max_iterations: int = 20, unknown_limit: int = 3):
         AgentRunConfig(max_iterations, unknown_limit),
         id_factory=lambda: "run-1",
     )
+
+
+class RecordingControlOperation:
+    def __init__(self) -> None:
+        self.result = ToolResult(True, "delegate", "ok")
+        self.cancelled = False
+
+    async def events(self):
+        if False:
+            yield AgentProgress("", 0, "run_started")
+
+    async def cancel(self) -> None:
+        self.cancelled = True
+
+
+class RecordingControlTool:
+    name = "delegate"
+    description = "record the Agent control context"
+    parameters_schema = {"type": "object", "properties": {}}
+    safety = ToolSafety.READ_ONLY
+    permission_spec = ToolPermissionSpec(None, PermissionTargetKind.TOOL, "delegate")
+
+    def __init__(self) -> None:
+        self.contexts: list[AgentControlContext | None] = []
+
+    def control_operation(self, arguments, context):
+        self.contexts.append(context)
+        return RecordingControlOperation()
+
+    async def execute(self, arguments):
+        raise AssertionError("control tools execute through control_operation")
 
 
 class RecordingHistorySink:
@@ -91,6 +128,125 @@ def _summary_response(path: str) -> str:
         "<analysis_draft>draft</analysis_draft>"
         f"<formal_summary>{body}</formal_summary>"
     )
+
+
+def test_control_tool_receives_the_actual_provider_request() -> None:
+    inner = ScriptedAsyncProvider(
+        [
+            [ProviderToolCall(tool_call("call-1", "delegate"))],
+            [ProviderTextDelta("done")],
+        ]
+    )
+    provider = RequestBoundaryProvider(inner)
+    tool = RecordingControlTool()
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        AgentRunConfig(max_iterations=7),
+        id_factory=lambda: "run-1",
+        profile_name="main",
+        permission_mode_supplier=lambda: PermissionMode.STRICT,
+        allowed_safety=frozenset({ToolSafety.READ_ONLY}),
+    )
+
+    run = runner.start([], "inspect", ToolRegistry([tool]))
+    asyncio.run(collect_async(run.events()))
+
+    assert len(tool.contexts) == 1
+    context = tool.contexts[0]
+    assert context is not None
+    assert context.run_id == "run-1"
+    assert context.iteration == 1
+    assert context.profile_name == "main"
+    assert context.permission_mode is PermissionMode.STRICT
+    assert context.max_iterations == 7
+    assert context.allowed_safety == frozenset({ToolSafety.READ_ONLY})
+    assert context.parent_request is inner.calls[0]
+
+
+def test_missing_request_boundary_does_not_synthesize_a_parent_request() -> None:
+    inner = ScriptedAsyncProvider(
+        [
+            [ProviderToolCall(tool_call("call-1", "delegate"))],
+            [ProviderTextDelta("done")],
+        ]
+    )
+    tool = RecordingControlTool()
+
+    run = _runner(inner).start([], "inspect", ToolRegistry([tool]))
+    asyncio.run(collect_async(run.events()))
+
+    assert tool.contexts == [None]
+
+
+def test_fork_seed_preserves_first_request_prefix_and_uses_its_loop_limit() -> None:
+    parent_tools = ToolRegistry([ControlledTool("read-parent")])
+    child_tools = ToolRegistry([ControlledTool("read-child")])
+    parent = ModelRequest(
+        prompt=PromptPackage("stable-parent", "dynamic-parent"),
+        messages=(ChatMessage("user", "old"), ChatMessage("assistant", "answer")),
+        tools=parent_tools,
+        max_output_tokens=1234,
+    )
+    seed = ForkRequestSeed(
+        "main",
+        parent,
+        "parent-run",
+        3,
+        PermissionMode.DEFAULT,
+        4,
+        frozenset({ToolSafety.READ_ONLY}),
+    )
+    provider = ScriptedAsyncProvider([[ProviderTextDelta("done")]])
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController()),
+        id_factory=lambda: "child-run",
+        profile_name="main",
+    )
+
+    run = runner.start([], "new task", child_tools, seed_request=seed)
+    asyncio.run(collect_async(run.events()))
+
+    first = provider.calls[0]
+    assert first.prompt is parent.prompt
+    assert first.messages == parent.messages + (ChatMessage("user", "new task"),)
+    assert first.tools is parent_tools
+    assert first.max_output_tokens == 1234
+
+
+def test_fork_seed_rejects_empty_task_and_profile_mismatch() -> None:
+    parent = ModelRequest(
+        prompt=PromptPackage("stable", "dynamic"),
+        messages=(),
+    )
+    seed = ForkRequestSeed(
+        "other",
+        parent,
+        "parent-run",
+        1,
+        PermissionMode.DEFAULT,
+        2,
+        frozenset({ToolSafety.READ_ONLY}),
+    )
+    runner = AgentRunner(
+        ScriptedAsyncProvider([]),
+        ToolScheduler(AllowAllPermissionController()),
+        profile_name="main",
+    )
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        runner.start([], "   ", ToolRegistry([]), seed_request=seed)
+    with pytest.raises(ValueError, match="profile"):
+        runner.start([], "task", ToolRegistry([]), seed_request=seed)
+
+
+def test_subagent_progress_event_is_bounded_and_contains_no_child_payload() -> None:
+    event = AgentSubagentProgress("task-1", "foreground", "running", "working")
+    assert event.task_id == "task-1"
+    assert set(event.__dict__) == {"task_id", "placement", "status", "message"}
+    with pytest.raises(ValueError, match="1024"):
+        AgentSubagentProgress("task-1", "background", "running", "x" * 1025)
 
 
 def test_completed_without_tools() -> None:

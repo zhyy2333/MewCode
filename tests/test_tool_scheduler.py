@@ -3,7 +3,12 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-from mewcode.agent import AgentProgress, AgentToolResult, ToolScheduler
+from mewcode.agent import (
+    AgentProgress,
+    AgentToolResult,
+    ToolPolicyDecision,
+    ToolScheduler,
+)
 from mewcode.hooks.models import (
     CommandHookAction,
     HookActionOutcome,
@@ -259,6 +264,16 @@ class DecisionExecutor:
         return None
 
 
+class RecordingExecutionPolicy:
+    def __init__(self, allowed: bool, log: list[str]) -> None:
+        self.allowed = allowed
+        self.log = log
+
+    def evaluate(self, call, preflight):
+        self.log.append("subagent-policy")
+        return ToolPolicyDecision(self.allowed, "frozen task policy")
+
+
 def _tool_hook_runtime(tmp_path: Path, executor: DecisionExecutor) -> HookRuntime:
     before = HookRule(
         HookRuleKey(HookSource.USER, Path("h"), 0),
@@ -324,6 +339,33 @@ def test_hard_preflight_runs_before_hook_and_hides_arguments(tmp_path: Path) -> 
     asyncio.run(collect_async(schedule.events()))
     assert controller.log == ["preflight"]
     assert log == []
+    assert schedule.executions[0].result.metadata["permission_denied"] is True
+
+
+def test_subagent_policy_runs_after_hard_preflight_and_before_hook(tmp_path: Path) -> None:
+    hook_log: list[str] = []
+    policy_log: list[str] = []
+    controller = TwoStagePermissionController()
+    runtime = _tool_hook_runtime(
+        tmp_path,
+        DecisionExecutor(HookActionOutcome(HookOutcomeKind.SUCCESS), hook_log),
+    )
+    tool = ControlledTool("write", ToolSafety.SIDE_EFFECT)
+    schedule = ToolScheduler(
+        controller,
+        hook_runtime=runtime,
+        policy=RecordingExecutionPolicy(False, policy_log),
+    ).schedule("run", 1, [tool_call("1", "write")], ToolRegistry([tool]))
+
+    events = asyncio.run(collect_async(schedule.events()))
+
+    assert controller.log == ["preflight"]
+    assert policy_log == ["subagent-policy"]
+    assert hook_log == []
+    assert tool.calls == []
+    assert runtime.consume_prompt_context() == ("after-fired",)
+    decisions = [event for event in events if hasattr(event, "source")]
+    assert decisions[0].source is PermissionSource.SUBAGENT_POLICY
     assert schedule.executions[0].result.metadata["permission_denied"] is True
 
 

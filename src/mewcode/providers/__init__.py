@@ -22,6 +22,13 @@ from .base import (
     create_provider,
 )
 from .usage import UsageLedger, UsageSnapshot, UsageTrackingProvider
+from .request_boundary import (
+    CaptureOnlyRequestBoundary,
+    ProviderRequestBoundary,
+    RequestBoundaryProvider,
+    RequestSnapshotSlot,
+    bind_request_boundary,
+)
 
 __all__ = [
     "DEFAULT_MAX_TOKENS",
@@ -48,4 +55,9 @@ __all__ = [
     "UsageLedger",
     "UsageSnapshot",
     "UsageTrackingProvider",
+    "CaptureOnlyRequestBoundary",
+    "ProviderRequestBoundary",
+    "RequestBoundaryProvider",
+    "RequestSnapshotSlot",
+    "bind_request_boundary",
 ]

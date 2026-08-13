@@ -106,6 +106,8 @@ ProgressPhase = Literal[
     "tool_batch_completed",
 ]
 
+MAX_SUBAGENT_PROGRESS_CHARS = 1024
+
 
 @dataclass(frozen=True)
 class AgentProgress:
@@ -115,6 +117,21 @@ class AgentProgress:
     completed: int | None = None
     total: int | None = None
     message: str = ""
+
+
+@dataclass(frozen=True)
+class AgentSubagentProgress:
+    task_id: str
+    placement: Literal["foreground", "background"]
+    status: str
+    message: str = ""
+
+    def __post_init__(self) -> None:
+        if len(self.message) > MAX_SUBAGENT_PROGRESS_CHARS:
+            raise ValueError(
+                "Subagent progress messages must not exceed "
+                f"{MAX_SUBAGENT_PROGRESS_CHARS} characters."
+            )
 
 
 @dataclass(frozen=True)
@@ -137,5 +154,6 @@ AgentEvent = (
     | AgentContextStatus
     | AgentContinuityStatus
     | AgentProgress
+    | AgentSubagentProgress
     | AgentStopped
 )

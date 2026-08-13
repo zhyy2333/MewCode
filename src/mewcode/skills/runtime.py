@@ -198,6 +198,8 @@ class SkillRuntime:
         scoped = (*shared, *((isolated,) if isolated is not None else ()))
         package_registry = ToolRegistry(tool for item in scoped for tool in item.tools)
         base = self._global_tools
+        if isolated is not None:
+            base = base.without({"agent"})
         if loader_tool is not None:
             base = base.without({"load_skill"}).merge(ToolRegistry([loader_tool]))
         combined = base.merge(package_registry)
@@ -206,6 +208,8 @@ class SkillRuntime:
                 name for item in scoped for name in item.definition.tools
             }
             names.add("load_skill")
+            if isolated is None and "agent" in combined.names:
+                names.add("agent")
             combined = combined.select_names(names)
         safe = combined.select_safety(allowed_safety)
         loader = combined.select_names({"load_skill"})

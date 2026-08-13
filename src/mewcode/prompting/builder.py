@@ -32,6 +32,7 @@ class PromptBuilder:
         dynamic_content = {
             "environment": render_environment(self._environment_provider.get()),
             "custom_instructions": additions.custom_instructions,
+            "agent_role": additions.agent_role,
             "available_skills": additions.available_skills,
             "active_skills": _active_skills(additions),
             "long_term_memory": additions.long_term_memory,

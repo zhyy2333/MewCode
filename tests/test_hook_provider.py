@@ -18,7 +18,15 @@ from mewcode.hooks.models import (
 from mewcode.hooks.provider import HookedProvider
 from mewcode.hooks.runtime import HookRuntime
 from mewcode.prompting import PromptPackage
-from mewcode.providers import ModelRequest, ProviderError, ProviderTextDelta
+from mewcode.providers import (
+    CaptureOnlyRequestBoundary,
+    ModelRequest,
+    ProviderError,
+    ProviderTextDelta,
+    RequestBoundaryProvider,
+    RequestSnapshotSlot,
+    bind_request_boundary,
+)
 from fakes import ScriptedAsyncProvider, collect_async
 
 
@@ -53,6 +61,51 @@ def test_before_prompt_is_injected_into_current_request(tmp_path: Path) -> None:
     assert "## Hook Context" in provider.calls[0].prompt.dynamic_system
     assert "injected" in provider.calls[0].prompt.dynamic_system
     assert request.prompt.dynamic_system == "dynamic"
+
+
+def test_request_boundary_observes_hook_injection(tmp_path: Path) -> None:
+    inner = ScriptedAsyncProvider([[ProviderTextDelta("ok")]])
+    hooked = HookedProvider(RequestBoundaryProvider(inner), _runtime(tmp_path), "main")
+    slot = RequestSnapshotSlot()
+
+    with bind_request_boundary(CaptureOnlyRequestBoundary(slot)):
+        asyncio.run(
+            collect_async(
+                hooked.stream_reply(ModelRequest(PromptPackage("stable", "dynamic"), ()))
+            )
+        )
+
+    assert slot.request is inner.calls[0]
+    assert "## Hook Context" in slot.request.prompt.dynamic_system
+    assert "injected" in slot.request.prompt.dynamic_system
+
+
+def test_subagent_provider_consumes_only_its_partition_and_defers_fork_prefix(
+    tmp_path: Path,
+) -> None:
+    inner = ScriptedAsyncProvider(
+        [[ProviderTextDelta("first")], [ProviderTextDelta("second")]]
+    )
+    runtime = _runtime(tmp_path)
+    hooked = HookedProvider(inner, runtime, "main")
+    request = ModelRequest(PromptPackage("stable", "dynamic"), ())
+
+    async def scenario() -> None:
+        with runtime.bind_scope(
+            subagent_task_id="task-a",
+            parent_run_id="parent",
+            component="subagent",
+            preserve_fork_prefix=True,
+        ):
+            await collect_async(hooked.stream_reply(request))
+            await collect_async(hooked.stream_reply(request))
+
+    asyncio.run(scenario())
+
+    assert "## Hook Context" not in inner.calls[0].prompt.dynamic_system
+    assert "## Hook Context" in inner.calls[1].prompt.dynamic_system
+    assert runtime.consume_prompt_context() == ()
+    assert runtime.consume_prompt_context("task-a") == ()
 
 
 def test_empty_runtime_passes_original_request_object(tmp_path: Path) -> None:

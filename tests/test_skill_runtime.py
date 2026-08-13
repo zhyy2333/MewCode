@@ -11,6 +11,8 @@ from mewcode.skills import (
     discover_sources,
 )
 from mewcode.tools import ToolRegistry
+from mewcode.tools import ToolSafety
+from tests.fakes import ControlledTool
 
 
 class Binding:
@@ -130,3 +132,32 @@ def test_activation_rejects_same_length_body_change_before_refresh(tmp_path: Pat
 
     with pytest.raises(SkillDefinitionError, match="changed before"):
         runtime.activate("sample")
+
+
+def test_root_view_keeps_agent_but_isolated_view_never_exposes_it(
+    tmp_path: Path,
+) -> None:
+    roots = SkillRoots(tmp_path / "p", tmp_path / "u", tmp_path / "b")
+    _write(roots.project, "shared", "Shared body")
+    _write(roots.project, "private", "Private body", "isolated")
+    agent = ControlledTool("agent")
+    runtime = SkillRuntime(_catalog(roots), tmp_path, ToolRegistry([agent]))
+
+    assert runtime.run_view({ToolSafety.READ_ONLY}).tools.get("agent") is agent
+
+    runtime.activate("shared")
+    assert runtime.run_view({ToolSafety.READ_ONLY}).tools.get("agent") is agent
+
+    runtime.activate("private")
+    isolated = runtime.run_view(
+        {ToolSafety.READ_ONLY}, isolated_name="private"
+    )
+    assert "agent" not in isolated.tools.names
+
+
+def test_run_view_does_not_create_agent_when_global_registry_lacks_it(
+    tmp_path: Path,
+) -> None:
+    roots = SkillRoots(tmp_path / "p", tmp_path / "u", tmp_path / "b")
+    runtime = SkillRuntime(_catalog(roots), tmp_path, ToolRegistry([]))
+    assert "agent" not in runtime.run_view({ToolSafety.READ_ONLY}).tools.names

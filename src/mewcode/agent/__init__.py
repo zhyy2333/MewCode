@@ -6,6 +6,7 @@ from .events import (
     AgentPermissionDecision,
     AgentPermissionRequest,
     AgentProgress,
+    AgentSubagentProgress,
     AgentStopped,
     AgentTextDelta,
     AgentTokenUsage,
@@ -24,7 +25,15 @@ from .runner import (
     AgentRunner,
     HistoryCommitSink,
 )
-from .control import AgentControlOperation, AgentControlTool
+from .control import (
+    AgentControlContext,
+    AgentControlOperation,
+    AgentControlTool,
+    AllowAllToolExecutionPolicy,
+    ForkRequestSeed,
+    ToolExecutionPolicy,
+    ToolPolicyDecision,
+)
 
 __all__ = [
     "AgentEvent",
@@ -34,10 +43,14 @@ __all__ = [
     "AgentPermissionDecision",
     "AgentPermissionRequest",
     "AgentProgress",
+    "AgentSubagentProgress",
     "AgentRun",
     "AgentRunView",
     "AgentControlOperation",
+    "AgentControlContext",
     "AgentControlTool",
+    "AllowAllToolExecutionPolicy",
+    "ForkRequestSeed",
     "AgentRunConfig",
     "AgentRunOutcome",
     "AgentRunStateError",
@@ -54,4 +67,6 @@ __all__ = [
     "ToolSchedule",
     "ToolScheduleStateError",
     "ToolScheduler",
+    "ToolExecutionPolicy",
+    "ToolPolicyDecision",
 ]

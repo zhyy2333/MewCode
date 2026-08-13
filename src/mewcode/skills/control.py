@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mewcode.agent import AgentControlOperation
+from mewcode.agent import AgentControlContext, AgentControlOperation
 from mewcode.tools import (
     PermissionTargetKind,
     ToolPermissionSpec,
@@ -31,7 +31,11 @@ class LoadSkillTool:
     def __init__(self, coordinator: SkillCoordinator) -> None:
         self._coordinator = coordinator
 
-    def control_operation(self, arguments: dict[str, object]) -> AgentControlOperation:
+    def control_operation(
+        self,
+        arguments: dict[str, object],
+        context: AgentControlContext | None,
+    ) -> AgentControlOperation:
         name = arguments.get("name")
         input_text = arguments.get("input", "")
         return self._coordinator.invoke(
