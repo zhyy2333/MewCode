@@ -281,7 +281,13 @@ class Repl:
     async def _consume(self, source: AsyncIterator[AgentEvent]) -> None:
         renderer = _EventRenderer()
         iterator = source.__aiter__()
-        event_task = asyncio.create_task(_next_agent_event(iterator))
+        event_queue: asyncio.Queue[tuple[bool, AgentEvent | BaseException]] = (
+            asyncio.Queue(maxsize=1)
+        )
+        event_producer = asyncio.create_task(
+            _pump_agent_events(iterator, event_queue)
+        )
+        event_task = asyncio.create_task(event_queue.get())
         control_reader = getattr(self._terminal, "read_run_control", None)
         control_task = (
             asyncio.create_task(_next_run_control(control_reader))
@@ -311,7 +317,7 @@ class Repl:
                             await asyncio.gather(control_task, return_exceptions=True)
                             control_task = None
                         await self._handle_permission_request(event)
-                        event_task = asyncio.create_task(_next_agent_event(iterator))
+                        event_task = asyncio.create_task(event_queue.get())
                         if control_reader is not None:
                             control_task = asyncio.create_task(
                                 _next_run_control(control_reader)
@@ -320,7 +326,7 @@ class Repl:
                     text = renderer.render(event)
                     if text is not None:
                         self._terminal.write(text)
-                    event_task = asyncio.create_task(_next_agent_event(iterator))
+                    event_task = asyncio.create_task(event_queue.get())
                 if control_task is not None and control_task in done:
                     has_control, value = control_task.result()
                     control_task = None
@@ -342,7 +348,7 @@ class Repl:
         finally:
             pending = [
                 task
-                for task in (event_task, control_task)
+                for task in (event_task, control_task, event_producer)
                 if task is not None and not task.done()
             ]
             for task in pending:
@@ -542,11 +548,25 @@ def _indent_lines(text: str) -> str:
     return "".join(f"  {line}" for line in text.splitlines(keepends=True))
 
 
-async def _next_agent_event(iterator):
+async def _pump_agent_events(
+    iterator: AsyncIterator[AgentEvent],
+    queue: asyncio.Queue[tuple[bool, AgentEvent | BaseException]],
+) -> None:
     try:
-        return True, await anext(iterator)
+        while True:
+            try:
+                event = await anext(iterator)
+            except StopAsyncIteration as exc:
+                await queue.put((False, exc))
+                return
+            await queue.put((True, event))
+    except asyncio.CancelledError:
+        close = getattr(iterator, "aclose", None)
+        if close is not None:
+            await close()
+        raise
     except BaseException as exc:
-        return False, exc
+        await queue.put((False, exc))
 
 
 async def _next_run_control(reader):

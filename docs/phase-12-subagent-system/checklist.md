@@ -151,3 +151,10 @@
 - `python -m pytest -q`：退出码 0，936 passed，14.35s；无跳过、失败或警告摘要。
 - 通用层反向依赖与子系统核心层交互依赖两项 `rg` 检查均无匹配；内置和示例角色由生产解析器测试通过。
 - `git diff --check` 与工作区状态检查在最终提交前执行；用户原有 `examples/hooks.yaml` 和已跟踪 `__pycache__` 改动不纳入本阶段提交。
+
+### 异步 ContextVar 缺陷回归（2026-08-13）
+
+- REPL 使用单一 producer Task 连续推进 Agent 异步事件流；逐事件调度与控制键竞速不再跨 Task 调用 `anext()`。
+- 回归用例在同一生成器中绑定真实 RequestBoundary 与 Hook scope，验证连续事件和最终清理发生在同一 Task Context。
+- `python -m pytest tests/test_repl.py tests/test_agent_runner.py tests/test_request_boundary.py tests/test_hook_runtime.py tests/test_hook_provider.py tests/test_subagent_runtime.py tests/test_subagent_control.py tests/test_conversation.py -q`：退出码 0，154 passed，1.56s。
+- `python -m pytest -q`：退出码 0，937 passed，15.01s。

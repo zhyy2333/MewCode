@@ -33,12 +33,15 @@ from mewcode.permissions import (
     PermissionSource,
 )
 from mewcode.providers import (
+    CaptureOnlyRequestBoundary,
     ConfigError,
     ProviderError,
     ProviderProfile,
     RequestBoundaryProvider,
+    RequestSnapshotSlot,
     TokenUsage,
     UsageTrackingProvider,
+    bind_request_boundary,
 )
 from mewcode.repl import Repl
 from mewcode.tools import ToolCallRequest, ToolExecution, ToolResult
@@ -198,6 +201,42 @@ def test_consume_races_ctrl_b_without_interrupting_agent_events() -> None:
     assert conversation.detaches == 1
     assert any("moved to background" in item for item in terminal.output)
     assert any("working - safe" in item for item in terminal.output)
+
+
+def test_consume_keeps_async_generator_contextvars_in_one_task(tmp_path: Path) -> None:
+    class Terminal:
+        def __init__(self):
+            self.output = []
+
+        def write(self, text):
+            self.output.append(text)
+
+        def write_error(self, text):
+            self.output.append(text)
+
+    async def scenario():
+        terminal = Terminal()
+        hook_runtime = HookRuntime.empty(tmp_path, "context-task")
+        boundary = CaptureOnlyRequestBoundary(RequestSnapshotSlot())
+        task_ids = []
+
+        async def source():
+            with hook_runtime.bind_scope(component="regression"):
+                with bind_request_boundary(boundary):
+                    task_ids.append(id(asyncio.current_task()))
+                    yield AgentTextDelta("run", 1, "first")
+                    task_ids.append(id(asyncio.current_task()))
+                    assert hook_runtime.scope["component"] == "regression"
+                    yield stop_event()
+
+        await Repl(FakeConversation(), terminal=terminal)._consume(source())
+        await hook_runtime.close()
+        return terminal, task_ids
+
+    terminal, task_ids = asyncio.run(scenario())
+
+    assert task_ids[0] == task_ids[1]
+    assert "first" in "".join(terminal.output)
 
 
 def test_terminal_monitor_drains_last_subagent_event_during_close() -> None:
