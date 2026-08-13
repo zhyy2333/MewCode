@@ -139,6 +139,7 @@ class AgentRun:
         ),
         seed_request: ForkRequestSeed | None = None,
         request_boundary_factory: RequestBoundaryFactory | None = None,
+        hook_component: str = "agent",
     ) -> None:
         self._run_id = run_id
         self._mode = mode
@@ -163,6 +164,7 @@ class AgentRun:
         self._request_boundary_factory = request_boundary_factory or (
             lambda slot: CaptureOnlyRequestBoundary(slot)
         )
+        self._hook_component = hook_component
         self._state = _State.NEW
         self._outcome: AgentRunOutcome | None = None
         self._cancel_requested = asyncio.Event()
@@ -193,7 +195,7 @@ class AgentRun:
             self._hook_runtime.bind_scope(
                 run_id=self._run_id,
                 mode=self._mode.value,
-                component="agent",
+                component=self._hook_component,
             )
             if self._hook_runtime is not None
             else None
@@ -715,6 +717,7 @@ class AgentRunner:
             {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
         ),
         request_boundary_factory: RequestBoundaryFactory | None = None,
+        hook_component: str = "agent",
     ) -> None:
         self._provider = provider
         self._scheduler = scheduler
@@ -731,6 +734,7 @@ class AgentRunner:
         )
         self._allowed_safety = allowed_safety
         self._request_boundary_factory = request_boundary_factory
+        self._hook_component = hook_component
 
     def start(
         self,
@@ -775,4 +779,5 @@ class AgentRunner:
             ),
             seed_request=seed_request,
             request_boundary_factory=self._request_boundary_factory,
+            hook_component=self._hook_component,
         )

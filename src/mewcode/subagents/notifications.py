@@ -3,7 +3,10 @@ from __future__ import annotations
 from collections import deque
 from collections.abc import Callable
 from html import escape
+from dataclasses import replace
 
+from mewcode.prompting import PromptPackage
+from mewcode.providers import ModelRequest, RequestSnapshotSlot
 from mewcode.providers import TokenUsage
 
 from .models import (
@@ -16,6 +19,33 @@ from .models import (
 
 
 DeliveredCallback = Callable[[str], object]
+
+
+class RootAgentRequestBoundary:
+    def __init__(
+        self,
+        notifications: SubagentNotificationQueue,
+        slot: RequestSnapshotSlot,
+    ) -> None:
+        self._notifications = notifications
+        self._slot = slot
+
+    def prepare(self, request: ModelRequest) -> ModelRequest:
+        batch = self._notifications.consume_batch()
+        actual = request
+        if batch.notifications:
+            dynamic = request.prompt.dynamic_system
+            combined = (
+                f"{dynamic}\n\n{batch.rendered_system_section}"
+                if dynamic
+                else batch.rendered_system_section
+            )
+            actual = replace(
+                request,
+                prompt=PromptPackage(request.prompt.stable_system, combined),
+            )
+        self._slot.capture(actual)
+        return actual
 
 
 class SubagentNotificationQueue:

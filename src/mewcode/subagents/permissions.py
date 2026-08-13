@@ -44,6 +44,17 @@ class SubagentPermissionController:
         store = PermissionRuleStore(snapshot, _NoPersistentWriter())
         return cls(PermissionController(PermissionTargetBuilder(workspace), store, mode))
 
+    @classmethod
+    def from_snapshot(
+        cls,
+        workspace: Workspace,
+        rule_sets: PermissionRuleSets,
+        mode: PermissionMode,
+    ) -> SubagentPermissionController:
+        snapshot = persistent_permission_snapshot(rule_sets)
+        store = PermissionRuleStore(snapshot, _NoPersistentWriter())
+        return cls(PermissionController(PermissionTargetBuilder(workspace), store, mode))
+
     @property
     def mode(self) -> PermissionMode:
         return self._controller.mode

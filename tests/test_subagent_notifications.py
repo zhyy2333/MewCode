@@ -9,8 +9,11 @@ from mewcode.subagents import (
     SubagentNotification,
     SubagentNotificationQueue,
     SubagentTaskStatus,
+    RootAgentRequestBoundary,
     render_notifications,
 )
+from mewcode.prompting import PromptPackage
+from mewcode.providers import ModelRequest, RequestSnapshotSlot
 
 
 def _notification(
@@ -104,3 +107,37 @@ def test_delivered_callback_runs_once_and_failure_isolated() -> None:
     assert [item.task_id for item in batch.notifications] == ["bad", "good"]
     assert calls == ["bad", "good"]
     assert queue.consume_batch().notifications == ()
+
+
+def test_root_request_boundary_injects_once_then_captures_final_request() -> None:
+    queue = SubagentNotificationQueue()
+    queue.enqueue_once(_notification("task"))
+    slot = RequestSnapshotSlot()
+    boundary = RootAgentRequestBoundary(queue, slot)
+    request = ModelRequest(PromptPackage("stable", "dynamic"), ())
+
+    actual = boundary.prepare(request)
+
+    assert actual is slot.request
+    assert actual is not request
+    assert actual.prompt.stable_system == "stable"
+    assert actual.messages is request.messages
+    assert actual.tools is request.tools
+    assert "dynamic\n\n## Completed Subagent Tasks" in actual.prompt.dynamic_system
+    assert queue.pending_count == 0
+
+
+def test_empty_root_boundary_is_zero_copy_and_subagent_capture_does_not_consume() -> None:
+    from mewcode.providers import CaptureOnlyRequestBoundary
+
+    queue = SubagentNotificationQueue()
+    queue.enqueue_once(_notification("task"))
+    request = ModelRequest(PromptPackage("stable", "dynamic"), ())
+    child_slot = RequestSnapshotSlot()
+    assert CaptureOnlyRequestBoundary(child_slot).prepare(request) is request
+    assert queue.pending_count == 1
+
+    queue.clear()
+    root_slot = RequestSnapshotSlot()
+    assert RootAgentRequestBoundary(queue, root_slot).prepare(request) is request
+    assert root_slot.request is request

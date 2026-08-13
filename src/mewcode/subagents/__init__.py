@@ -32,7 +32,11 @@ from .models import (
     SubagentTerminalEvent,
     TaskCancelResult,
 )
-from .notifications import SubagentNotificationQueue, render_notifications
+from .notifications import (
+    RootAgentRequestBoundary,
+    SubagentNotificationQueue,
+    render_notifications,
+)
 from .parser import parse_agent_definition
 from .paths import AgentDefinitionRoots, discover_agent_sources
 from .permissions import SubagentPermissionController, persistent_permission_snapshot
@@ -56,9 +60,13 @@ from .tasks import (
     SubagentTaskHandle,
     SubagentTaskManager,
 )
+from .runtime import SubagentRuntime, SubagentRuntimeFactory
+from .coordinator import SubagentCoordinationError, SubagentCoordinator
+from .control import AGENT_TOOL_SCHEMA, AgentTool, SubagentDelegationOperation
 
 __all__ = [
     "AGENT_NAME_PATTERN",
+    "AGENT_TOOL_SCHEMA",
     "FOREGROUND_TIMEOUT_SECONDS",
     "MAX_ACTIVE_TASKS",
     "MAX_CANDIDATES_PER_ROOT",
@@ -71,6 +79,7 @@ __all__ = [
     "MAX_SELECTED_PROMPT_BYTES",
     "MAX_TASK_BYTES",
     "NotificationBatch",
+    "RootAgentRequestBoundary",
     "TASK_CLOSE_TIMEOUT_SECONDS",
     "AgentCatalogError",
     "AgentDefinition",
@@ -80,6 +89,7 @@ __all__ = [
     "AgentDefinitionLayer",
     "AgentDefinitionRoots",
     "AgentDefinitionSource",
+    "AgentTool",
     "DEFAULT_GLOBALLY_FORBIDDEN_TOOLS",
     "DefinedToolScope",
     "FileReadObservation",
@@ -87,6 +97,9 @@ __all__ = [
     "FrozenSubagentToolPolicy",
     "SubagentPermissionController",
     "SubagentDiagnostic",
+    "SubagentDelegationOperation",
+    "SubagentCoordinationError",
+    "SubagentCoordinator",
     "SubagentDriverOutcome",
     "SubagentKind",
     "SubagentLaunch",
@@ -95,6 +108,8 @@ __all__ = [
     "SubagentParent",
     "SubagentPlacement",
     "SubagentProgress",
+    "SubagentRuntime",
+    "SubagentRuntimeFactory",
     "SubagentTaskDriver",
     "SubagentTaskHandle",
     "SubagentTaskManager",

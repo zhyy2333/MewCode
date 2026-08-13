@@ -4,15 +4,18 @@ import asyncio
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable
 import dataclasses
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import inspect
 import time
 from typing import Protocol
 from uuid import uuid4
 
-from mewcode.agent import AgentSubagentProgress
+from mewcode.agent import AgentSubagentProgress, ForkRequestSeed
+from mewcode.permissions import PermissionMode, PermissionRuleSets
+from mewcode.prompting import PromptAdditions
 from mewcode.providers import TokenUsage
+from mewcode.tools import ToolRegistry, ToolSafety
 
 from .models import (
     FOREGROUND_TIMEOUT_SECONDS,
@@ -30,8 +33,10 @@ from .models import (
     SubagentTaskStatus,
     SubagentTerminalEvent,
     TaskCancelResult,
+    AgentDefinition,
 )
 from .notifications import SubagentNotificationQueue
+from .policy import FrozenSubagentToolPolicy
 
 evolve = getattr(dataclasses, "re" + "place")
 
@@ -66,6 +71,17 @@ class SubagentLaunch:
     parent: SubagentParent
     placement: SubagentPlacement
     driver_factory: DriverFactory
+    task_text: str = ""
+    definition: AgentDefinition | None = None
+    tools: ToolRegistry = field(default_factory=lambda: ToolRegistry([]))
+    policy: FrozenSubagentToolPolicy = field(
+        default_factory=lambda: FrozenSubagentToolPolicy(frozenset(), {})
+    )
+    permission_rules: PermissionRuleSets = PermissionRuleSets()
+    permission_mode: PermissionMode = PermissionMode.DEFAULT
+    allowed_safety: frozenset[ToolSafety] = frozenset({ToolSafety.READ_ONLY})
+    additions: PromptAdditions = PromptAdditions()
+    seed: ForkRequestSeed | None = None
 
 
 @dataclass
