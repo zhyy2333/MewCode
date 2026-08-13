@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+from pathlib import Path
+from types import MappingProxyType
 
 import pytest
 
@@ -38,6 +40,16 @@ from mewcode.providers import (
 )
 from mewcode.repl import Repl
 from mewcode.tools import ToolCallRequest, ToolExecution, ToolResult
+from mewcode.hooks.models import (
+    CommandHookAction,
+    HookCatalog,
+    HookEvent,
+    HookRule,
+    HookRuleKey,
+    HookSource,
+)
+from mewcode.hooks.runtime import HookRuntime
+from mewcode.hooks.trust import WorkspaceTrustStore
 
 
 @pytest.fixture(autouse=True)
@@ -930,3 +942,43 @@ def test_cli_closes_runtime_on_keyboard_interrupt(monkeypatch) -> None:
         def run(self): raise KeyboardInterrupt
     monkeypatch.setattr(cli, "Repl", InterruptRepl)
     assert cli.main([]) == 130 and calls == ["start", "close"]
+
+
+def test_repl_resolves_project_hook_trust_before_first_input(tmp_path: Path) -> None:
+    class Executor:
+        async def execute(self, *args, **kwargs):
+            raise AssertionError("No Hook action should run before trust is resolved.")
+
+        async def close(self):
+            return None
+
+    rule = HookRule(
+        HookRuleKey(HookSource.PROJECT, tmp_path / ".mewcode" / "hooks.yaml", 0),
+        HookEvent.SESSION_START,
+        None,
+        CommandHookAction("ignored"),
+    )
+    runtime = HookRuntime(
+        HookCatalog(
+            (rule,), MappingProxyType({HookEvent.SESSION_START: (rule,)}), True
+        ),
+        Executor(),
+        workspace=tmp_path,
+        session_id="s",
+        project_trusted=None,
+    )
+    store = WorkspaceTrustStore(tmp_path / "user" / "trust.json")
+    answers = iter(["n", "/exit"])
+    output = io.StringIO()
+    repl = Repl(
+        FakeConversation(),
+        stdout=output,
+        stderr=io.StringIO(),
+        input_func=lambda _prompt: next(answers),
+        hook_runtime=runtime,
+        hook_trust_store=store,
+        workspace=tmp_path,
+    )
+    assert repl.run() == 0
+    assert store.read(tmp_path) is False
+    assert runtime.trust_required is False

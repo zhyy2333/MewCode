@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import sys
 from pathlib import Path
 from types import MappingProxyType
@@ -57,6 +58,16 @@ from .providers import (
 from .repl import Repl
 from .terminal import PromptToolkitTerminal
 from .tools import ToolRegistry, Workspace, create_builtin_registry
+from .hooks import (
+    HookActionExecutor,
+    HookConfigError,
+    HookConfigLoader,
+    HookDiagnosticLogger,
+    HookPaths,
+    HookRuntime,
+    HookedProvider,
+    WorkspaceTrustStore,
+)
 from .skills import (
     LoadSkillTool,
     SkillCatalogError,
@@ -107,17 +118,29 @@ def _argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _optional_keyword(factory, name: str, value: object) -> dict[str, object]:
+    try:
+        parameters = inspect.signature(factory).parameters
+    except (TypeError, ValueError):
+        return {}
+    return {name: value} if name in parameters else {}
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = _argument_parser().parse_args(argv)
     mcp_runtime: McpRuntime | None = None
     context_archive: ContextArchive | None = None
     session_binding: SessionBinding | None = None
     memory_manager: MemoryManager | None = None
+    hook_runtime: HookRuntime | None = None
     try:
         static_command_registry = create_builtin_command_registry()
         command_registry = DynamicCommandCatalog(static_command_registry)
         interaction_state = InteractionState()
         workspace = Workspace(Path.cwd())
+        hook_catalog = HookConfigLoader().load(
+            HookPaths.for_workspace(workspace.root)
+        )
         profile_catalog = _load_profiles()
         profile = profile_catalog.active_profile
         usage_ledger = profile_catalog.usage_ledger
@@ -147,6 +170,54 @@ def main(argv: list[str] | None = None) -> int:
         )
         opened_session = session_repository.open(session_request)
         session_binding = opened_session.binding
+        hook_trust_store = WorkspaceTrustStore.for_user_home()
+        project_trusted = (
+            hook_trust_store.read(workspace.root)
+            if hook_catalog.requires_project_trust
+            else False
+        )
+        if hook_catalog.rules:
+            hook_runtime = HookRuntime(
+                hook_catalog,
+                HookActionExecutor(
+                    workspace.root,
+                    api_key_environment_names=tuple(
+                        profile_catalog.api_key_environment_names
+                    ),
+                ),
+                workspace=workspace.root,
+                session_id=opened_session.state.session_id,
+                resumed=opened_session.resumed,
+                project_trusted=project_trusted,
+                diagnostics=HookDiagnosticLogger(
+                    Path.home() / ".mewcode" / "logs" / "hooks.jsonl",
+                    sensitive_values=tuple(
+                        entry.profile.api_key
+                        for entry in profile_catalog.entries.values()
+                    ),
+                ),
+            )
+        else:
+            hook_runtime = HookRuntime.empty(
+                workspace.root,
+                opened_session.state.session_id,
+                resumed=opened_session.resumed,
+            )
+        hooked_providers: dict[str, object] = {}
+
+        def hooked_provider(name: str | None = None):
+            selected = name or profile_catalog.active_name
+            if not hook_catalog.rules:
+                return profile_catalog.provider(selected)
+            wrapped = hooked_providers.get(selected)
+            if wrapped is None:
+                wrapped = HookedProvider(
+                    profile_catalog.provider(selected), hook_runtime, selected
+                )
+                hooked_providers[selected] = wrapped
+            return wrapped
+
+        provider = hooked_provider()
         memory_manager = MemoryManager(
             MemoryStore(continuity_paths, api_key=profile.api_key),
             MemoryUpdater(
@@ -160,6 +231,7 @@ def main(argv: list[str] | None = None) -> int:
             provider,
             context_archive,
             ContextConfig(profile.context_window),
+            hook_runtime=hook_runtime,
         )
 
         builtin_registry = create_builtin_registry(workspace)
@@ -227,13 +299,17 @@ def main(argv: list[str] | None = None) -> int:
             PermissionMode(arguments.permission_mode),
         )
 
-        scheduler = ToolScheduler(permission_controller)
+        scheduler = ToolScheduler(
+            permission_controller,
+            **_optional_keyword(ToolScheduler, "hook_runtime", hook_runtime),
+        )
         prompt_builder = PromptBuilder(PromptEnvironmentProvider(workspace.root))
         agent_runner = AgentRunner(
             provider,
             scheduler,
             prompt_builder=prompt_builder,
             context_manager=context_manager,
+            **_optional_keyword(AgentRunner, "hook_runtime", hook_runtime),
         )
         skill_runtime = SkillRuntime(
             catalog,
@@ -250,15 +326,17 @@ def main(argv: list[str] | None = None) -> int:
         def isolated_runner(profile_name: str | None) -> AgentRunner:
             selected = profile_catalog.require(profile_name or profile_catalog.active_name)
             isolated_context = ContextManager(
-                profile_catalog.provider(profile_name),
+                hooked_provider(profile_name),
                 context_archive,
                 ContextConfig(selected.context_window),
+                hook_runtime=hook_runtime,
             )
             return AgentRunner(
-                profile_catalog.provider(profile_name),
+                hooked_provider(profile_name),
                 scheduler,
                 prompt_builder=prompt_builder,
                 context_manager=isolated_context,
+                **_optional_keyword(AgentRunner, "hook_runtime", hook_runtime),
             )
 
         coordinator = SkillCoordinator(
@@ -322,6 +400,7 @@ def main(argv: list[str] | None = None) -> int:
             skill_runtime=skill_runtime,
             skill_coordinator=coordinator,
             skill_refresher=refresh_skills,
+            hook_runtime=hook_runtime,
         )
         conversation_ref["value"] = conversation
         action = "resumed" if opened_session.resumed else "created"
@@ -358,6 +437,9 @@ def main(argv: list[str] | None = None) -> int:
             usage_ledger=usage_ledger,
             memory_manager=memory_manager,
             context_manager=context_manager,
+            hook_runtime=hook_runtime,
+            hook_trust_store=hook_trust_store,
+            workspace=workspace.root,
         ).run()
     except CommandRegistrationError as exc:
         sys.stderr.write(f"Error: {exc}\n")
@@ -366,6 +448,9 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write(f"Error: {exc}\n")
         return 1
     except PermissionConfigError as exc:
+        sys.stderr.write(f"Error: {exc}\n")
+        return 1
+    except HookConfigError as exc:
         sys.stderr.write(f"Error: {exc}\n")
         return 1
     except (ConfigError, ProviderError) as exc:
@@ -402,6 +487,11 @@ def main(argv: list[str] | None = None) -> int:
                 _write_mcp_diagnostics(mcp_runtime.close())
             except Exception:
                 sys.stderr.write("Warning: MCP runtime shutdown failed.\n")
+        if hook_runtime is not None:
+            try:
+                asyncio.run(hook_runtime.close())
+            except Exception:
+                sys.stderr.write("Warning: Hook runtime shutdown failed.\n")
 
 
 def _write_mcp_diagnostics(diagnostics: tuple[McpDiagnostic, ...]) -> None:

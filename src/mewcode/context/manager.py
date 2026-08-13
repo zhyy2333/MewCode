@@ -7,6 +7,7 @@ from enum import Enum, auto
 
 from mewcode.providers import ChatMessage, LLMProvider, ModelRequest, TokenUsage
 from mewcode.tools import ToolExecution
+from mewcode.hooks import HookEvent, HookRuntime, make_event
 
 from .archive import ContextArchive
 from .estimator import TokenEstimator
@@ -100,6 +101,7 @@ class ContextManager:
         provider: LLMProvider,
         archive: ContextArchive,
         config: ContextConfig,
+        hook_runtime: HookRuntime | None = None,
     ) -> None:
         self._archive = archive
         self._config = config
@@ -112,6 +114,7 @@ class ContextManager:
             self._estimator,
         )
         self._breaker = CompactionCircuitBreaker(config.failure_limit)
+        self._hook_runtime = hook_runtime
 
     @property
     def consecutive_failures(self) -> int:
@@ -191,14 +194,30 @@ class ContextManager:
             ContextStatusKind.COMPACTION_STARTED,
             "Automatically compacting earlier conversation history.",
         )
+        await self._compact_hook(
+            HookEvent.COMPACT_BEFORE, "automatic", "started", len(request.messages)
+        )
         try:
             compacted = await self._history_compactor.compact(
                 request.messages,
                 CompactionMode.AUTOMATIC,
             )
         except asyncio.CancelledError:
+            await self._compact_hook(
+                HookEvent.COMPACT_AFTER,
+                "automatic",
+                "cancelled",
+                len(request.messages),
+            )
             raise
         except ContextError:
+            await self._compact_hook(
+                HookEvent.COMPACT_AFTER,
+                "automatic",
+                "failure",
+                len(request.messages),
+                error="compaction failed",
+            )
             async for status in self._record_failure():
                 yield status
             message = "Automatic context compaction failed; active history was unchanged."
@@ -212,6 +231,14 @@ class ContextManager:
             return
 
         if not compacted.changed:
+            await self._compact_hook(
+                HookEvent.COMPACT_AFTER,
+                "automatic",
+                "failure",
+                len(request.messages),
+                len(compacted.messages),
+                changed=False,
+            )
             message = (
                 "The request is near the context limit, but no earlier history can be "
                 "compacted safely."
@@ -240,6 +267,15 @@ class ContextManager:
         rebuilt = replace(request, messages=compacted.messages)
         rebuilt_estimate = self._estimator.estimate(rebuilt)
         if rebuilt_estimate.input_tokens >= boundary:
+            await self._compact_hook(
+                HookEvent.COMPACT_AFTER,
+                "automatic",
+                "failure",
+                len(request.messages),
+                len(compacted.messages),
+                changed=True,
+                error="compacted request still exceeds capacity",
+            )
             message = (
                 "The compacted request still cannot fit within the safe context boundary."
             )
@@ -261,6 +297,14 @@ class ContextManager:
             usage=compacted.usage,
             changed=True,
         )
+        await self._compact_hook(
+            HookEvent.COMPACT_AFTER,
+            "automatic",
+            "success",
+            len(request.messages),
+            len(compacted.messages),
+            changed=True,
+        )
 
     async def _prepare_manual(
         self,
@@ -271,14 +315,27 @@ class ContextManager:
             ContextStatusKind.COMPACTION_STARTED,
             "Explicitly compacting earlier conversation history.",
         )
+        await self._compact_hook(
+            HookEvent.COMPACT_BEFORE, "manual", "started", len(messages)
+        )
         try:
             compacted = await self._history_compactor.compact(
                 messages,
                 CompactionMode.MANUAL,
             )
         except asyncio.CancelledError:
+            await self._compact_hook(
+                HookEvent.COMPACT_AFTER, "manual", "cancelled", len(messages)
+            )
             raise
         except ContextError:
+            await self._compact_hook(
+                HookEvent.COMPACT_AFTER,
+                "manual",
+                "failure",
+                len(messages),
+                error="compaction failed",
+            )
             async for status in self._record_failure():
                 yield status
             message = "Explicit context compaction failed; active history was unchanged."
@@ -292,6 +349,14 @@ class ContextManager:
             return
 
         if not compacted.changed:
+            await self._compact_hook(
+                HookEvent.COMPACT_AFTER,
+                "manual",
+                "success",
+                len(messages),
+                len(compacted.messages),
+                changed=False,
+            )
             yield ContextStatus(
                 ContextStatusKind.NO_COMPACTION_NEEDED,
                 "No earlier conversation history needs compaction.",
@@ -316,6 +381,48 @@ class ContextManager:
             None,
             usage=compacted.usage,
             changed=True,
+        )
+        await self._compact_hook(
+            HookEvent.COMPACT_AFTER,
+            "manual",
+            "success",
+            len(messages),
+            len(compacted.messages),
+            changed=True,
+        )
+
+    async def _compact_hook(
+        self,
+        event: HookEvent,
+        mode: str,
+        status: str,
+        before: int,
+        after: int | None = None,
+        *,
+        changed: bool | None = None,
+        error: str | None = None,
+    ) -> None:
+        if self._hook_runtime is None:
+            return
+        values: dict[str, object] = {
+            "mode": mode,
+            "status": status,
+            "message_count_before": before,
+        }
+        if after is not None:
+            values["message_count_after"] = after
+        if changed is not None:
+            values["changed"] = changed
+        if error is not None:
+            values["error"] = error
+        await self._hook_runtime.dispatch(
+            make_event(
+                event,
+                workspace=self._hook_runtime.workspace,
+                session_id=self._hook_runtime.session_id,
+                resumed=self._hook_runtime.resumed,
+                values={"compaction": values},
+            )
         )
 
     async def _record_failure(self) -> AsyncIterator[ContextStatus]:

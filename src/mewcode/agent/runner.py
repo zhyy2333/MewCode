@@ -13,6 +13,7 @@ from mewcode.context import (
     ContextFailureKind,
     ContextManager,
 )
+from mewcode.hooks import HookRuntime
 from mewcode.prompting import (
     PromptAdditions,
     PromptBuilder,
@@ -123,6 +124,7 @@ class AgentRun:
         context_manager: ContextManager | None,
         history_commit_sink: HistoryCommitSink | None,
         run_view_provider: RunViewProvider | None = None,
+        hook_runtime: HookRuntime | None = None,
     ) -> None:
         self._run_id = run_id
         self._mode = mode
@@ -137,6 +139,7 @@ class AgentRun:
         self._context_manager = context_manager
         self._history_commit_sink = history_commit_sink
         self._run_view_provider = run_view_provider
+        self._hook_runtime = hook_runtime
         self._state = _State.NEW
         self._outcome: AgentRunOutcome | None = None
         self._cancel_requested = asyncio.Event()
@@ -159,6 +162,17 @@ class AgentRun:
         final_text = ""
         plan_finalizing = False
         plan_investigation_messages: list[ChatMessage] = []
+        scope = (
+            self._hook_runtime.bind_scope(
+                run_id=self._run_id,
+                mode=self._mode.value,
+                component="agent",
+            )
+            if self._hook_runtime is not None
+            else None
+        )
+        if scope is not None:
+            scope.__enter__()
 
         try:
             yield AgentProgress(
@@ -540,6 +554,8 @@ class AgentRun:
                 str(exc),
             )
         except Exception as exc:
+            if self._hook_runtime is not None:
+                await self._hook_runtime.system_error("agent", exc)
             yield self._finish(
                 StopReason.ERROR,
                 iteration,
@@ -549,6 +565,8 @@ class AgentRun:
                 f"Unexpected agent error: {exc}",
             )
         finally:
+            if scope is not None:
+                scope.__exit__(None, None, None)
             self._consumer_task = None
             self._done.set()
 
@@ -622,6 +640,7 @@ class AgentRunner:
         prompt_builder: PromptBuilder | None = None,
         id_factory: Callable[[], str] | None = None,
         context_manager: ContextManager | None = None,
+        hook_runtime: HookRuntime | None = None,
     ) -> None:
         self._provider = provider
         self._scheduler = scheduler
@@ -631,6 +650,7 @@ class AgentRunner:
         )
         self._id_factory = id_factory or (lambda: str(uuid4()))
         self._context_manager = context_manager
+        self._hook_runtime = hook_runtime
 
     def start(
         self,
@@ -656,4 +676,5 @@ class AgentRunner:
             context_manager=self._context_manager,
             history_commit_sink=history_commit_sink,
             run_view_provider=run_view_provider,
+            hook_runtime=self._hook_runtime,
         )

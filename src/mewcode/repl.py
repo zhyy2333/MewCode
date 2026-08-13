@@ -4,6 +4,7 @@ import asyncio
 import sys
 from collections.abc import AsyncIterator, Callable
 from typing import TextIO
+from pathlib import Path
 
 from .commands import (
     CommandDispatcher,
@@ -34,6 +35,7 @@ from .conversation import Conversation, ConversationError, ConversationMode, Con
 from .permissions import PermissionChoice, PermissionController, PermissionMode
 from .providers import UsageLedger, UsageSnapshot
 from .terminal import TerminalSession
+from .hooks import HookRuntime, WorkspaceTrustStore
 
 InputFunc = Callable[[str], str]
 
@@ -54,6 +56,9 @@ class Repl:
         usage_ledger: UsageLedger | None = None,
         memory_manager=None,
         context_manager=None,
+        hook_runtime: HookRuntime | None = None,
+        hook_trust_store: WorkspaceTrustStore | None = None,
+        workspace: Path | None = None,
     ) -> None:
         self._conversation = conversation
         self._stdout = stdout
@@ -69,6 +74,9 @@ class Repl:
         self._usage_ledger = usage_ledger or UsageLedger()
         self._memory_manager = memory_manager or NullMemoryManager()
         self._context_manager = context_manager
+        self._hook_runtime = hook_runtime
+        self._hook_trust_store = hook_trust_store
+        self._workspace = workspace
         self._dispatcher = CommandDispatcher(self._registry, self, self)
 
     def run(self) -> int:
@@ -84,6 +92,21 @@ class Repl:
         )
         for message in self._startup_messages:
             self._terminal.write(f"{message}\n")
+        if self._hook_runtime is not None and self._hook_runtime.trust_required:
+            trusted = await self._prompt_hook_trust()
+            persisted = (
+                self._hook_trust_store.write(self._workspace, trusted)
+                if self._hook_trust_store is not None and self._workspace is not None
+                else False
+            )
+            self._hook_runtime.resolve_project_trust(trusted if persisted else False)
+            if not persisted:
+                self._terminal.write_error(
+                    "Warning: Hook trust was not saved; project external Hooks remain disabled.\n"
+                )
+        start = getattr(self._conversation, "start", None)
+        if start is not None:
+            await start()
         try:
             while not self._state.exit_requested:
                 try:
@@ -125,6 +148,28 @@ class Repl:
                     self._terminal.write_error(f"Warning: {warning.message}\n")
             except Exception:
                 self._terminal.write_error("Warning: conversation shutdown failed.\n")
+
+    async def _prompt_hook_trust(self) -> bool:
+        workspace = str(self._workspace or "workspace")
+        source = str((self._workspace or Path.cwd()) / ".mewcode" / "hooks.yaml")
+        prompt = getattr(self._terminal, "prompt_hook_trust", None)
+        while True:
+            try:
+                if prompt is not None:
+                    raw = (await prompt(workspace, source)).strip().lower()
+                else:
+                    raw = (
+                        await self._terminal.prompt_permission(
+                            f"trust project Hooks for {workspace}? [y]es/[n]o: "
+                        )
+                    ).strip().lower()
+            except EOFError:
+                return False
+            if raw in {"y", "yes"}:
+                return True
+            if raw in {"n", "no"}:
+                return False
+            self._terminal.write_error("Choose y or n.\n")
 
     def show_message(self, message: str) -> None:
         self._terminal.write(f"{message}\n")
@@ -261,6 +306,11 @@ class _LegacyTerminal:
 
     async def prompt_permission(self, message: str) -> str:
         return self._input(message)
+
+    async def prompt_hook_trust(self, workspace: str, source: str) -> str:
+        return self._input(
+            f"trust project Hooks for {workspace} ({source})? [y]es/[n]o: "
+        )
 
     def write(self, text: str) -> None:
         self._stdout.write(text)

@@ -13,6 +13,20 @@ from mewcode.conversation import Conversation, ConversationError, ConversationMo
 from mewcode.providers import ChatMessage, ModelRequest, ModelResponse, ProviderError, ProviderEvent, ProviderTextDelta
 from mewcode.prompting import PromptAdditions
 from mewcode.tools import ToolExecution, ToolRegistry
+from mewcode.hooks.models import (
+    CommandHookAction,
+    HookActionOutcome,
+    HookCatalog,
+    HookEvent,
+    HookOutcomeKind,
+    HookRule,
+    HookRuleKey,
+    HookSource,
+)
+from mewcode.hooks.provider import HookedProvider
+from mewcode.hooks.runtime import HookRuntime
+from types import MappingProxyType
+import json
 
 from tests.fakes import AllowAllPermissionController, ScriptedAsyncProvider, collect_async
 
@@ -66,6 +80,74 @@ def test_messages_returns_copy() -> None:
     copied = conversation.messages()
     copied.clear()
     assert len(conversation.messages()) == 2
+
+
+def test_session_turn_and_message_lifecycles_are_paired(tmp_path: Path) -> None:
+    class RecordingExecutor:
+        def __init__(self) -> None:
+            self.events: list[str] = []
+
+        async def execute(self, rule, envelope, *, expects_decision):
+            self.events.append(json.loads(envelope.encoded)["event"])
+            return HookActionOutcome(HookOutcomeKind.SUCCESS)
+
+        async def close(self):
+            return None
+
+    event_names = (
+        HookEvent.SESSION_START,
+        HookEvent.SESSION_END,
+        HookEvent.TURN_START,
+        HookEvent.TURN_END,
+        HookEvent.MESSAGE_BEFORE,
+        HookEvent.MESSAGE_AFTER,
+    )
+    rules = tuple(
+        HookRule(
+            HookRuleKey(HookSource.USER, Path("h"), index),
+            event,
+            None,
+            CommandHookAction("ignored"),
+        )
+        for index, event in enumerate(event_names)
+    )
+    executor = RecordingExecutor()
+    runtime = HookRuntime(
+        HookCatalog(
+            rules,
+            MappingProxyType(
+                {event: tuple(rule for rule in rules if rule.event is event) for event in event_names}
+            ),
+        ),
+        executor,
+        workspace=tmp_path,
+        session_id="s",
+        project_trusted=True,
+    )
+    base = ScriptedAsyncProvider([[ProviderTextDelta("hello")]])
+    provider = HookedProvider(base, runtime, "main")
+    runner = AgentRunner(
+        provider,
+        ToolScheduler(AllowAllPermissionController(), hook_runtime=runtime),
+        id_factory=lambda: "run",
+        hook_runtime=runtime,
+    )
+    conversation = Conversation(runner, ToolRegistry([]), hook_runtime=runtime)
+
+    async def scenario() -> None:
+        await conversation.start()
+        await collect_async(conversation.ask("Hi"))
+        await conversation.close()
+
+    asyncio.run(scenario())
+    assert executor.events == [
+        "session.start",
+        "turn.start",
+        "message.before",
+        "message.after",
+        "turn.end",
+        "session.end",
+    ]
 
 
 def test_reset_clears_messages_and_pending_plan_in_memory() -> None:

@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from uuid import uuid4
 
 from .prompting import PromptAdditions, PromptRunContext
 from .agent import (
@@ -29,6 +30,7 @@ from .continuity import (
 )
 from .continuity.session_codec import session_title
 from .providers import ChatMessage
+from .hooks import HookEvent, HookRuntime, make_event
 from .tools import ToolRegistry, ToolSafety
 from .skills import SkillCoordinator, SkillMode, SkillRefreshResult, SkillRuntime
 
@@ -76,6 +78,7 @@ class Conversation:
         skill_runtime: SkillRuntime | None = None,
         skill_coordinator: SkillCoordinator | None = None,
         skill_refresher: Callable[[], SkillRefreshResult] | None = None,
+        hook_runtime: HookRuntime | None = None,
     ) -> None:
         self._runner = runner
         self._tools = tools
@@ -102,6 +105,23 @@ class Conversation:
         self._skill_coordinator = skill_coordinator
         self._skill_refresher = skill_refresher
         self._active_skill_safety = {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
+        self._hook_runtime = hook_runtime
+        self._started = False
+        self._closed = False
+
+    async def start(self) -> None:
+        if self._started or self._closed:
+            return
+        self._started = True
+        if self._hook_runtime is not None:
+            await self._hook_runtime.dispatch(
+                make_event(
+                    HookEvent.SESSION_START,
+                    workspace=self._hook_runtime.workspace,
+                    session_id=self._session_id,
+                    resumed=self._resumed,
+                )
+            )
 
     def messages(self) -> list[ChatMessage]:
         return list(self._messages)
@@ -333,17 +353,31 @@ class Conversation:
                 self._active_context_operation = None
 
     async def close(self) -> tuple[ContextStatus | ContinuityDiagnostic, ...]:
+        if self._closed:
+            return ()
+        self._closed = True
         await self.cancel_active()
         diagnostics: list[ContextStatus | ContinuityDiagnostic] = list(
             await self._memory.close()
         )
+        if self._hook_runtime is not None and self._started:
+            await self._hook_runtime.dispatch(
+                make_event(
+                    HookEvent.SESSION_END,
+                    workspace=self._hook_runtime.workspace,
+                    session_id=self._session_id,
+                    resumed=self._resumed,
+                    values={"session": {"id": self._session_id, "resumed": self._resumed, "status": "success"}},
+                )
+            )
         if self._session is not None:
             diagnostics.extend(self._session.close())
         if self._skill_runtime is not None:
             self._skill_runtime.close()
-        if self._context_manager is None:
-            return tuple(diagnostics)
-        diagnostics.extend(self._context_manager.close())
+        if self._context_manager is not None:
+            diagnostics.extend(self._context_manager.close())
+        if self._hook_runtime is not None:
+            await self._hook_runtime.close()
         return tuple(diagnostics)
 
     async def _run(
@@ -356,6 +390,20 @@ class Conversation:
     ) -> AsyncIterator[AgentEvent]:
         if self._active_run is not None or self._active_context_operation is not None:
             raise ConversationError("Another conversation operation is already active.")
+        turn_id = uuid4().hex
+        scope = None
+        if self._hook_runtime is not None:
+            await self._hook_runtime.dispatch(
+                make_event(
+                    HookEvent.TURN_START,
+                    workspace=self._hook_runtime.workspace,
+                    session_id=self._session_id,
+                    resumed=self._resumed,
+                    values={"turn": {"id": turn_id, "mode": mode.value, "input_summary": user_text[:4096]}},
+                )
+            )
+            scope = self._hook_runtime.bind_scope(turn_id=turn_id, mode=mode.value)
+            scope.__enter__()
         run = self._runner.start(
             self._messages,
             user_text,
@@ -367,11 +415,29 @@ class Conversation:
         )
         self._active_run = run
         self._last_outcome = None
+        turn_status = "failure"
         try:
             async for event in run.events():
                 yield event
             self._last_outcome = run.outcome
             self._messages = list(run.outcome.committed_history)
+            turn_status = (
+                "success"
+                if run.outcome.completed
+                else "cancelled"
+                if run.outcome.reason.value == "cancelled"
+                else "failure"
+            )
+            if self._hook_runtime is not None:
+                await self._hook_runtime.dispatch(
+                    make_event(
+                        HookEvent.TURN_END,
+                        workspace=self._hook_runtime.workspace,
+                        session_id=self._session_id,
+                        resumed=self._resumed,
+                        values={"turn": {"id": turn_id, "mode": mode.value, "input_summary": user_text[:4096], "status": turn_status}},
+                    )
+                )
             if run.outcome.completed:
                 self._memory.schedule(
                     MemoryTurn(
@@ -384,8 +450,20 @@ class Conversation:
                     )
                 )
         except AgentRunStateError as exc:
+            if self._hook_runtime is not None:
+                await self._hook_runtime.dispatch(
+                    make_event(
+                        HookEvent.TURN_END,
+                        workspace=self._hook_runtime.workspace,
+                        session_id=self._session_id,
+                        resumed=self._resumed,
+                        values={"turn": {"id": turn_id, "mode": mode.value, "input_summary": user_text[:4096], "status": "failure"}},
+                    )
+                )
             raise ConversationError(str(exc)) from exc
         finally:
+            if scope is not None:
+                scope.__exit__(None, None, None)
             if self._active_run is run:
                 self._active_run = None
 

@@ -24,6 +24,8 @@ class TerminalSession(Protocol):
 
     async def prompt_permission(self, message: str) -> str: ...
 
+    async def prompt_hook_trust(self, workspace: str, source: str) -> str: ...
+
     def write(self, text: str) -> None: ...
 
     def write_error(self, text: str) -> None: ...
@@ -131,6 +133,11 @@ class PromptToolkitTerminal:
 
     async def prompt_permission(self, message: str) -> str:
         return await self._permission_session.prompt_async(message)
+
+    async def prompt_hook_trust(self, workspace: str, source: str) -> str:
+        return await self._permission_session.prompt_async(
+            f"trust project Hooks for {workspace} ({source})? [y]es/[n]o: "
+        )
 
     def write(self, text: str) -> None:
         self._stdout.write(text)
