@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import pytest
 
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import CompleteEvent
@@ -13,7 +15,12 @@ from mewcode.commands import (
     InteractionState,
     create_builtin_command_registry,
 )
-from mewcode.terminal import CommandCompleter, PromptToolkitTerminal, _apply_tab
+from mewcode.terminal import (
+    CommandCompleter,
+    PromptToolkitTerminal,
+    RunControl,
+    _apply_tab,
+)
 
 
 def completion_texts(text: str, cursor: int | None = None) -> list[str]:
@@ -128,3 +135,85 @@ def test_terminal_and_permission_prompts_propagate_eof() -> None:
             pass
         else:
             raise AssertionError("EOF must propagate from prompt_toolkit")
+
+
+def test_run_control_ignores_regular_keys_and_recognizes_ctrl_b() -> None:
+    async def scenario():
+        with create_pipe_input() as pipe:
+            terminal = PromptToolkitTerminal(
+                create_builtin_command_registry(),
+                InteractionState(),
+                stdin=pipe,
+                output=DummyOutput(),
+            )
+            reader = asyncio.create_task(terminal.read_run_control())
+            await asyncio.sleep(0)
+            pipe.send_text("abc")
+            await asyncio.sleep(0)
+            assert not reader.done()
+            pipe.send_bytes(b"\x02")
+            return await reader
+
+    assert asyncio.run(scenario()) is RunControl.BACKGROUND
+
+
+def test_run_control_cancellation_releases_input_for_relisten() -> None:
+    async def scenario():
+        with create_pipe_input() as pipe:
+            terminal = PromptToolkitTerminal(
+                create_builtin_command_registry(),
+                InteractionState(),
+                stdin=pipe,
+                output=DummyOutput(),
+            )
+            first = asyncio.create_task(terminal.read_run_control())
+            await asyncio.sleep(0)
+            first.cancel()
+            await asyncio.gather(first, return_exceptions=True)
+            second = asyncio.create_task(terminal.read_run_control())
+            await asyncio.sleep(0)
+            pipe.send_bytes(b"\x02")
+            return await second
+
+    assert asyncio.run(scenario()) is RunControl.BACKGROUND
+
+
+def test_run_control_ctrl_c_preserves_keyboard_interrupt() -> None:
+    async def scenario():
+        with create_pipe_input() as pipe:
+            terminal = PromptToolkitTerminal(
+                create_builtin_command_registry(),
+                InteractionState(),
+                stdin=pipe,
+                output=DummyOutput(),
+            )
+            reader = asyncio.create_task(terminal.read_run_control())
+            await asyncio.sleep(0)
+            pipe.send_bytes(b"\x03")
+            await reader
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(scenario())
+
+
+def test_notify_is_single_line_bounded_and_flushes_redirected_output() -> None:
+    class Stream(io.StringIO):
+        def __init__(self):
+            super().__init__()
+            self.flushes = 0
+
+        def flush(self):
+            self.flushes += 1
+
+    stream = Stream()
+    terminal = PromptToolkitTerminal(
+        create_builtin_command_registry(),
+        InteractionState(),
+        output=DummyOutput(),
+        stdout=stream,
+    )
+    asyncio.run(terminal.notify("first\nsecond" + "x" * 600))
+    assert stream.getvalue().startswith("first second")
+    assert stream.getvalue().count("\n") == 1
+    assert len(stream.getvalue()) <= 513
+    assert stream.flushes == 1

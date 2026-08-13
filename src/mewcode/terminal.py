@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import sys
+import asyncio
 from collections.abc import Iterator
+from enum import StrEnum
 from typing import Protocol, TextIO
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application import run_in_terminal
 from prompt_toolkit.application.current import get_app_or_none
 from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.completion import Completer, CompleteEvent, Completion
@@ -12,11 +15,16 @@ from prompt_toolkit.document import Document
 from prompt_toolkit.history import DummyHistory
 from prompt_toolkit.input import Input, create_input
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from prompt_toolkit.output import Output, create_output
 from prompt_toolkit.output.plain_text import PlainTextOutput
 from prompt_toolkit.shortcuts import CompleteStyle
 
 from .commands import CommandRegistry, InteractionState
+
+
+class RunControl(StrEnum):
+    BACKGROUND = "background"
 
 
 class TerminalSession(Protocol):
@@ -25,6 +33,10 @@ class TerminalSession(Protocol):
     async def prompt_permission(self, message: str) -> str: ...
 
     async def prompt_hook_trust(self, workspace: str, source: str) -> str: ...
+
+    async def read_run_control(self) -> RunControl: ...
+
+    async def notify(self, text: str) -> None: ...
 
     def write(self, text: str) -> None: ...
 
@@ -139,6 +151,35 @@ class PromptToolkitTerminal:
             f"trust project Hooks for {workspace} ({source})? [y]es/[n]o: "
         )
 
+    async def read_run_control(self) -> RunControl:
+        loop = asyncio.get_running_loop()
+        result: asyncio.Future[RunControl] = loop.create_future()
+
+        def input_ready() -> None:
+            if result.done():
+                return
+            for key_press in self._input.read_keys():
+                if key_press.key == Keys.ControlB:
+                    result.set_result(RunControl.BACKGROUND)
+                    return
+                if key_press.key == Keys.ControlC:
+                    result.set_exception(KeyboardInterrupt())
+                    return
+
+        with self._input.raw_mode(), self._input.attach(input_ready):
+            return await result
+
+    async def notify(self, text: str) -> None:
+        rendered = _notification_line(text)
+        application = get_app_or_none()
+        if application is not None and application.is_running:
+            try:
+                await run_in_terminal(lambda: self.write(rendered))
+                return
+            except Exception:
+                pass
+        self.write(rendered)
+
     def write(self, text: str) -> None:
         self._stdout.write(text)
         self._stdout.flush()
@@ -156,3 +197,8 @@ class PromptToolkitTerminal:
         application = get_app_or_none()
         if application is not None and application.is_running:
             application.invalidate()
+
+
+def _notification_line(text: str, limit: int = 512) -> str:
+    single = " ".join(str(text).splitlines()).strip()[:limit]
+    return single + "\n"

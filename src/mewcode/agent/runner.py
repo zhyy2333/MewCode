@@ -747,6 +747,7 @@ class AgentRunner:
         run_view_provider: RunViewProvider | None = None,
         seed_request: ForkRequestSeed | None = None,
         allowed_safety: frozenset[ToolSafety] | None = None,
+        request_boundary_factory: RequestBoundaryFactory | None = None,
     ) -> AgentRun:
         if seed_request is not None:
             if not user_text.strip():
@@ -778,6 +779,10 @@ class AgentRunner:
                 self._allowed_safety if allowed_safety is None else allowed_safety
             ),
             seed_request=seed_request,
-            request_boundary_factory=self._request_boundary_factory,
+            request_boundary_factory=(
+                self._request_boundary_factory
+                if request_boundary_factory is None
+                else request_boundary_factory
+            ),
             hook_component=self._hook_component,
         )

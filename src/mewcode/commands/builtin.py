@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 from mewcode.permissions import PermissionMode
+from mewcode.subagents import (
+    SubagentTaskSnapshot,
+    SubagentTaskStatus,
+    TaskCancelResult,
+)
 
 from .contracts import CommandContext
 from .core import (
@@ -176,6 +181,93 @@ async def _exit(context: CommandContext, arguments: str) -> None:
     context.ui.request_exit()
 
 
+def _progress_summary(snapshot: SubagentTaskSnapshot) -> str:
+    progress = snapshot.progress
+    if progress is None:
+        return "n/a"
+    text = " ".join(progress.message.splitlines())[:160]
+    return f"iteration={progress.iteration} phase={progress.phase[:64]} message={text}"
+
+
+def _task_label(snapshot: SubagentTaskSnapshot) -> str:
+    role = snapshot.role or "fork"
+    return (
+        f"{snapshot.task_id} kind={snapshot.kind.value} role={role[:64]} "
+        f"placement={snapshot.placement.value} status={snapshot.status.value} "
+        f"created={snapshot.created_at.isoformat()} progress={_progress_summary(snapshot)}"
+    )
+
+
+async def _tasks(context: CommandContext, arguments: str) -> None:
+    _no_arguments(arguments)
+    snapshots = context.runtime.list_subagent_tasks()
+    if not snapshots:
+        context.ui.show_message("No subagent tasks.")
+        return
+    active = [item for item in snapshots if item.status.active]
+    terminal = [item for item in snapshots if item.status.terminal]
+    lines = ["Active subagent tasks:"]
+    lines.extend(f"  {_task_label(item)}" for item in active)
+    if not active:
+        lines.append("  none")
+    lines.append("Terminal subagent tasks:")
+    lines.extend(f"  {_task_label(item)}" for item in terminal)
+    if not terminal:
+        lines.append("  none")
+    context.ui.show_message("\n".join(lines))
+
+
+def _task_detail(snapshot: SubagentTaskSnapshot) -> str:
+    usage = snapshot.usage
+    lines = [
+        f"task: {snapshot.task_id}",
+        f"kind: {snapshot.kind.value}",
+        f"role: {snapshot.role or 'fork'}",
+        f"profile: {snapshot.profile_name}",
+        f"placement: {snapshot.placement.value}",
+        f"status: {snapshot.status.value}",
+        f"created: {snapshot.created_at.isoformat()}",
+        f"started: {snapshot.started_at.isoformat() if snapshot.started_at else 'n/a'}",
+        f"finished: {snapshot.finished_at.isoformat() if snapshot.finished_at else 'n/a'}",
+        f"progress: {_progress_summary(snapshot)}",
+        "tokens: "
+        f"in={_token(usage.input_tokens)} out={_token(usage.output_tokens)} "
+        f"total={_token(usage.total_tokens)} "
+        f"cache-read={_token(usage.cache_read_tokens)} "
+        f"cache-write={_token(usage.cache_write_tokens)}",
+        f"truncated: {'true' if snapshot.truncated else 'false'}",
+    ]
+    if snapshot.status.terminal:
+        lines.append(f"result:\n{snapshot.result}")
+        if snapshot.error:
+            lines.append(f"error:\n{snapshot.error}")
+    return "\n".join(lines)
+
+
+async def _task(context: CommandContext, arguments: str) -> None:
+    tokens = arguments.split()
+    if len(tokens) == 1:
+        if tokens[0] == "cancel":
+            raise CommandUsageError()
+        snapshot = context.runtime.get_subagent_task(tokens[0])
+        if snapshot is None:
+            raise CommandExecutionError(f"Unknown subagent task '{tokens[0]}'.")
+        context.ui.show_message(_task_detail(snapshot))
+        return
+    if len(tokens) == 2 and tokens[0] == "cancel":
+        task_id = tokens[1]
+        result = await context.runtime.cancel_subagent_task(task_id)
+        messages = {
+            TaskCancelResult.REQUESTED: f"Cancellation requested for subagent task {task_id}.",
+            TaskCancelResult.ALREADY_TERMINAL: f"Subagent task {task_id} is already terminal.",
+            TaskCancelResult.ALREADY_REQUESTED: f"Cancellation was already requested for subagent task {task_id}.",
+            TaskCancelResult.NOT_FOUND: f"Unknown subagent task '{task_id}'.",
+        }
+        context.ui.show_message(messages[result])
+        return
+    raise CommandUsageError()
+
+
 def create_builtin_command_registry() -> CommandRegistry:
     definitions = (
         CommandDefinition("help", "Show command help.", "/help [command]", CommandType.LOCAL, _help, argument_hint="[command]"),
@@ -187,6 +279,8 @@ def create_builtin_command_registry() -> CommandRegistry:
         CommandDefinition("memory", "Show the safe memory summary.", "/memory", CommandType.LOCAL, _memory),
         CommandDefinition("permission", "Show or change permission mode.", "/permission [strict|default|allow]", CommandType.LOCAL, _permission, aliases=("permissions",), argument_hint="[strict|default|allow]"),
         CommandDefinition("status", "Show the current runtime status.", "/status", CommandType.LOCAL, _status),
+        CommandDefinition("tasks", "List subagent tasks.", "/tasks", CommandType.LOCAL, _tasks),
+        CommandDefinition("task", "Show or cancel a subagent task.", "/task <id>|cancel <id>", CommandType.LOCAL, _task, argument_hint="<id>|cancel <id>"),
         CommandDefinition("reset", "Reset the current conversation state.", "/reset", CommandType.LOCAL, _reset),
         CommandDefinition("exit", "Exit MewCode.", "/exit", CommandType.LOCAL, _exit, aliases=("quit",), hidden=True),
     )

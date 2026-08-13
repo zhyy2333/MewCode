@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 
 import pytest
 
@@ -21,6 +22,15 @@ from mewcode.continuity import MemoryRuntimeStatus, MemoryUpdateState
 from mewcode.conversation import ConversationStatus
 from mewcode.permissions import PermissionMode
 from mewcode.providers import TokenUsage, UsageSnapshot
+from mewcode.subagents import (
+    SubagentKind,
+    SubagentParent,
+    SubagentPlacement,
+    SubagentProgress,
+    SubagentTaskSnapshot,
+    SubagentTaskStatus,
+    TaskCancelResult,
+)
 
 
 class FakeUI:
@@ -48,6 +58,9 @@ class FakeRuntime:
         self.compactions = 0
         self.resets = 0
         self.permission = PermissionMode.DEFAULT
+        self.tasks = ()
+        self.cancel_result = TaskCancelResult.NOT_FOUND
+        self.cancelled_ids = []
 
     async def compact_context(self): self.compactions += 1
     async def reset_conversation(self): self.resets += 1
@@ -56,6 +69,11 @@ class FakeRuntime:
     def context_status(self): return ContextRuntimeStatus(False, 3)
     def permission_mode(self): return self.permission
     def set_permission_mode(self, mode): self.permission = mode
+    def list_subagent_tasks(self): return self.tasks
+    def get_subagent_task(self, task_id): return next((item for item in self.tasks if item.task_id == task_id), None)
+    async def cancel_subagent_task(self, task_id):
+        self.cancelled_ids.append(task_id)
+        return self.cancel_result
 
 
 def dispatch(name: str, arguments: str = "", ui=None, runtime=None):
@@ -69,7 +87,7 @@ def dispatch(name: str, arguments: str = "", ui=None, runtime=None):
 def test_builtin_metadata_is_exact() -> None:
     registry = create_builtin_command_registry()
     assert [item.name for item in registry.public_definitions()] == [
-        "clear", "compact", "do", "help", "memory", "permission", "plan", "reset", "session", "status"
+        "clear", "compact", "do", "help", "memory", "permission", "plan", "reset", "session", "status", "task", "tasks"
     ]
     assert registry.resolve("permissions").name == "permission"
     assert registry.resolve("quit").name == "exit"
@@ -81,7 +99,7 @@ def test_builtin_metadata_is_exact() -> None:
 def test_help_is_registry_driven_and_hides_exit() -> None:
     ui, _ = dispatch("help")
     output = ui.messages[0]
-    assert output.count(" - ") == 10
+    assert output.count(" - ") == 12
     assert "/permissions" in output
     assert "/exit" not in output and "/quit" not in output
     ui, _ = dispatch("help", "/permissions")
@@ -194,6 +212,95 @@ def test_reset_failure_does_not_change_plan_mode() -> None:
 
 def test_review_prompt_compatibility_export_is_empty() -> None:
     assert REVIEW_PROMPT == ""
+
+
+def _task_snapshot(
+    task_id="task-1",
+    *,
+    status=SubagentTaskStatus.RUNNING,
+    role="reviewer",
+    usage=TokenUsage.zero(),
+):
+    now = datetime(2026, 8, 13, tzinfo=timezone.utc)
+    return SubagentTaskSnapshot(
+        task_id,
+        SubagentKind.DEFINED if role else SubagentKind.FORK,
+        status,
+        SubagentPlacement.BACKGROUND,
+        role,
+        "main",
+        SubagentParent("parent", 1),
+        now,
+        now,
+        now if status.terminal else None,
+        SubagentProgress(2, "model", "safe\nprogress"),
+        "final result" if status.terminal else "",
+        "failed" if status is SubagentTaskStatus.FAILED else None,
+        False,
+        usage,
+        False,
+    )
+
+
+def test_tasks_lists_safe_grouped_summaries_and_rejects_arguments() -> None:
+    runtime = FakeRuntime()
+    ui, _ = dispatch("tasks", runtime=runtime)
+    assert ui.messages == ["No subagent tasks."]
+
+    runtime.tasks = (
+        _task_snapshot(),
+        _task_snapshot("fork-1", status=SubagentTaskStatus.COMPLETED, role=None),
+    )
+    ui, _ = dispatch("tasks", runtime=runtime)
+    output = ui.messages[0]
+    assert "Active subagent tasks:" in output
+    assert "Terminal subagent tasks:" in output
+    assert "role=fork" in output
+    assert "safe progress" in output
+    assert "final result" not in output
+    ui, _ = dispatch("tasks", "extra", runtime=runtime)
+    assert ui.errors[0] == "Usage: /tasks"
+
+
+def test_task_detail_is_local_nonblocking_and_formats_unknown_usage() -> None:
+    runtime = FakeRuntime()
+    runtime.tasks = (
+        _task_snapshot(
+            status=SubagentTaskStatus.COMPLETED,
+            usage=TokenUsage(None, 2, None, None, None),
+        ),
+    )
+    ui, _ = dispatch("task", "task-1", runtime=runtime)
+    output = ui.messages[0]
+    assert "status: completed" in output
+    assert "result:\nfinal result" in output
+    assert "in=n/a out=2 total=n/a cache-read=n/a cache-write=n/a" in output
+    ui, _ = dispatch("task", "missing", runtime=runtime)
+    assert ui.errors == ["Unknown subagent task 'missing'."]
+
+
+@pytest.mark.parametrize(
+    ("result", "text"),
+    [
+        (TaskCancelResult.REQUESTED, "Cancellation requested"),
+        (TaskCancelResult.ALREADY_TERMINAL, "already terminal"),
+        (TaskCancelResult.ALREADY_REQUESTED, "already requested"),
+        (TaskCancelResult.NOT_FOUND, "Unknown subagent task"),
+    ],
+)
+def test_task_cancel_formats_all_idempotent_results(result, text) -> None:
+    runtime = FakeRuntime()
+    runtime.cancel_result = result
+    ui, _ = dispatch("task", "cancel task-1", runtime=runtime)
+    assert runtime.cancelled_ids == ["task-1"]
+    assert text in ui.messages[0]
+
+
+@pytest.mark.parametrize("arguments", ["", "cancel", "cancel one extra", "other one"])
+def test_task_rejects_invalid_token_combinations(arguments) -> None:
+    ui, runtime = dispatch("task", arguments)
+    assert ui.errors == ["Usage: /task <id>|cancel <id>"]
+    assert runtime.cancelled_ids == []
 
 
 @pytest.mark.parametrize("name", ["compact", "clear", "plan", "do", "session", "memory", "status", "reset", "exit"])

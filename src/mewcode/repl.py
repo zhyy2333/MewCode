@@ -25,6 +25,7 @@ from .agent import (
     AgentPermissionDecision,
     AgentPermissionRequest,
     AgentProgress,
+    AgentSubagentProgress,
     AgentStopped,
     AgentTextDelta,
     AgentTokenUsage,
@@ -34,7 +35,7 @@ from .agent import (
 from .conversation import Conversation, ConversationError, ConversationMode, ConversationStatus
 from .permissions import PermissionChoice, PermissionController, PermissionMode
 from .providers import UsageLedger, UsageSnapshot
-from .terminal import TerminalSession
+from .terminal import RunControl, TerminalSession
 from .hooks import HookRuntime, WorkspaceTrustStore
 
 InputFunc = Callable[[str], str]
@@ -107,6 +108,10 @@ class Repl:
         start = getattr(self._conversation, "start", None)
         if start is not None:
             await start()
+        monitor: asyncio.Task[None] | None = None
+        has_subagents = getattr(self._conversation, "has_subagent_tasks", None)
+        if has_subagents is not None and has_subagents():
+            monitor = asyncio.create_task(self._monitor_subagent_tasks())
         try:
             while not self._state.exit_requested:
                 try:
@@ -148,6 +153,21 @@ class Repl:
                     self._terminal.write_error(f"Warning: {warning.message}\n")
             except Exception:
                 self._terminal.write_error("Warning: conversation shutdown failed.\n")
+            if monitor is not None:
+                await asyncio.gather(monitor, return_exceptions=True)
+
+    async def _monitor_subagent_tasks(self) -> None:
+        try:
+            async for event in self._conversation.subagent_terminal_events():
+                summary = (
+                    f"subagent[{event.task_id[:8]}]: {event.status.value}"
+                )
+                try:
+                    await self._terminal.notify(summary)
+                except Exception:
+                    continue
+        except Exception:
+            return
 
     async def _prompt_hook_trust(self) -> bool:
         workspace = str(self._workspace or "workspace")
@@ -249,16 +269,86 @@ class Repl:
     async def reset_conversation(self) -> None:
         await self._conversation.reset()
 
+    def list_subagent_tasks(self):
+        return self._conversation.list_subagent_tasks()
+
+    def get_subagent_task(self, task_id: str):
+        return self._conversation.get_subagent_task(task_id)
+
+    async def cancel_subagent_task(self, task_id: str):
+        return await self._conversation.cancel_subagent_task(task_id)
+
     async def _consume(self, source: AsyncIterator[AgentEvent]) -> None:
         renderer = _EventRenderer()
-        async for event in source:
-            if isinstance(event, AgentPermissionRequest):
-                await self._handle_permission_request(event)
-                continue
-            text = renderer.render(event)
-            if text is None:
-                continue
-            self._terminal.write(text)
+        iterator = source.__aiter__()
+        event_task = asyncio.create_task(_next_agent_event(iterator))
+        control_reader = getattr(self._terminal, "read_run_control", None)
+        control_task = (
+            asyncio.create_task(_next_run_control(control_reader))
+            if control_reader is not None
+            else None
+        )
+        try:
+            while event_task is not None:
+                waiters = {event_task}
+                if control_task is not None:
+                    waiters.add(control_task)
+                done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+                if event_task in done:
+                    try:
+                        has_event, value = event_task.result()
+                    except Exception:
+                        raise
+                    if not has_event:
+                        if isinstance(value, StopAsyncIteration):
+                            return
+                        raise value
+                    event = value
+                    event_task = None
+                    if isinstance(event, AgentPermissionRequest):
+                        if control_task is not None:
+                            control_task.cancel()
+                            await asyncio.gather(control_task, return_exceptions=True)
+                            control_task = None
+                        await self._handle_permission_request(event)
+                        event_task = asyncio.create_task(_next_agent_event(iterator))
+                        if control_reader is not None:
+                            control_task = asyncio.create_task(
+                                _next_run_control(control_reader)
+                            )
+                        continue
+                    text = renderer.render(event)
+                    if text is not None:
+                        self._terminal.write(text)
+                    event_task = asyncio.create_task(_next_agent_event(iterator))
+                if control_task is not None and control_task in done:
+                    has_control, value = control_task.result()
+                    control_task = None
+                    if not has_control:
+                        raise value
+                    control = value
+                    if control is RunControl.BACKGROUND:
+                        task_id = await self._conversation.background_foreground_subagent()
+                        if task_id is None:
+                            self._terminal.write("subagent: no foreground task to background\n")
+                        else:
+                            self._terminal.write(
+                                f"subagent[{task_id[:8]}]: moved to background\n"
+                            )
+                    if control_reader is not None:
+                        control_task = asyncio.create_task(
+                            _next_run_control(control_reader)
+                        )
+        finally:
+            pending = [
+                task
+                for task in (event_task, control_task)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     async def _handle_permission_request(self, event: AgentPermissionRequest) -> None:
         challenge = event.challenge
@@ -311,6 +401,13 @@ class _LegacyTerminal:
         return self._input(
             f"trust project Hooks for {workspace} ({source})? [y]es/[n]o: "
         )
+
+    async def read_run_control(self) -> RunControl:
+        future = asyncio.get_running_loop().create_future()
+        return await future
+
+    async def notify(self, text: str) -> None:
+        self.write(" ".join(text.splitlines())[:512] + "\n")
 
     def write(self, text: str) -> None:
         self._stdout.write(text)
@@ -374,6 +471,12 @@ def _format_event(event: AgentEvent) -> str | None:
         return f"context: {event.status.message}\n"
     if isinstance(event, AgentTextDelta):
         return event.text
+    if isinstance(event, AgentSubagentProgress):
+        message = " ".join(event.message.splitlines())[:160]
+        return (
+            f"subagent[{event.task_id[:8]}]: {event.status}"
+            f" - {message}\n"
+        )
     if isinstance(event, AgentToolCall):
         return f"tool: {event.request.name} ...\n"
     if isinstance(event, AgentToolResult):
@@ -437,3 +540,17 @@ def _is_secondary_event(event: AgentEvent) -> bool:
 
 def _indent_lines(text: str) -> str:
     return "".join(f"  {line}" for line in text.splitlines(keepends=True))
+
+
+async def _next_agent_event(iterator):
+    try:
+        return True, await anext(iterator)
+    except BaseException as exc:
+        return False, exc
+
+
+async def _next_run_control(reader):
+    try:
+        return True, await reader()
+    except BaseException as exc:
+        return False, exc

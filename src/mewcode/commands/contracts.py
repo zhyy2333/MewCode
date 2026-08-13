@@ -8,6 +8,7 @@ from mewcode.continuity import MemoryRuntimeStatus
 from mewcode.conversation import ConversationStatus
 from mewcode.permissions import PermissionMode
 from mewcode.providers import UsageSnapshot
+from mewcode.subagents import SubagentTaskSnapshot, TaskCancelResult
 
 from .core import CommandRegistry, InteractionMode, ParsedInput
 
@@ -58,6 +59,12 @@ class CommandRuntime(Protocol):
     ) -> None: ...
 
     async def reset_conversation(self) -> None: ...
+
+    def list_subagent_tasks(self) -> tuple[SubagentTaskSnapshot, ...]: ...
+
+    def get_subagent_task(self, task_id: str) -> SubagentTaskSnapshot | None: ...
+
+    async def cancel_subagent_task(self, task_id: str) -> TaskCancelResult: ...
 
 
 @dataclass(frozen=True)

@@ -15,6 +15,7 @@ from mewcode.agent import (
     AgentPermissionDecision,
     AgentProgress,
     AgentStopped,
+    AgentSubagentProgress,
     AgentTextDelta,
     AgentTokenUsage,
     AgentToolCall,
@@ -50,6 +51,8 @@ from mewcode.hooks.models import (
 )
 from mewcode.hooks.runtime import HookRuntime
 from mewcode.hooks.trust import WorkspaceTrustStore
+from mewcode.subagents import SubagentTaskStatus, SubagentTerminalEvent
+from mewcode.terminal import RunControl
 
 
 @pytest.fixture(autouse=True)
@@ -145,6 +148,97 @@ def render_events(events: list[object]) -> str:
         for event in events
         if (text := renderer.render(event)) is not None
     )
+
+
+def test_subagent_progress_renderer_is_bounded_and_payload_safe() -> None:
+    text = render_events(
+        [AgentSubagentProgress("1234567890", "foreground", "working", "line1\nline2")]
+    )
+    assert text == "subagent[12345678]: working - line1 line2\n"
+
+
+def test_consume_races_ctrl_b_without_interrupting_agent_events() -> None:
+    class Terminal:
+        def __init__(self):
+            self.output = []
+            self.controls = 0
+
+        async def read_run_control(self):
+            self.controls += 1
+            if self.controls == 1:
+                return RunControl.BACKGROUND
+            await asyncio.Future()
+
+        def write(self, text): self.output.append(text)
+        def write_error(self, text): self.output.append(text)
+
+    class Conversation(FakeConversation):
+        def __init__(self):
+            super().__init__()
+            self.detaches = 0
+
+        async def background_foreground_subagent(self):
+            self.detaches += 1
+            return "abcdefgh-task"
+
+    async def source():
+        await asyncio.sleep(0)
+        yield AgentSubagentProgress("abcdefgh-task", "foreground", "working", "safe")
+        yield stop_event()
+
+    async def scenario():
+        terminal = Terminal()
+        conversation = Conversation()
+        repl = Repl(conversation, terminal=terminal)
+        await repl._consume(source())
+        return terminal, conversation
+
+    terminal, conversation = asyncio.run(scenario())
+    assert conversation.detaches == 1
+    assert any("moved to background" in item for item in terminal.output)
+    assert any("working - safe" in item for item in terminal.output)
+
+
+def test_terminal_monitor_drains_last_subagent_event_during_close() -> None:
+    class Terminal:
+        def __init__(self):
+            self.notices = []
+            self.prompts = 0
+
+        async def prompt(self):
+            self.prompts += 1
+            return "/exit"
+        async def notify(self, text): self.notices.append(text)
+        def write(self, text): pass
+        def write_error(self, text): pass
+        def clear(self): pass
+        def invalidate(self): pass
+
+    class Conversation(FakeConversation):
+        def __init__(self):
+            super().__init__()
+            self.queue = asyncio.Queue()
+
+        async def start(self): pass
+        def has_subagent_tasks(self): return True
+        async def subagent_terminal_events(self):
+            while True:
+                item = await self.queue.get()
+                if item is None:
+                    return
+                yield item
+        async def close(self):
+            await self.queue.put(
+                SubagentTerminalEvent("123456789", SubagentTaskStatus.COMPLETED, "hidden")
+            )
+            await self.queue.put(None)
+            return ()
+
+    terminal = Terminal()
+    conversation = Conversation()
+    repl = Repl(conversation, terminal=terminal)
+    assert asyncio.run(repl._run_loop()) == 0
+    assert terminal.notices == ["subagent[12345678]: completed"]
 
 
 def test_repl_exit_closes_conversation_and_returns_zero() -> None:

@@ -33,6 +33,14 @@ from .providers import ChatMessage
 from .hooks import HookEvent, HookRuntime, make_event
 from .tools import ToolRegistry, ToolSafety
 from .skills import SkillCoordinator, SkillMode, SkillRefreshResult, SkillRuntime
+from .subagents import (
+    RootAgentRequestBoundary,
+    SubagentDiagnostic,
+    SubagentTaskManager,
+    SubagentTaskSnapshot,
+    SubagentTerminalEvent,
+    TaskCancelResult,
+)
 
 
 class ConversationError(RuntimeError):
@@ -79,6 +87,7 @@ class Conversation:
         skill_coordinator: SkillCoordinator | None = None,
         skill_refresher: Callable[[], SkillRefreshResult] | None = None,
         hook_runtime: HookRuntime | None = None,
+        task_manager: SubagentTaskManager | None = None,
     ) -> None:
         self._runner = runner
         self._tools = tools
@@ -106,6 +115,7 @@ class Conversation:
         self._skill_refresher = skill_refresher
         self._active_skill_safety = {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
         self._hook_runtime = hook_runtime
+        self._task_manager = task_manager
         self._started = False
         self._closed = False
 
@@ -250,6 +260,11 @@ class Conversation:
     async def reset(self) -> None:
         if self._active_run is not None or self._active_context_operation is not None:
             raise ConversationError("Another conversation operation is already active.")
+        if self._task_manager is not None:
+            try:
+                await self._task_manager.reset()
+            except Exception as exc:
+                raise ConversationError("Subagent tasks could not be reset.") from exc
         await self._memory.await_pending()
         try:
             if self._session is not None:
@@ -326,6 +341,37 @@ class Conversation:
         if self._active_context_operation is not None:
             await self._active_context_operation.cancel()
 
+    def has_subagent_tasks(self) -> bool:
+        return self._task_manager is not None
+
+    def list_subagent_tasks(self) -> tuple[SubagentTaskSnapshot, ...]:
+        return self._task_manager.list() if self._task_manager is not None else ()
+
+    def get_subagent_task(self, task_id: str) -> SubagentTaskSnapshot | None:
+        return self._task_manager.get(task_id) if self._task_manager is not None else None
+
+    async def cancel_subagent_task(self, task_id: str) -> TaskCancelResult:
+        if self._task_manager is None:
+            return TaskCancelResult.NOT_FOUND
+        try:
+            return await self._task_manager.cancel(task_id)
+        except Exception as exc:
+            raise ConversationError("The subagent task could not be cancelled.") from exc
+
+    async def background_foreground_subagent(self) -> str | None:
+        if self._task_manager is None:
+            return None
+        try:
+            return await self._task_manager.detach_current_foreground("manual")
+        except Exception as exc:
+            raise ConversationError("The foreground subagent could not be backgrounded.") from exc
+
+    async def subagent_terminal_events(self) -> AsyncIterator[SubagentTerminalEvent]:
+        if self._task_manager is None:
+            return
+        async for event in self._task_manager.terminal_events():
+            yield event
+
     async def compact(self) -> AsyncIterator[AgentEvent]:
         if self._context_manager is None:
             raise ConversationError("Context management is unavailable.")
@@ -352,14 +398,25 @@ class Conversation:
             if self._active_context_operation is operation:
                 self._active_context_operation = None
 
-    async def close(self) -> tuple[ContextStatus | ContinuityDiagnostic, ...]:
+    async def close(self) -> tuple[ContextStatus | ContinuityDiagnostic | SubagentDiagnostic, ...]:
         if self._closed:
             return ()
         self._closed = True
         await self.cancel_active()
-        diagnostics: list[ContextStatus | ContinuityDiagnostic] = list(
-            await self._memory.close()
-        )
+        diagnostics: list[ContextStatus | ContinuityDiagnostic | SubagentDiagnostic] = []
+        if self._task_manager is not None:
+            try:
+                diagnostics.extend(await self._task_manager.close())
+            except Exception:
+                diagnostics.append(
+                    SubagentDiagnostic(None, "Subagent task shutdown did not finish cleanly.")
+                )
+        try:
+            diagnostics.extend(await self._memory.close())
+        except Exception:
+            diagnostics.append(
+                SubagentDiagnostic(None, "Memory shutdown did not finish cleanly.")
+            )
         if self._hook_runtime is not None and self._started:
             await self._hook_runtime.dispatch(
                 make_event(
@@ -371,13 +428,33 @@ class Conversation:
                 )
             )
         if self._session is not None:
-            diagnostics.extend(self._session.close())
+            try:
+                diagnostics.extend(self._session.close())
+            except Exception:
+                diagnostics.append(
+                    SubagentDiagnostic(None, "Session shutdown did not finish cleanly.")
+                )
         if self._skill_runtime is not None:
-            self._skill_runtime.close()
+            try:
+                self._skill_runtime.close()
+            except Exception:
+                diagnostics.append(
+                    SubagentDiagnostic(None, "Skill shutdown did not finish cleanly.")
+                )
         if self._context_manager is not None:
-            diagnostics.extend(self._context_manager.close())
+            try:
+                diagnostics.extend(self._context_manager.close())
+            except Exception:
+                diagnostics.append(
+                    SubagentDiagnostic(None, "Context shutdown did not finish cleanly.")
+                )
         if self._hook_runtime is not None:
-            await self._hook_runtime.close()
+            try:
+                await self._hook_runtime.close()
+            except Exception:
+                diagnostics.append(
+                    SubagentDiagnostic(None, "Hook shutdown did not finish cleanly.")
+                )
         return tuple(diagnostics)
 
     async def _run(
@@ -412,6 +489,16 @@ class Conversation:
             prompt_context,
             history_commit_sink=self._session,
             run_view_provider=run_view_provider,
+            request_boundary_factory=(
+                (
+                    lambda slot: RootAgentRequestBoundary(
+                        self._task_manager.notifications,
+                        slot,
+                    )
+                )
+                if self._task_manager is not None
+                else None
+            ),
         )
         self._active_run = run
         self._last_outcome = None
