@@ -20,7 +20,19 @@ from .models import (
     AgentDefinitionError,
     AgentDefinitionLayer,
     AgentDefinitionSource,
+    NotificationBatch,
+    SubagentDiagnostic,
+    SubagentKind,
+    SubagentNotification,
+    SubagentParent,
+    SubagentPlacement,
+    SubagentProgress,
+    SubagentTaskSnapshot,
+    SubagentTaskStatus,
+    SubagentTerminalEvent,
+    TaskCancelResult,
 )
+from .notifications import SubagentNotificationQueue, render_notifications
 from .parser import parse_agent_definition
 from .paths import AgentDefinitionRoots, discover_agent_sources
 from .permissions import SubagentPermissionController, persistent_permission_snapshot
@@ -37,6 +49,13 @@ from .scoped_tools import (
     TaskScopedTool,
     build_task_scoped_registry,
 )
+from .tasks import (
+    SubagentDriverOutcome,
+    SubagentLaunch,
+    SubagentTaskDriver,
+    SubagentTaskHandle,
+    SubagentTaskManager,
+)
 
 __all__ = [
     "AGENT_NAME_PATTERN",
@@ -51,6 +70,7 @@ __all__ = [
     "MAX_RETAINED_TASKS",
     "MAX_SELECTED_PROMPT_BYTES",
     "MAX_TASK_BYTES",
+    "NotificationBatch",
     "TASK_CLOSE_TIMEOUT_SECONDS",
     "AgentCatalogError",
     "AgentDefinition",
@@ -66,7 +86,23 @@ __all__ = [
     "FileReadObservationCache",
     "FrozenSubagentToolPolicy",
     "SubagentPermissionController",
+    "SubagentDiagnostic",
+    "SubagentDriverOutcome",
+    "SubagentKind",
+    "SubagentLaunch",
+    "SubagentNotification",
+    "SubagentNotificationQueue",
+    "SubagentParent",
+    "SubagentPlacement",
+    "SubagentProgress",
+    "SubagentTaskDriver",
+    "SubagentTaskHandle",
+    "SubagentTaskManager",
+    "SubagentTaskSnapshot",
+    "SubagentTaskStatus",
+    "SubagentTerminalEvent",
     "TaskScopedTool",
+    "TaskCancelResult",
     "build_agent_catalog",
     "build_defined_tool_scope",
     "build_fork_tool_policy",
@@ -74,4 +110,5 @@ __all__ = [
     "discover_agent_sources",
     "parse_agent_definition",
     "persistent_permission_snapshot",
+    "render_notifications",
 ]

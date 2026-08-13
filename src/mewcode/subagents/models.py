@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import IntEnum, StrEnum
+from datetime import datetime
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
 
 from mewcode.permissions import PermissionMode
+from mewcode.providers import TokenUsage
 
 
 AGENT_NAME_PATTERN = r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
@@ -101,3 +103,111 @@ class AgentDefinitionError(ValueError):
 
 class AgentCatalogError(ValueError):
     pass
+
+
+class SubagentKind(StrEnum):
+    DEFINED = "defined"
+    FORK = "fork"
+
+
+class SubagentTaskStatus(StrEnum):
+    REGISTERED = "registered"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+    @property
+    def terminal(self) -> bool:
+        return self in {
+            SubagentTaskStatus.COMPLETED,
+            SubagentTaskStatus.FAILED,
+            SubagentTaskStatus.CANCELLED,
+        }
+
+    @property
+    def active(self) -> bool:
+        return not self.terminal
+
+
+class SubagentPlacement(StrEnum):
+    FOREGROUND = "foreground"
+    BACKGROUND = "background"
+
+
+class TaskCancelResult(StrEnum):
+    REQUESTED = "requested"
+    NOT_FOUND = "not_found"
+    ALREADY_TERMINAL = "already_terminal"
+    ALREADY_REQUESTED = "already_requested"
+
+
+@dataclass(frozen=True)
+class SubagentParent:
+    run_id: str
+    iteration: int
+
+
+@dataclass(frozen=True)
+class SubagentProgress:
+    iteration: int
+    phase: str
+    message: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "message", self.message[:1024])
+
+
+@dataclass(frozen=True)
+class SubagentTaskSnapshot:
+    task_id: str
+    kind: SubagentKind
+    status: SubagentTaskStatus
+    placement: SubagentPlacement
+    role: str | None
+    profile_name: str
+    parent: SubagentParent
+    created_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+    progress: SubagentProgress | None = None
+    result: str = ""
+    error: str | None = None
+    truncated: bool = False
+    usage: TokenUsage = TokenUsage.zero()
+    notification_pending: bool = False
+
+
+@dataclass(frozen=True)
+class SubagentNotification:
+    task_id: str
+    status: SubagentTaskStatus
+    role: str | None
+    result: str
+    error: str | None
+    truncated: bool
+    usage: TokenUsage
+    completed_at: datetime
+
+
+@dataclass(frozen=True)
+class NotificationBatch:
+    notifications: tuple[SubagentNotification, ...]
+    rendered_system_section: str
+    encoded_bytes: int
+
+
+@dataclass(frozen=True)
+class SubagentTerminalEvent:
+    task_id: str
+    status: SubagentTaskStatus
+    summary: str
+
+
+@dataclass(frozen=True)
+class SubagentDiagnostic:
+    task_id: str | None
+    message: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "message", self.message[:MAX_DIAGNOSTIC_CHARS])
