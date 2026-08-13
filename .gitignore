@@ -1,6 +1,8 @@
 # Local MewCode config and secrets
 /.mewcode/*
 !/.mewcode/permissions.yaml
+!/.mewcode/hooks.yaml
+/.mewcode/hooks.local.yaml
 /config.yaml
 /config.yml
 /.codex

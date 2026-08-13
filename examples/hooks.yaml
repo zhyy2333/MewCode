@@ -1,0 +1,55 @@
+hooks:
+  # Prompt actions add context to the next real Provider request only.
+  - event: session.start
+    action:
+      type: prompt
+      content: Prefer the repository formatter for generated source files.
+      once: true
+
+  # Conditions use exactly one all/any group. Matches are complete, not partial.
+  - event: tool.before
+    if:
+      all:
+        - field: tool.name
+          match: exact
+          value: run_command
+        - field: tool.arguments.command
+          match: regex
+          value: "^git\\s+push(?:\\s|$)"
+        - field: tool.target.value
+          match: glob
+          value: "git *"
+          negate: false
+    action:
+      type: command
+      command: python .mewcode/check_push.py
+      timeout_seconds: 10
+      once: false
+      background: false
+
+  # The endpoint receives the same bounded JSON envelope as command stdin.
+  - event: turn.end
+    if:
+      any:
+        - field: turn.status
+          match: exact
+          value: success
+        - field: turn.status
+          match: exact
+          value: failure
+    action:
+      type: http
+      url: https://hooks.example.test/mewcode
+      method: POST
+      headers:
+        X-Hook-Source: mewcode
+      timeout_seconds: 15
+      once: false
+      background: true
+
+  # Agent actions are validated but intentionally skipped in this release.
+  - event: session.end
+    action:
+      type: agent
+      task: Summarize the completed session.
+      once: false

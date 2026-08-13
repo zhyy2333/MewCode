@@ -264,7 +264,56 @@ mew> 按刚才的分析实现并验证
 
 `/do` 只把持续模式切回 DEFAULT，不会自动执行或改写旧版本会话中保存的计划。内置 `/review` 是独立只读 Skill；在 PLAN 中调用时仍受只读安全上限约束，完成或失败后不会改变持续模式。
 
-当前阶段不包含网络请求限制、资源配额、审计日志和自动化质量评估。
+当前阶段不包含通用网络沙箱、自动化质量评估或 Hook 之外的审计系统。
+
+## Hook 自动化
+
+Hook 在 Agent 生命周期的固定边界执行声明式自动化。配置按以下顺序追加加载，文件缺失等同空配置；任一文件存在格式错误时，整个 Hook 目录在启动阶段被拒绝，不会先执行部分规则：
+
+- 用户全局：`~/.mewcode/hooks.yaml`
+- 项目共享：`<workspace>/.mewcode/hooks.yaml`
+- 项目本地：`<workspace>/.mewcode/hooks.local.yaml`
+
+每条规则由必填 `event`、可选 `if` 和必填 `action` 组成。固定事件为 `session.start/end`、`turn.start/end`、`message.before/after`、`tool.before/after`、`system.compact.before/after` 和 `system.error`。message 边界对应每一次真实 Provider 请求，包括主回复、独立 Skill、上下文摘要和记忆更新；已开始的生命周期在失败、拒绝或取消时仍会得到配对 after/end。
+
+```yaml
+hooks:
+  - event: tool.before
+    if:
+      all:
+        - field: tool.name
+          match: exact
+          value: run_command
+        - field: tool.arguments.command
+          match: regex
+          value: "^git\\s+push(?:\\s|$)"
+          negate: false
+    action:
+      type: command
+      command: python .mewcode/check_push.py
+      timeout_seconds: 10
+      once: false
+      background: false
+```
+
+条件必须选择非空 `all` 或 `any`，不能混用或嵌套。子句支持类型严格的 `exact`、与权限规则相同转义语义的完整 `glob`、带运行时超时的完整 `regex`，以及最后应用的 `negate`。`tool.arguments.*` 可定位嵌套工具参数；对象、数组和 null 不会被隐式转成字符串。
+
+动作有四类：
+
+- `command`：以工作区为 cwd 执行 shell 命令，统一事件 JSON 从 stdin 输入；默认超时 60 秒，最大 600 秒。
+- `prompt`：把内容加入下一次真实模型请求的动态 `## Hook Context`，消费后不重放，也不写入历史。
+- `http`：把同一事件 JSON 作为请求体发往 HTTP(S) 地址；默认 POST/30 秒，最大 120 秒，不跟随重定向。
+- `agent`：当前版本只校验并记录 placeholder skipped，不会真正启动子 Agent。
+
+command 和 HTTP 支持 `once`、`background` 与各自的 `timeout_seconds`。`once` 在当前进程首次匹配、动作尝试前原子消费，即使动作失败也不重试；重启后可以再次触发，不写持久标记。后台动作按声明顺序启动，退出时有界等待后取消/终止；`tool.before` 以及 prompt/agent 不允许后台运行。同步动作按声明顺序执行，普通 Hook 失败只写诊断并继续 Agent 主流程。
+
+`tool.before` 的同步 command stdout 或 HTTP 2xx body 可以返回严格 JSON：`{"decision":"allow"}` 或 `{"decision":"deny","reason":"..."}`。空响应表示继续；非零退出、非 2xx、超时、非法 JSON、未知决定或缺少 reason 都按 Hook 失败放行。首个合法 deny 会停止剩余 before 规则，不执行工具，并把原因作为失败 ToolResult 反馈模型。安全顺序始终是“危险命令/路径硬门禁 → Hook → 权限规则与人工确认”；Hook allow 不能越过任何权限限制，硬门禁拒绝的参数不会发送给外部 Hook。
+
+command stdin 与 HTTP body 使用相同的有界、带 `schema_version` 的 JSON 信封。大参数会被递归截断并在 `truncated_fields` 标记；信封不包含完整历史、PromptPackage、隐藏模型内容、API Key 或认证头。command 环境还会移除所有 Profile Key 变量。项目共享配置中的 command/HTTP 首次使用前需要针对当前规范工作区单独确认信任；拒绝后仅禁用这两类外部动作，prompt 仍可用，其他工作区不会继承决定。
+
+动作结果写入 `~/.mewcode/logs/hooks.jsonl`，约 1 MiB 时轮转并保留 `.1`–`.3`。日志仅记录事件、规则来源/索引、动作类型、后台状态、耗时、结果和有界脱敏摘要，不保存信封、headers、响应正文、原始堆栈或凭据。主要上限还包括每文件 256 条、合并 512 条、每规则 32 个条件、单 prompt 32 KiB、单次 prompt 消费 64 KiB、外部信封 1 MiB、command 双路输出各 64 KiB、HTTP 响应 64 KiB、后台任务 32 个。
+
+完整示例见 `examples/hooks.yaml`。本阶段不提供显式 priority、热重载、失败重试、跨重启 once、真实子 Agent、通用 OS 沙箱或跨平台 shell 语法转换。
 
 ## 权限系统
 
