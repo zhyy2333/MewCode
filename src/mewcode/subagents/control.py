@@ -15,17 +15,63 @@ from .models import SubagentPlacement, SubagentTaskStatus
 from .tasks import SubagentTaskHandle, SubagentTaskManager
 
 
-AGENT_TOOL_SCHEMA = {
-    "type": "object",
-    "properties": {
-        "type": {"type": "string", "enum": ["defined", "fork"]},
-        "task": {"type": "string"},
-        "role": {"type": "string"},
-        "background": {"type": "boolean"},
-    },
-    "required": ["type", "task"],
-    "additionalProperties": False,
-}
+class _FrozenSchemaDict(dict):
+    def _reject_mutation(self, *args, **kwargs):
+        del args, kwargs
+        raise TypeError("The agent tool schema is immutable.")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    clear = _reject_mutation
+    pop = _reject_mutation
+    popitem = _reject_mutation
+    setdefault = _reject_mutation
+    update = _reject_mutation
+    __ior__ = _reject_mutation
+
+
+class _FrozenSchemaList(list):
+    def _reject_mutation(self, *args, **kwargs):
+        del args, kwargs
+        raise TypeError("The agent tool schema is immutable.")
+
+    __setitem__ = _reject_mutation
+    __delitem__ = _reject_mutation
+    __iadd__ = _reject_mutation
+    __imul__ = _reject_mutation
+    append = _reject_mutation
+    clear = _reject_mutation
+    extend = _reject_mutation
+    insert = _reject_mutation
+    pop = _reject_mutation
+    remove = _reject_mutation
+    reverse = _reject_mutation
+    sort = _reject_mutation
+
+
+def _freeze_schema(value):
+    if isinstance(value, dict):
+        return _FrozenSchemaDict(
+            (key, _freeze_schema(item)) for key, item in value.items()
+        )
+    if isinstance(value, list):
+        return _FrozenSchemaList(_freeze_schema(item) for item in value)
+    return value
+
+
+AGENT_TOOL_SCHEMA = _freeze_schema(
+    {
+        "type": "object",
+        "properties": {
+            "type": {"type": "string", "enum": ["defined", "fork"]},
+            "task": {"type": "string"},
+            "role": {"type": "string"},
+            "background": {"type": "boolean"},
+        },
+        "required": ["type", "task"],
+        "additionalProperties": False,
+    }
+)
 
 
 class AgentTool:

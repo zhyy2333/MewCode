@@ -313,11 +313,13 @@ def test_command_sequence_keeps_all_local_commands_out_of_conversation() -> None
         "do",
         "help",
         "memory",
-            "permission",
-            "plan",
-            "reset",
+        "permission",
+        "plan",
+        "reset",
         "session",
         "status",
+        "task",
+        "tasks",
     ]
 
 

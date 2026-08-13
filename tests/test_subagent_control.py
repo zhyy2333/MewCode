@@ -211,6 +211,12 @@ def test_agent_tool_schema_is_stable_across_catalog_and_task_state(tmp_path: Pat
         "required": ["type", "task"],
         "additionalProperties": False,
     }
+    with pytest.raises(TypeError, match="immutable"):
+        AGENT_TOOL_SCHEMA["extra"] = True
+    with pytest.raises(TypeError, match="immutable"):
+        AGENT_TOOL_SCHEMA["required"].append("extra")
+    with pytest.raises(TypeError, match="immutable"):
+        AGENT_TOOL_SCHEMA["properties"]["type"]["enum"][0] = "other"
 
 
 def test_explicit_background_and_fork_return_before_blocked_driver(tmp_path: Path) -> None:
