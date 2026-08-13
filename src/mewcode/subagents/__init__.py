@@ -23,6 +23,20 @@ from .models import (
 )
 from .parser import parse_agent_definition
 from .paths import AgentDefinitionRoots, discover_agent_sources
+from .permissions import SubagentPermissionController, persistent_permission_snapshot
+from .policy import (
+    DEFAULT_GLOBALLY_FORBIDDEN_TOOLS,
+    DefinedToolScope,
+    FrozenSubagentToolPolicy,
+    build_defined_tool_scope,
+    build_fork_tool_policy,
+)
+from .scoped_tools import (
+    FileReadObservation,
+    FileReadObservationCache,
+    TaskScopedTool,
+    build_task_scoped_registry,
+)
 
 __all__ = [
     "AGENT_NAME_PATTERN",
@@ -46,7 +60,18 @@ __all__ = [
     "AgentDefinitionLayer",
     "AgentDefinitionRoots",
     "AgentDefinitionSource",
+    "DEFAULT_GLOBALLY_FORBIDDEN_TOOLS",
+    "DefinedToolScope",
+    "FileReadObservation",
+    "FileReadObservationCache",
+    "FrozenSubagentToolPolicy",
+    "SubagentPermissionController",
+    "TaskScopedTool",
     "build_agent_catalog",
+    "build_defined_tool_scope",
+    "build_fork_tool_policy",
+    "build_task_scoped_registry",
     "discover_agent_sources",
     "parse_agent_definition",
+    "persistent_permission_snapshot",
 ]
