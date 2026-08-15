@@ -36,6 +36,23 @@ _scope: contextvars.ContextVar[dict[str, object]] = contextvars.ContextVar(
 )
 
 
+class HookProcessState:
+    """Event-loop-local budgets shared by root and task Hook runtimes."""
+
+    def __init__(self, once: set[object] | None = None) -> None:
+        self.once = once if once is not None else set()
+        self.background_count = 0
+
+    def acquire_background(self, limit: int) -> bool:
+        if self.background_count >= limit:
+            return False
+        self.background_count += 1
+        return True
+
+    def release_background(self) -> None:
+        self.background_count = max(0, self.background_count - 1)
+
+
 class HookRuntime:
     def __init__(
         self,
@@ -49,6 +66,8 @@ class HookRuntime:
         matcher: HookConditionMatcher | None = None,
         diagnostics: HookDiagnosticLogger | None = None,
         limits: HookLimits = DEFAULT_HOOK_LIMITS,
+        once_state: set[object] | None = None,
+        process_state: HookProcessState | None = None,
     ) -> None:
         self.catalog = catalog
         self._executor = executor
@@ -60,7 +79,8 @@ class HookRuntime:
         self._diagnostics = diagnostics
         self._limits = limits
         self._dispatch_lock = asyncio.Lock()
-        self._once: set[object] = set()
+        self._process_state = process_state or HookProcessState(once_state)
+        self._once = self._process_state.once
         self._prompts: list[str] = []
         self._task_prompts: dict[str, list[str]] = {}
         self._background: set[asyncio.Task[None]] = set()
@@ -86,6 +106,14 @@ class HookRuntime:
     @property
     def trust_required(self) -> bool:
         return self.catalog.requires_project_trust and self._project_trusted is None
+
+    @property
+    def once_state(self) -> set[object]:
+        return self._once
+
+    @property
+    def process_state(self) -> HookProcessState:
+        return self._process_state
 
     def resolve_project_trust(self, trusted: bool) -> tuple[HookDiagnostic, ...]:
         self._project_trusted = bool(trusted)
@@ -136,10 +164,11 @@ class HookRuntime:
                 self._record(event, rule, HookOutcomeKind.SKIPPED, "project external action is not trusted")
                 continue
             if rule.action.control.once:
-                if rule.key in self._once:
+                once_identity = _once_identity(rule, self.workspace)
+                if once_identity in self._once:
                     self._record(event, rule, HookOutcomeKind.SKIPPED, "once rule already consumed")
                     continue
-                self._once.add(rule.key)
+                self._once.add(once_identity)
             if isinstance(rule.action, PromptHookAction):
                 if self._queue_prompt(rule.action.content):
                     self._record(event, rule, HookOutcomeKind.SUCCESS, "prompt queued")
@@ -147,12 +176,18 @@ class HookRuntime:
                     self._record(event, rule, HookOutcomeKind.FAILURE, "prompt queue limit exceeded")
                 continue
             if rule.action.control.background:
-                if len(self._background) >= self._limits.background_tasks:
+                if not self._process_state.acquire_background(
+                    self._limits.background_tasks
+                ):
                     self._record(event, rule, HookOutcomeKind.FAILURE, "background task limit exceeded")
                     continue
                 if envelope is None:
                     envelope = serialize_event(event, self._limits)
-                task = asyncio.create_task(self._execute_background(rule, event, envelope))
+                try:
+                    task = asyncio.create_task(self._execute_background(rule, event, envelope))
+                except BaseException:
+                    self._process_state.release_background()
+                    raise
                 self._background.add(task)
                 task.add_done_callback(self._background_done)
                 continue
@@ -258,6 +293,7 @@ class HookRuntime:
 
     def _background_done(self, task: asyncio.Task[None]) -> None:
         self._background.discard(task)
+        self._process_state.release_background()
         try:
             task.exception()
         except (asyncio.CancelledError, Exception):
@@ -325,6 +361,25 @@ class HookRuntime:
         except Exception:
             pass
         return ()
+
+
+def _once_identity(rule: HookRule, workspace: Path) -> tuple[object, ...]:
+    resolved = rule.key.path.resolve(strict=False)
+    if rule.key.source is HookSource.USER:
+        path_identity = str(resolved)
+    else:
+        try:
+            path_identity = resolved.relative_to(workspace.resolve(strict=False)).as_posix()
+        except ValueError:
+            path_identity = str(resolved)
+    return (
+        rule.key.source,
+        path_identity,
+        rule.key.index,
+        repr(rule.event),
+        repr(rule.condition),
+        repr(rule.action),
+    )
 
 
 def _bounded_identifier(value: object, limit: int = 128) -> str | None:

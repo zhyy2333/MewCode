@@ -6,9 +6,11 @@ from mewcode.agent import AgentControlContext, ForkRequestSeed
 from mewcode.permissions import PermissionRuleStore
 from mewcode.prompting import PromptAdditions
 from mewcode.tools import ToolRegistry
+from mewcode.worktrees import WorktreeLifecycleService
 
 from .models import (
     MAX_TASK_BYTES,
+    AgentIsolation,
     AgentDefinitionCatalog,
     SubagentKind,
     SubagentParent,
@@ -22,6 +24,8 @@ from .policy import (
 )
 from .runtime import SubagentRuntimeFactory
 from .tasks import SubagentLaunch
+from .workspace_runtime import WorkspaceRuntimeBundleFactory
+from .worktree_driver import WorktreeSubagentDriver
 
 
 class SubagentCoordinationError(ValueError):
@@ -38,7 +42,10 @@ class SubagentCoordinator:
         *,
         background_capable_names: Iterable[str],
         additions_supplier: Callable[[], PromptAdditions] = PromptAdditions,
+        worktree_additions_supplier: Callable[[], PromptAdditions] | None = None,
         globally_forbidden_names: Iterable[str] = DEFAULT_GLOBALLY_FORBIDDEN_TOOLS,
+        worktree_lifecycle: WorktreeLifecycleService | None = None,
+        workspace_runtime_factory: WorkspaceRuntimeBundleFactory | None = None,
     ) -> None:
         self._catalog = catalog
         self._runtime_factory = runtime_factory
@@ -46,7 +53,12 @@ class SubagentCoordinator:
         self._parent_rule_store = parent_rule_store
         self._background_capable_names = frozenset(background_capable_names)
         self._additions_supplier = additions_supplier
+        self._worktree_additions_supplier = (
+            worktree_additions_supplier or additions_supplier
+        )
         self._globally_forbidden_names = frozenset(globally_forbidden_names)
+        self._worktree_lifecycle = worktree_lifecycle
+        self._workspace_runtime_factory = workspace_runtime_factory
 
     def prepare(
         self,
@@ -127,7 +139,11 @@ class SubagentCoordinator:
         profile_name = (
             context.profile_name if definition.model == "inherit" else definition.model
         )
-        base = self._additions_supplier()
+        base = (
+            self._worktree_additions_supplier()
+            if definition.isolation is AgentIsolation.WORKTREE
+            else self._additions_supplier()
+        )
         additions = PromptAdditions(
             custom_instructions=base.custom_instructions,
             long_term_memory=base.long_term_memory,
@@ -135,6 +151,15 @@ class SubagentCoordinator:
         holder: dict[str, SubagentLaunch] = {}
 
         def create(task_id: str):
+            if definition.isolation is AgentIsolation.WORKTREE:
+                if self._worktree_lifecycle is None or self._workspace_runtime_factory is None:
+                    raise RuntimeError("Worktree isolation is unavailable in this workspace.")
+                return WorktreeSubagentDriver(
+                    task_id,
+                    holder["launch"],
+                    self._worktree_lifecycle,
+                    self._workspace_runtime_factory,
+                )
             return self._runtime_factory.create(task_id, holder["launch"])
 
         launch = SubagentLaunch(

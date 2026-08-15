@@ -164,6 +164,17 @@ def _render_one(
     ]
     if error:
         lines.extend(("error:", escape(error)))
+    if notification.worktree is not None:
+        lines.extend(
+            (
+                "worktree:",
+                f"state: {escape(notification.worktree.state[:128])}",
+                f"path: {escape(notification.worktree.path)}",
+                f"branch: {escape(notification.worktree.branch_ref)}",
+            )
+        )
+        if notification.worktree.reason:
+            lines.append(f"reason: {escape(notification.worktree.reason)}")
     if notification.truncated:
         lines.append("truncated: true")
     return "\n".join(lines)
@@ -194,6 +205,7 @@ def _bounded_notification(notification: SubagentNotification) -> SubagentNotific
         truncated=notification.truncated or result_cut or error_cut,
         usage=notification.usage,
         completed_at=notification.completed_at,
+        worktree=notification.worktree,
     )
 
 

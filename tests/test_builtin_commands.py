@@ -31,6 +31,12 @@ from mewcode.subagents import (
     SubagentTaskStatus,
     TaskCancelResult,
 )
+from mewcode.worktrees import (
+    WorktreeDeleteResult,
+    WorktreeDeleteStatus,
+    WorktreeState,
+    WorktreeStatus,
+)
 
 
 class FakeUI:
@@ -61,6 +67,9 @@ class FakeRuntime:
         self.tasks = ()
         self.cancel_result = TaskCancelResult.NOT_FOUND
         self.cancelled_ids = []
+        self.worktrees = ()
+        self.deleted_worktrees = []
+        self.delete_result = WorktreeDeleteResult(WorktreeDeleteStatus.ALREADY_ABSENT)
 
     async def compact_context(self): self.compactions += 1
     async def reset_conversation(self): self.resets += 1
@@ -74,6 +83,10 @@ class FakeRuntime:
     async def cancel_subagent_task(self, task_id):
         self.cancelled_ids.append(task_id)
         return self.cancel_result
+    async def list_worktrees(self): return self.worktrees
+    async def delete_worktree(self, name, *, force):
+        self.deleted_worktrees.append((name, force))
+        return self.delete_result
 
 
 def dispatch(name: str, arguments: str = "", ui=None, runtime=None):
@@ -87,7 +100,7 @@ def dispatch(name: str, arguments: str = "", ui=None, runtime=None):
 def test_builtin_metadata_is_exact() -> None:
     registry = create_builtin_command_registry()
     assert [item.name for item in registry.public_definitions()] == [
-        "clear", "compact", "do", "help", "memory", "permission", "plan", "reset", "session", "status", "task", "tasks"
+        "clear", "compact", "do", "help", "memory", "permission", "plan", "reset", "session", "status", "task", "tasks", "worktree", "worktrees"
     ]
     assert registry.resolve("permissions").name == "permission"
     assert registry.resolve("quit").name == "exit"
@@ -99,7 +112,7 @@ def test_builtin_metadata_is_exact() -> None:
 def test_help_is_registry_driven_and_hides_exit() -> None:
     ui, _ = dispatch("help")
     output = ui.messages[0]
-    assert output.count(" - ") == 12
+    assert output.count(" - ") == 14
     assert "/permissions" in output
     assert "/exit" not in output and "/quit" not in output
     ui, _ = dispatch("help", "/permissions")
@@ -107,6 +120,27 @@ def test_help_is_registry_driven_and_hides_exit() -> None:
     assert "Aliases: /permissions" in ui.messages[0]
     ui, _ = dispatch("help", "exit")
     assert ui.errors == ["Unknown command '/exit'. Use /help."]
+
+
+def test_worktrees_list_and_strict_delete_commands(tmp_path) -> None:
+    runtime = FakeRuntime()
+    runtime.worktrees = (
+        WorktreeStatus(
+            "task/abc",
+            WorktreeState.RETAINED,
+            tmp_path / "tree",
+            "refs/heads/mewcode/worktree/task/abc",
+            datetime.now(timezone.utc),
+            "tracked changes",
+        ),
+    )
+    ui, _ = dispatch("worktrees", runtime=runtime)
+    assert "task/abc" in ui.messages[0]
+    runtime.delete_result = WorktreeDeleteResult(WorktreeDeleteStatus.DELETED)
+    dispatch("worktree", "delete task/abc --force", runtime=runtime)
+    assert runtime.deleted_worktrees == [("task/abc", True)]
+    ui, _ = dispatch("worktree", "delete --force task/abc", runtime=runtime)
+    assert ui.errors
 
 
 def test_help_and_alias_details_share_the_same_registry_metadata() -> None:

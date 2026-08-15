@@ -6,6 +6,7 @@ from mewcode.subagents import (
     SubagentTaskStatus,
     TaskCancelResult,
 )
+from mewcode.worktrees import WorktreeDeleteStatus
 
 from .contracts import CommandContext
 from .core import (
@@ -191,10 +192,15 @@ def _progress_summary(snapshot: SubagentTaskSnapshot) -> str:
 
 def _task_label(snapshot: SubagentTaskSnapshot) -> str:
     role = snapshot.role or "fork"
+    worktree = (
+        f" worktree={snapshot.worktree.state}:{snapshot.worktree.path}"
+        if snapshot.worktree is not None
+        else ""
+    )
     return (
         f"{snapshot.task_id} kind={snapshot.kind.value} role={role[:64]} "
         f"placement={snapshot.placement.value} status={snapshot.status.value} "
-        f"created={snapshot.created_at.isoformat()} progress={_progress_summary(snapshot)}"
+        f"created={snapshot.created_at.isoformat()} progress={_progress_summary(snapshot)}{worktree}"
     )
 
 
@@ -241,6 +247,16 @@ def _task_detail(snapshot: SubagentTaskSnapshot) -> str:
         lines.append(f"result:\n{snapshot.result}")
         if snapshot.error:
             lines.append(f"error:\n{snapshot.error}")
+    if snapshot.worktree is not None:
+        lines.extend(
+            (
+                f"worktree-state: {snapshot.worktree.state}",
+                f"worktree-path: {snapshot.worktree.path}",
+                f"worktree-branch: {snapshot.worktree.branch_ref}",
+            )
+        )
+        if snapshot.worktree.reason:
+            lines.append(f"worktree-reason: {snapshot.worktree.reason}")
     return "\n".join(lines)
 
 
@@ -268,6 +284,42 @@ async def _task(context: CommandContext, arguments: str) -> None:
     raise CommandUsageError()
 
 
+async def _worktrees(context: CommandContext, arguments: str) -> None:
+    _no_arguments(arguments)
+    statuses = await context.runtime.list_worktrees()
+    if not statuses:
+        context.ui.show_message("No managed Worktrees.")
+        return
+    lines = ["Managed Worktrees:"]
+    for item in statuses:
+        reason = f" reason={item.retained_reason}" if item.retained_reason else ""
+        lines.append(
+            f"  {item.name} state={item.state.value} path={item.path} "
+            f"branch={item.branch_ref}{reason}"
+        )
+    context.ui.show_message("\n".join(lines))
+
+
+async def _worktree(context: CommandContext, arguments: str) -> None:
+    tokens = arguments.split()
+    if len(tokens) == 3 and tokens[0] == "delete" and tokens[2] == "--force":
+        name, force = tokens[1], True
+    elif len(tokens) == 2 and tokens[0] == "delete":
+        name, force = tokens[1], False
+    else:
+        raise CommandUsageError()
+    result = await context.runtime.delete_worktree(name, force=force)
+    messages = {
+        WorktreeDeleteStatus.DELETED: "Deleted managed Worktree",
+        WorktreeDeleteStatus.ALREADY_ABSENT: "Managed Worktree is already absent",
+        WorktreeDeleteStatus.RETAINED: "Retained managed Worktree",
+        WorktreeDeleteStatus.ACTIVE: "Managed Worktree is active",
+        WorktreeDeleteStatus.REJECTED: "Rejected managed Worktree deletion",
+    }
+    suffix = f": {result.reason}" if result.reason else "."
+    context.ui.show_message(f"{messages[result.status]} '{name}'{suffix}")
+
+
 def create_builtin_command_registry() -> CommandRegistry:
     definitions = (
         CommandDefinition("help", "Show command help.", "/help [command]", CommandType.LOCAL, _help, argument_hint="[command]"),
@@ -281,6 +333,8 @@ def create_builtin_command_registry() -> CommandRegistry:
         CommandDefinition("status", "Show the current runtime status.", "/status", CommandType.LOCAL, _status),
         CommandDefinition("tasks", "List subagent tasks.", "/tasks", CommandType.LOCAL, _tasks),
         CommandDefinition("task", "Show or cancel a subagent task.", "/task <id>|cancel <id>", CommandType.LOCAL, _task, argument_hint="<id>|cancel <id>"),
+        CommandDefinition("worktrees", "List managed Worktrees.", "/worktrees", CommandType.LOCAL, _worktrees),
+        CommandDefinition("worktree", "Delete a managed Worktree.", "/worktree delete <name> [--force]", CommandType.LOCAL, _worktree, argument_hint="delete <name> [--force]"),
         CommandDefinition("reset", "Reset the current conversation state.", "/reset", CommandType.LOCAL, _reset),
         CommandDefinition("exit", "Exit MewCode.", "/exit", CommandType.LOCAL, _exit, aliases=("quit",), hidden=True),
     )

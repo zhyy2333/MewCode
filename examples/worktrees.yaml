@@ -1,0 +1,16 @@
+version: 1
+rules:
+  # Copy an ignored, untracked local runtime file into each new Worktree.
+  - type: copy
+    path: .env.local
+    required: false
+
+  # Link a large ignored dependency directory; link failure never falls back to copy.
+  - type: link
+    path: node_modules
+    required: false
+
+  # Make task-local Git commands use this tracked hooks directory.
+  - type: git_hooks
+    path: .githooks
+    required: true

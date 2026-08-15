@@ -120,6 +120,8 @@ python -m mewcode
 | `/tasks` | 本地列出当前进程内的活动与终态子 Agent 任务摘要 |
 | `/task <id>` | 非阻塞查看一个子任务的状态、结果和用量 |
 | `/task cancel <id>` | 取消指定的活动子任务；重复或终态取消保持幂等 |
+| `/worktrees` | 只读列出由 MewCode 管理的 Worktree、状态、路径和临时分支 |
+| `/worktree delete <name> [--force]` | 删除指定的非活动 Worktree；默认保护未提交修改和未推送提交 |
 | `/reset` | 原子清空当前会话消息、待执行计划和 Skill 激活状态，并恢复 `[DEFAULT]` |
 
 所有有效 Skill 也会自动注册为 `/<skill-name> [input]`，因此内置的 `/commit`、`/review` 和 `/test` 会与系统命令一起出现在帮助和补全中。
@@ -134,7 +136,7 @@ python -m mewcode
 
 主 Agent 通过始终稳定的 `agent` 工具委派独立任务。工具只有 `type`、`task`、`role`、`background` 四个参数：`defined` 必须指定已加载角色，默认在前台等待；`fork` 不接受角色或 `background` 参数并始终进入后台。定义式任务超过 10 秒会原地转为后台，也可在运行时按 `Ctrl+B` 手动转后台；这不会取消、重启或重计任务。`Ctrl+C` 仍取消当前主运行以及仍与其绑定的前台子任务，已经解除到后台的任务继续执行。
 
-角色是带严格 YAML frontmatter 的 Markdown 文件。项目级 `<workspace>/.mewcode/agents/` 覆盖用户级 `~/.mewcode/agents/`，再覆盖包内置角色，最后覆盖启动时显式注入的插件根；高层无效定义会产生诊断并回退到低层有效定义，同层有效重名会拒绝启动。目录只在启动时读取，没有热重载。格式如下，七个字段全部必填：
+角色是带严格 YAML frontmatter 的 Markdown 文件。项目级 `<workspace>/.mewcode/agents/` 覆盖用户级 `~/.mewcode/agents/`，再覆盖包内置角色，最后覆盖启动时显式注入的插件根；高层无效定义会产生诊断并回退到低层有效定义，同层有效重名会拒绝启动。目录只在启动时读取，没有热重载。`isolation` 可选，缺省为 `shared`：
 
 ```markdown
 ---
@@ -148,19 +150,26 @@ disallowed_tools: []
 model: inherit
 max_turns: 20
 permission_mode: default
+isolation: worktree
 ---
 You are an independent code reviewer...
 ```
 
-`model: inherit` 使用委派父请求的 Profile；其他值必须是配置中已有的 Profile 名。`haiku`、`sonnet`、`opus` 没有内置别名，只有用户实际创建同名 Profile 时才有效。完整示例见 `examples/agents/code-reviewer.md`；内置 `explore` 角色只开放 `read_file`、`find_files`、`search_code`。
+`model: inherit` 使用委派父请求的 Profile；其他值必须是配置中已有的 Profile 名。`haiku`、`sonnet`、`opus` 没有内置别名，只有用户实际创建同名 Profile 时才有效。完整示例见 `examples/agents/code-reviewer.md` 和 `examples/agents/worktree-coder.md`；内置 `explore` 角色只开放 `read_file`、`find_files`、`search_code`。
 
-定义式子 Agent 从空历史和固定角色正文启动，只复制人工指令与长期记忆，不继承父对话、活动 Skill 或临时 Hook prompt。Fork 首轮复用产生委派调用的实际父请求 prompt、消息前缀、工具顺序和输出上限，并只在尾部追加新任务，以便 Provider 有机会复用缓存；缓存实际命中不作保证。两类任务的消息、权限 session、文件读取观察、上下文归档和 Token 统计彼此隔离，Provider 客户端、Hook 引擎和工作区文件系统共享。
+定义式子 Agent 从空历史和固定角色正文启动，只复制人工指令与长期记忆，不继承父对话、活动 Skill 或临时 Hook prompt。Fork 首轮复用产生委派调用的实际父请求 prompt、消息前缀、工具顺序和输出上限，并只在尾部追加新任务，以便 Provider 有机会复用缓存；缓存实际命中不作保证。两类任务的消息、权限 session、文件读取观察、上下文归档和 Token 统计彼此隔离；`shared` 角色仍使用主工作区，`worktree` 角色使用独立 Git Worktree。
 
 工具能力采用多层交集：父模式安全上限、角色白名单、角色黑名单、启动时冻结的后台能力名单和全局禁止名单共同收窄。`agent`、`load_skill` 不能在子 Agent 中执行，禁止嵌套委派。Fork 为保持缓存前缀可继续展示父工具 schema，但越界工具会在 Hook 和权限检查之前被冻结策略拒绝。子 Agent 不进行交互审批；任何原本为 `ASK` 的权限决定都会以非交互来源自动改写为拒绝，再把普通工具失败交回子模型继续处理。
 
 后台任务结束时终端只显示单行摘要。完整的有界结果可用 `/task <id>` 查看，并会在根 Agent 的下一次真实模型请求中以 `<untrusted-subagent-results>` 边界一次性注入；它不写入主历史。任务表和通知纯属进程内状态，退出后不恢复；`/reset` 会先取消并清空所有任务和待投递通知。
 
-本阶段不提供 Worktree 文件隔离、多 Agent 团队编排、跨会话后台任务持久化、嵌套 Agent、子 Agent 人工审批或缓存命中保证。由于工作区共享，一个子任务提交的文件变化会立即被其他任务后续真实读取看到。
+`worktree` 角色会在 `<workspace>/.mewcode/worktrees/task/<摘要>/` 创建独立目录和 `mewcode/worktree/task/<摘要>` 临时分支。所有文件、命令、Skill 进程、项目 Hook、stdio MCP、Prompt 环境和上下文归档都显式绑定该绝对目录，MewCode 不调用进程级 `chdir`。主 Agent 启动时冻结的用户级配置继续复用，项目指令、项目记忆、Hook 和 MCP 则从该 Worktree 重新加载。
+
+任务退出时，干净且没有未发布提交的临时目录会自动删除；存在 tracked 修改、未忽略的 untracked 文件、未被任一远端跟踪引用包含的新提交，或保护检查不确定时会保留，并在 `/task`、通知和 `/worktrees` 中显示。`--force` 只允许人工本地命令逐次指定，不能由 Agent 工具、配置或后台清理启用。后台清理只处理超过 24 小时的非活动候选，每轮最多 256 个，并复用相同的归属验证和非强制保护。
+
+可提交的初始化规则位于 `.mewcode/worktrees.yaml`，示例见 `examples/worktrees.yaml`。默认只尝试复制明确列出的本地 MewCode 配置/记忆；自定义 `copy` 和 `link` 规则也只接受主工作区内“未跟踪且已忽略”的内容。`link` 失败不会回退为大规模复制，`git_hooks` 通过子进程专属的 `core.hooksPath` 环境覆盖生效，不修改共享 Git 配置。
+
+Worktree 是并发文件隔离，不是操作系统安全沙箱；能够执行任意命令的代码仍可能访问绝对路径。本阶段也不提供自动合并、跨 Worktree 代码同步、多 Agent 团队编排、跨会话后台任务持久化、嵌套 Agent、子 Agent 人工审批或缓存命中保证。合并由上层显式执行 `git merge`。
 
 ## Skill 系统
 

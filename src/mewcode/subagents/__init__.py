@@ -20,6 +20,7 @@ from .models import (
     AgentDefinitionError,
     AgentDefinitionLayer,
     AgentDefinitionSource,
+    AgentIsolation,
     NotificationBatch,
     SubagentDiagnostic,
     SubagentKind,
@@ -31,6 +32,7 @@ from .models import (
     SubagentTaskStatus,
     SubagentTerminalEvent,
     TaskCancelResult,
+    WorktreeTaskSummary,
 )
 from .notifications import (
     RootAgentRequestBoundary,
@@ -61,6 +63,8 @@ from .tasks import (
     SubagentTaskManager,
 )
 from .runtime import SubagentRuntime, SubagentRuntimeFactory
+from .workspace_runtime import WorkspaceRuntimeBundle, WorkspaceRuntimeBundleFactory
+from .worktree_driver import WorktreeSubagentDriver
 from .coordinator import SubagentCoordinationError, SubagentCoordinator
 from .control import AGENT_TOOL_SCHEMA, AgentTool, SubagentDelegationOperation
 
@@ -89,6 +93,7 @@ __all__ = [
     "AgentDefinitionLayer",
     "AgentDefinitionRoots",
     "AgentDefinitionSource",
+    "AgentIsolation",
     "AgentTool",
     "DEFAULT_GLOBALLY_FORBIDDEN_TOOLS",
     "DefinedToolScope",
@@ -110,6 +115,9 @@ __all__ = [
     "SubagentProgress",
     "SubagentRuntime",
     "SubagentRuntimeFactory",
+    "WorkspaceRuntimeBundle",
+    "WorkspaceRuntimeBundleFactory",
+    "WorktreeSubagentDriver",
     "SubagentTaskDriver",
     "SubagentTaskHandle",
     "SubagentTaskManager",
@@ -118,6 +126,7 @@ __all__ = [
     "SubagentTerminalEvent",
     "TaskScopedTool",
     "TaskCancelResult",
+    "WorktreeTaskSummary",
     "build_agent_catalog",
     "build_defined_tool_scope",
     "build_fork_tool_policy",

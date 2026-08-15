@@ -36,12 +36,14 @@ class HookActionExecutor:
         http_client: httpx.AsyncClient | None = None,
         api_key_environment_names: tuple[str, ...] = (),
         limits: HookLimits = DEFAULT_HOOK_LIMITS,
+        environment_overrides: Mapping[str, str] | None = None,
     ) -> None:
         self._workspace = Path(workspace).resolve()
         self._http_client = http_client
         self._owns_http_client = False
         self._api_key_environment_names = frozenset(api_key_environment_names)
         self._limits = limits
+        self._environment_overrides = dict(environment_overrides or {})
 
     async def execute(
         self,
@@ -97,6 +99,7 @@ class HookActionExecutor:
             for key, value in os.environ.items()
             if key not in self._api_key_environment_names
         }
+        environment.update(self._environment_overrides)
         result = await run_shell(
             ProcessRequest(
                 command=action.command,

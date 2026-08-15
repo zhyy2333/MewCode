@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Mapping
 from pathlib import Path
 
 from mewcode.agent import (
@@ -15,13 +15,18 @@ from mewcode.agent import (
 )
 from mewcode.context import ContextArchive, ContextConfig, ContextManager
 from mewcode.hooks import HookRuntime
-from mewcode.prompting import PromptAdditions, PromptBuilder, PromptRunContext
+from mewcode.prompting import (
+    PromptAdditions,
+    PromptBuilder,
+    PromptEnvironmentProvider,
+    PromptRunContext,
+)
 from mewcode.providers import (
     CaptureOnlyRequestBoundary,
     LLMProvider,
     RequestSnapshotSlot,
 )
-from mewcode.tools import Workspace
+from mewcode.tools import ToolRegistry, Workspace, WorkspaceToolBinder
 
 from .permissions import SubagentPermissionController
 from .scoped_tools import FileReadObservationCache, build_task_scoped_registry
@@ -64,21 +69,66 @@ class SubagentRuntimeFactory:
         return self._hook_runtime
 
     def create(self, task_id: str, launch: SubagentLaunch) -> SubagentRuntime:
+        return self._create_with(
+            task_id,
+            launch,
+            workspace=self._workspace,
+            prompt_builder=self._prompt_builder,
+            hook_runtime=self._hook_runtime,
+            tools=launch.tools,
+        )
+
+    def create_bound(
+        self,
+        task_id: str,
+        launch: SubagentLaunch,
+        *,
+        workspace_root: Path,
+        process_environment: Mapping[str, str],
+        hook_runtime: HookRuntime | None = None,
+        additional_tools: ToolRegistry | None = None,
+    ) -> SubagentRuntime:
+        workspace = Workspace(workspace_root)
+        tools = WorkspaceToolBinder().bind(
+            launch.tools,
+            workspace,
+            process_environment=process_environment,
+            additional=additional_tools,
+        )
+        return self._create_with(
+            task_id,
+            launch,
+            workspace=workspace,
+            prompt_builder=PromptBuilder(PromptEnvironmentProvider(workspace.root)),
+            hook_runtime=hook_runtime,
+            tools=tools,
+        )
+
+    def _create_with(
+        self,
+        task_id: str,
+        launch: SubagentLaunch,
+        *,
+        workspace: Workspace,
+        prompt_builder: PromptBuilder,
+        hook_runtime: HookRuntime | None,
+        tools: ToolRegistry,
+    ) -> SubagentRuntime:
         provider = self._provider_supplier(launch.profile_name)
-        observations = FileReadObservationCache()
-        tools = build_task_scoped_registry(launch.tools, observations)
+        observations = FileReadObservationCache(workspace_root=workspace.root)
+        tools = build_task_scoped_registry(tools, observations)
         permissions = SubagentPermissionController.from_snapshot(
-            self._workspace,
+            workspace,
             launch.permission_rules,
             launch.permission_mode,
         )
         scheduler = ToolScheduler(
             permissions,
-            hook_runtime=self._hook_runtime,
+            hook_runtime=hook_runtime,
             policy=launch.policy,
         )
         archive = ContextArchive(
-            self._workspace.root,
+            workspace.root,
             session_id_factory=lambda: f"subagent-{task_id}",
         )
         archive.start(skip_stale_cleanup=True)
@@ -86,7 +136,7 @@ class SubagentRuntimeFactory:
             provider,
             archive,
             self._context_config_factory(launch.profile_name),
-            self._hook_runtime,
+            hook_runtime,
         )
         max_iterations = (
             launch.definition.max_turns
@@ -97,9 +147,9 @@ class SubagentRuntimeFactory:
             provider,
             scheduler,
             AgentRunConfig(max_iterations=max_iterations),
-            prompt_builder=self._prompt_builder,
+            prompt_builder=prompt_builder,
             context_manager=context_manager,
-            hook_runtime=self._hook_runtime,
+            hook_runtime=hook_runtime,
             profile_name=launch.profile_name,
             permission_mode_supplier=lambda: launch.permission_mode,
             allowed_safety=launch.allowed_safety,
@@ -126,8 +176,8 @@ class SubagentRuntimeFactory:
             launch,
             run,
             provider,
-            self._workspace,
-            self._hook_runtime,
+            workspace,
+            hook_runtime,
             context_manager,
             observations,
             permissions,

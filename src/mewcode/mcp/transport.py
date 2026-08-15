@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Mapping, Protocol
 
 import httpx
 
@@ -42,10 +42,12 @@ class DefaultMcpTransportFactory:
         workspace_root: Path,
         timeouts: McpTimeouts | None = None,
         http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+        environment_overrides: Mapping[str, str] | None = None,
     ) -> None:
         self._workspace_root = workspace_root
         self._timeouts = timeouts or McpTimeouts()
         self._http_client_factory = http_client_factory
+        self._environment_overrides = dict(environment_overrides or {})
 
     def create(self, config: McpServerConfig) -> McpTransport:
         if isinstance(config, StdioServerConfig):
@@ -55,6 +57,7 @@ class DefaultMcpTransportFactory:
                 config,
                 self._workspace_root,
                 shutdown_timeout=self._timeouts.shutdown_seconds,
+                environment_overrides=self._environment_overrides,
             )
         if isinstance(config, HttpServerConfig):
             from .http import StreamableHttpTransport
@@ -66,4 +69,3 @@ class DefaultMcpTransportFactory:
                 shutdown_timeout=self._timeouts.shutdown_seconds,
             )
         raise TypeError("Unsupported MCP server configuration.")
-

@@ -10,6 +10,7 @@ from mewcode.subagents import (
     AgentDefinitionError,
     AgentDefinitionLayer,
     AgentDefinitionSource,
+    AgentIsolation,
     parse_agent_definition,
 )
 
@@ -33,6 +34,7 @@ def _document(
     model: str = "inherit",
     max_turns: object = 20,
     permission_mode: str = "default",
+    isolation: str | None = None,
     body: str = "You are a reviewer.",
     newline: str = "\n",
 ) -> str:
@@ -45,9 +47,10 @@ def _document(
         f"model: {model}",
         f"max_turns: {max_turns}",
         f"permission_mode: {permission_mode}",
-        "---",
-        body,
     ]
+    if isolation is not None:
+        lines.append(f"isolation: {isolation}")
+    lines.extend(("---", body))
     return newline.join(lines)
 
 
@@ -60,6 +63,7 @@ def test_parse_valid_definition_with_lf_crlf_and_bom(tmp_path: Path) -> None:
         assert definition.name == path.stem
         assert definition.tools == ("read_file",)
         assert definition.permission_mode is PermissionMode.DEFAULT
+        assert definition.isolation is AgentIsolation.SHARED
         assert definition.system_prompt == "You are a reviewer."
 
 
@@ -140,3 +144,27 @@ def test_documented_code_reviewer_example_parses_with_read_only_tools() -> None:
     assert definition.disallowed_tools == ()
     assert definition.model == "inherit"
     assert "severity order" in definition.system_prompt
+
+
+def test_documented_worktree_coder_example_parses() -> None:
+    path = Path(__file__).parents[1] / "examples" / "agents" / "worktree-coder.md"
+    source = AgentDefinitionSource(
+        AgentDefinitionLayer.PROJECT,
+        path.parent,
+        path,
+        "worktree-coder",
+        "example",
+    )
+    definition = parse_agent_definition(source)
+    assert definition.isolation is AgentIsolation.WORKTREE
+    assert "write_file" in definition.tools
+
+
+def test_parse_explicit_isolation_modes_and_reject_unknown(tmp_path: Path) -> None:
+    for value, expected in (("shared", AgentIsolation.SHARED), ("worktree", AgentIsolation.WORKTREE)):
+        path = tmp_path / "reviewer.md"
+        path.write_text(_document(isolation=value), encoding="utf-8")
+        assert parse_agent_definition(_source(path)).isolation is expected
+    path.write_text(_document(isolation="container"), encoding="utf-8")
+    with pytest.raises(AgentDefinitionError, match="isolation"):
+        parse_agent_definition(_source(path))

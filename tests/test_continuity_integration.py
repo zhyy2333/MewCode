@@ -318,9 +318,11 @@ def test_command_sequence_keeps_all_local_commands_out_of_conversation() -> None
         "reset",
         "session",
         "status",
-        "task",
-        "tasks",
-    ]
+            "task",
+            "tasks",
+            "worktree",
+            "worktrees",
+        ]
 
 
 def test_plan_and_do_route_through_persistent_modes_without_hardcoded_review() -> None:

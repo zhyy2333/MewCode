@@ -2,7 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from hashlib import sha256
-from pathlib import PurePath
+import os
+from pathlib import Path, PurePath
 from typing import Any
 
 from mewcode.tools import Tool, ToolRegistry, ToolResult
@@ -18,9 +19,10 @@ class FileReadObservation:
 @dataclass
 class FileReadObservationCache:
     observations: dict[str, FileReadObservation] = field(default_factory=dict)
+    workspace_root: Path | None = None
 
     def observe(self, path: str, content: str) -> None:
-        normalized = _normalize_path(path)
+        normalized = self._normalize(path)
         encoded = content.encode("utf-8")
         self.observations[normalized] = FileReadObservation(
             normalized,
@@ -29,7 +31,16 @@ class FileReadObservationCache:
         )
 
     def invalidate(self, path: str) -> None:
-        self.observations.pop(_normalize_path(path), None)
+        self.observations.pop(self._normalize(path), None)
+
+    def _normalize(self, path: str) -> str:
+        candidate = Path(path)
+        if not candidate.is_absolute() and self.workspace_root is not None:
+            candidate = self.workspace_root / candidate
+        if candidate.is_absolute():
+            value = str(candidate.resolve(strict=False))
+            return os.path.normcase(value).casefold() if os.name == "nt" else value
+        return _normalize_path(path)
 
 
 class TaskScopedTool:

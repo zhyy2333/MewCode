@@ -23,6 +23,7 @@ from .continuity import (
     InstructionSnapshot,
     MemoryManager,
     MemoryTurn,
+    MemoryScope,
     NullMemoryManager,
     SessionBinding,
     SessionState,
@@ -40,6 +41,13 @@ from .subagents import (
     SubagentTaskSnapshot,
     SubagentTerminalEvent,
     TaskCancelResult,
+)
+from .worktrees import (
+    WorktreeDeleteResult,
+    WorktreeJanitor,
+    WorktreeLifecycleService,
+    WorktreePathPolicy,
+    WorktreeStatus,
 )
 
 
@@ -88,6 +96,8 @@ class Conversation:
         skill_refresher: Callable[[], SkillRefreshResult] | None = None,
         hook_runtime: HookRuntime | None = None,
         task_manager: SubagentTaskManager | None = None,
+        worktree_lifecycle: WorktreeLifecycleService | None = None,
+        worktree_janitor: WorktreeJanitor | None = None,
     ) -> None:
         self._runner = runner
         self._tools = tools
@@ -116,6 +126,8 @@ class Conversation:
         self._active_skill_safety = {ToolSafety.READ_ONLY, ToolSafety.SIDE_EFFECT}
         self._hook_runtime = hook_runtime
         self._task_manager = task_manager
+        self._worktree_lifecycle = worktree_lifecycle
+        self._worktree_janitor = worktree_janitor
         self._started = False
         self._closed = False
 
@@ -123,6 +135,8 @@ class Conversation:
         if self._started or self._closed:
             return
         self._started = True
+        if self._worktree_janitor is not None:
+            await self._worktree_janitor.start()
         if self._hook_runtime is not None:
             await self._hook_runtime.dispatch(
                 make_event(
@@ -192,6 +206,12 @@ class Conversation:
 
     def skill_base_additions(self) -> PromptAdditions:
         return self._current_additions()
+
+    def subagent_user_additions(self) -> PromptAdditions:
+        return self._prompt_additions.merged(
+            custom_instructions=self._instructions.user_content,
+            long_term_memory=self._memory.scope_prompt_view(MemoryScope.USER).content,
+        )
 
     def refresh_skills(self) -> SkillRefreshResult | None:
         return self._skill_refresher() if self._skill_refresher is not None else None
@@ -358,6 +378,23 @@ class Conversation:
         except Exception as exc:
             raise ConversationError("The subagent task could not be cancelled.") from exc
 
+    async def list_worktrees(self) -> tuple[WorktreeStatus, ...]:
+        if self._worktree_lifecycle is None:
+            return ()
+        try:
+            return await self._worktree_lifecycle.list_managed()
+        except Exception as exc:
+            raise ConversationError("Managed Worktrees could not be listed.") from exc
+
+    async def delete_worktree(self, name: str, *, force: bool) -> WorktreeDeleteResult:
+        if self._worktree_lifecycle is None:
+            raise ConversationError("Worktree isolation is unavailable.")
+        try:
+            parsed = WorktreePathPolicy().parse_name(name)
+            return await self._worktree_lifecycle.delete(parsed, force=force)
+        except Exception as exc:
+            raise ConversationError("Managed Worktree deletion was rejected.") from exc
+
     async def background_foreground_subagent(self) -> str | None:
         if self._task_manager is None:
             return None
@@ -410,6 +447,13 @@ class Conversation:
             except Exception:
                 diagnostics.append(
                     SubagentDiagnostic(None, "Subagent task shutdown did not finish cleanly.")
+                )
+        if self._worktree_janitor is not None:
+            try:
+                await self._worktree_janitor.close()
+            except Exception:
+                diagnostics.append(
+                    SubagentDiagnostic(None, "Worktree cleanup shutdown did not finish cleanly.")
                 )
         try:
             diagnostics.extend(await self._memory.close())

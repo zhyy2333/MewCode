@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from jsonschema import Draft202012Validator
 
@@ -35,6 +35,7 @@ class SkillProcessTool:
         workspace_root: Path,
         *,
         api_key_environment_names: Iterable[str] = (),
+        environment_overrides: Mapping[str, str] | None = None,
     ) -> None:
         self.name = declaration.public_name
         self.description = declaration.description
@@ -49,6 +50,7 @@ class SkillProcessTool:
         self._package = package.root
         self._workspace = workspace_root.resolve()
         self._key_names = frozenset(api_key_environment_names)
+        self._environment_overrides = dict(environment_overrides or {})
         self._last_stderr = ""
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
@@ -61,6 +63,7 @@ class SkillProcessTool:
         environment = dict(os.environ)
         for name in self._key_names:
             environment.pop(name, None)
+        environment.update(self._environment_overrides)
         environment["MEWCODE_SKILL_DIR"] = str(self._package)
         environment["MEWCODE_WORKSPACE_ROOT"] = str(self._workspace)
         try:
@@ -111,6 +114,27 @@ class SkillProcessTool:
 
     def _failure(self, message: str) -> ToolResult:
         return ToolResult(False, self.name, "", message)
+
+    def rebind_workspace(
+        self,
+        workspace_root: Path,
+        environment_overrides: Mapping[str, str] | None = None,
+    ) -> "SkillProcessTool":
+        clone = object.__new__(SkillProcessTool)
+        clone.name = self.name
+        clone.description = self.description
+        clone.parameters_schema = self.parameters_schema
+        clone.safety = self.safety
+        clone.permission_spec = self.permission_spec
+        clone._validator = self._validator
+        clone._command = self._command
+        clone._timeout = self._timeout
+        clone._package = self._package
+        clone._workspace = workspace_root.resolve()
+        clone._key_names = self._key_names
+        clone._environment_overrides = dict(environment_overrides or {})
+        clone._last_stderr = ""
+        return clone
 
 
 def create_skill_tools(

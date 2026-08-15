@@ -15,6 +15,7 @@ from .base import (
     validate_arguments,
 )
 from .builtin import create_builtin_registry
+from .binding import WorkspaceToolBinder
 from .command_tool import RunCommandTool
 from .file_tools import EditFileTool, ReadFileTool, WriteFileTool
 from .search_tools import FindFilesTool, SearchCodeTool
@@ -39,6 +40,7 @@ __all__ = [
     "Workspace",
     "WorkspaceError",
     "create_builtin_registry",
+    "WorkspaceToolBinder",
     "RunCommandTool",
     "EditFileTool",
     "ReadFileTool",

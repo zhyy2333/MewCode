@@ -5,7 +5,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from pathlib import Path
 import threading
-from typing import Any
+from typing import Any, Mapping
 
 from .manager import McpManager
 from .models import (
@@ -36,10 +36,12 @@ class McpRuntime:
         *,
         timeouts: McpTimeouts | None = None,
         transport_factory: McpTransportFactory | None = None,
+        environment_overrides: Mapping[str, str] | None = None,
     ) -> None:
         self._workspace_root = workspace_root
         self._timeouts = timeouts or McpTimeouts()
         self._transport_factory = transport_factory
+        self._environment_overrides = dict(environment_overrides or {})
         self._loop: asyncio.AbstractEventLoop | None = None
         self._thread: threading.Thread | None = None
         self._ready = threading.Event()
@@ -151,7 +153,9 @@ class McpRuntime:
 
     async def _start_manager(self, configs, reserved_tool_names):
         factory = self._transport_factory or DefaultMcpTransportFactory(
-            self._workspace_root, self._timeouts
+            self._workspace_root,
+            self._timeouts,
+            environment_overrides=self._environment_overrides,
         )
         self._manager = McpManager(factory, self._timeouts)
         return await self._manager.start(configs, reserved_tool_names)

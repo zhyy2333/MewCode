@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Mapping
 
-from mewcode.processes import ProcessRequest, run_shell
+from mewcode.processes import ProcessRequest, merge_process_environment, run_shell
 
 from .base import (
     DEFAULT_TOOL_CONTENT_LIMIT,
@@ -38,11 +38,13 @@ class RunCommandTool:
         default_timeout_seconds: int = DEFAULT_COMMAND_TIMEOUT_SECONDS,
         max_timeout_seconds: int = MAX_COMMAND_TIMEOUT_SECONDS,
         content_limit: int = DEFAULT_TOOL_CONTENT_LIMIT,
+        process_environment: Mapping[str, str] | None = None,
     ) -> None:
         self._workspace = workspace
         self._default_timeout_seconds = default_timeout_seconds
         self._max_timeout_seconds = max_timeout_seconds
         self._content_limit = content_limit
+        self._process_environment = dict(process_environment or {})
 
     async def execute(self, arguments: dict[str, Any]) -> ToolResult:
         command = arguments["command"]
@@ -79,6 +81,11 @@ class RunCommandTool:
                 ProcessRequest(
                     command=command,
                     cwd=self._workspace.root,
+                    env=(
+                        merge_process_environment(overrides=self._process_environment)
+                        if self._process_environment
+                        else None
+                    ),
                     timeout_seconds=timeout,
                     stdout_limit=max(self._content_limit * 4, 1024 * 1024),
                     stderr_limit=max(self._content_limit * 4, 1024 * 1024),

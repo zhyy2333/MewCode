@@ -16,6 +16,7 @@ from .memory_models import (
     MemoryUpdateState,
 )
 from .memory_store import MemoryStore
+from .memory_store import build_prompt_view
 from .memory_updater import MemoryUpdater
 
 
@@ -43,6 +44,14 @@ class MemoryManager:
 
     def prompt_view(self) -> MemoryPromptView:
         return self._view
+
+    def scope_prompt_view(self, scope: MemoryScope) -> MemoryPromptView:
+        entries = tuple(item for item in self._store.catalog() if item.scope is scope)
+        return build_prompt_view(
+            entries if scope is MemoryScope.PROJECT else (),
+            entries if scope is MemoryScope.USER else (),
+            self._store.config,
+        )
 
     def status(self) -> MemoryRuntimeStatus:
         catalog = self._store.catalog()
@@ -101,6 +110,10 @@ class MemoryManager:
 
 class NullMemoryManager:
     def prompt_view(self) -> MemoryPromptView:
+        return MemoryPromptView()
+
+    def scope_prompt_view(self, scope: MemoryScope) -> MemoryPromptView:
+        del scope
         return MemoryPromptView()
 
     def status(self) -> MemoryRuntimeStatus:

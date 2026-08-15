@@ -34,6 +34,7 @@ from .models import (
     SubagentTerminalEvent,
     TaskCancelResult,
     AgentDefinition,
+    WorktreeTaskSummary,
 )
 from .notifications import SubagentNotificationQueue
 from .policy import FrozenSubagentToolPolicy
@@ -47,6 +48,7 @@ class SubagentDriverOutcome:
     result: str = ""
     error: str | None = None
     usage: TokenUsage = TokenUsage.zero()
+    worktree: WorktreeTaskSummary | None = None
 
 
 class SubagentTaskDriver(Protocol):
@@ -308,6 +310,7 @@ class SubagentTaskManager:
             SubagentTaskStatus.FAILED,
             error="Subagent runtime did not produce an outcome.",
         )
+        events_completed = False
         try:
             async with self._lock:
                 record = self._records.get(task_id)
@@ -334,6 +337,7 @@ class SubagentTaskManager:
             async for progress in driver.events():
                 await self._record_progress(task_id, progress)
             outcome = driver.outcome
+            events_completed = True
         except asyncio.CancelledError:
             outcome = SubagentDriverOutcome(
                 SubagentTaskStatus.CANCELLED,
@@ -348,6 +352,12 @@ class SubagentTaskManager:
             if driver is not None:
                 try:
                     await driver.close()
+                    try:
+                        closed_outcome = driver.outcome
+                        if events_completed or closed_outcome.worktree is not None:
+                            outcome = closed_outcome
+                    except RuntimeError:
+                        pass
                 except Exception:
                     if outcome.status is SubagentTaskStatus.COMPLETED:
                         outcome = SubagentDriverOutcome(
@@ -404,6 +414,7 @@ class SubagentTaskManager:
                 error=error or None,
                 truncated=result_cut or error_cut,
                 usage=outcome.usage,
+                worktree=outcome.worktree,
                 notification_pending=pending,
             )
             if self._current_foreground == task_id:
@@ -420,6 +431,7 @@ class SubagentTaskManager:
                         result_cut or error_cut,
                         outcome.usage,
                         finished,
+                        outcome.worktree,
                     )
                 )
             self._terminal_events.put_nowait(

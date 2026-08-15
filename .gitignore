@@ -2,6 +2,8 @@
 /.mewcode/*
 !/.mewcode/permissions.yaml
 !/.mewcode/hooks.yaml
+!/.mewcode/worktrees.yaml
+/.mewcode/worktrees/
 /.mewcode/hooks.local.yaml
 /config.yaml
 /config.yml

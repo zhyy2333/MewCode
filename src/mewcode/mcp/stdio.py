@@ -5,7 +5,7 @@ from contextlib import suppress
 import json
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from .models import (
     MCP_MAX_MESSAGE_BYTES,
@@ -24,11 +24,13 @@ class StdioTransport:
         workspace_root: Path,
         *,
         shutdown_timeout: float = 5.0,
+        environment_overrides: Mapping[str, str] | None = None,
     ) -> None:
         self.server_name = config.name
         self._config = config
         self._workspace_root = workspace_root
         self._shutdown_timeout = shutdown_timeout
+        self._environment_overrides = dict(environment_overrides or {})
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -44,6 +46,7 @@ class StdioTransport:
         self._on_message = on_message
         self._on_failure = on_failure
         environment = os.environ.copy()
+        environment.update(self._environment_overrides)
         environment.update(dict(self._config.env_overrides))
         try:
             self._process = await asyncio.create_subprocess_exec(

@@ -11,6 +11,49 @@ from typing import Mapping
 
 
 PROCESS_STOP_TIMEOUT_SECONDS = 1.0
+MAX_GIT_CONFIG_OVERRIDES = 32
+
+
+def merge_process_environment(
+    base: Mapping[str, str] | None = None,
+    *,
+    overrides: Mapping[str, str] | None = None,
+    workspace_root: Path | None = None,
+    git_config: tuple[tuple[str, str], ...] = (),
+) -> dict[str, str]:
+    """Build a child-only environment without mutating process-global state."""
+    result = dict(os.environ if base is None else base)
+    if overrides:
+        for key, value in overrides.items():
+            if not isinstance(key, str) or not key or "=" in key or "\x00" in key:
+                raise ValueError("environment key is invalid")
+            if not isinstance(value, str) or "\x00" in value:
+                raise ValueError("environment value is invalid")
+            result[key] = value
+    if workspace_root is not None:
+        if not workspace_root.is_absolute():
+            raise ValueError("workspace_root must be absolute")
+        result["MEWCODE_WORKSPACE_ROOT"] = str(workspace_root.resolve(strict=False))
+    if len(git_config) > MAX_GIT_CONFIG_OVERRIDES:
+        raise ValueError("too many Git configuration overrides")
+    existing_raw = result.get("GIT_CONFIG_COUNT", "0")
+    if not existing_raw.isascii() or not existing_raw.isdigit():
+        raise ValueError("GIT_CONFIG_COUNT is invalid")
+    existing = int(existing_raw)
+    if existing > MAX_GIT_CONFIG_OVERRIDES:
+        raise ValueError("too many existing Git configuration overrides")
+    for index in range(existing):
+        if f"GIT_CONFIG_KEY_{index}" not in result or f"GIT_CONFIG_VALUE_{index}" not in result:
+            raise ValueError("existing Git configuration overrides are incomplete")
+    if existing + len(git_config) > MAX_GIT_CONFIG_OVERRIDES:
+        raise ValueError("too many combined Git configuration overrides")
+    for offset, (key, value) in enumerate(git_config, start=existing):
+        if not key or "\x00" in key or "\n" in key or "\x00" in value:
+            raise ValueError("Git configuration override is invalid")
+        result[f"GIT_CONFIG_KEY_{offset}"] = key
+        result[f"GIT_CONFIG_VALUE_{offset}"] = value
+    result["GIT_CONFIG_COUNT"] = str(existing + len(git_config))
+    return result
 
 
 @dataclass(frozen=True)

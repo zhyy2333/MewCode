@@ -14,6 +14,7 @@ from .models import (
     AgentDefinition,
     AgentDefinitionError,
     AgentDefinitionSource,
+    AgentIsolation,
 )
 
 
@@ -28,6 +29,7 @@ _FIELDS = frozenset(
         "permission_mode",
     }
 )
+_OPTIONAL_FIELDS = frozenset({"isolation"})
 _NAME = re.compile(AGENT_NAME_PATTERN)
 
 
@@ -93,16 +95,18 @@ def parse_agent_definition(source: AgentDefinitionSource) -> AgentDefinition:
             "Agent definition frontmatter must be a YAML object.", source=source
         )
     keys = set(metadata)
-    if keys != _FIELDS:
+    if not _FIELDS.issubset(keys) or not keys.issubset(_FIELDS | _OPTIONAL_FIELDS):
         missing = sorted(_FIELDS - keys)
-        unknown = sorted(str(key) for key in keys - _FIELDS)
+        unknown = sorted(str(key) for key in keys - _FIELDS - _OPTIONAL_FIELDS)
         details = []
         if missing:
             details.append("missing: " + ", ".join(missing))
         if unknown:
             details.append("unknown: " + ", ".join(unknown))
         raise AgentDefinitionError(
-            "Agent definition requires exactly seven fields (" + "; ".join(details) + ").",
+            "Agent definition requires exactly seven fields and optional isolation ("
+            + "; ".join(details)
+            + ").",
             source=source,
         )
     name = _string(metadata["name"], "name", source)
@@ -139,6 +143,17 @@ def parse_agent_definition(source: AgentDefinitionSource) -> AgentDefinition:
         raise AgentDefinitionError(
             "Agent permission_mode must be strict, default, or allow.", source=source
         ) from exc
+    isolation_value = metadata.get("isolation", AgentIsolation.SHARED.value)
+    if not isinstance(isolation_value, str):
+        raise AgentDefinitionError(
+            "Agent isolation must be shared or worktree.", source=source
+        )
+    try:
+        isolation = AgentIsolation(isolation_value.strip())
+    except ValueError as exc:
+        raise AgentDefinitionError(
+            "Agent isolation must be shared or worktree.", source=source
+        ) from exc
     system_prompt = body.strip()
     if not system_prompt:
         raise AgentDefinitionError(
@@ -154,6 +169,7 @@ def parse_agent_definition(source: AgentDefinitionSource) -> AgentDefinition:
         permission_mode,
         system_prompt,
         source,
+        isolation,
     )
 
 

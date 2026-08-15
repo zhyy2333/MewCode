@@ -9,6 +9,7 @@ from mewcode.conversation import ConversationStatus
 from mewcode.permissions import PermissionMode
 from mewcode.providers import UsageSnapshot
 from mewcode.subagents import SubagentTaskSnapshot, TaskCancelResult
+from mewcode.worktrees import WorktreeDeleteResult, WorktreeStatus
 
 from .core import CommandRegistry, InteractionMode, ParsedInput
 
@@ -65,6 +66,12 @@ class CommandRuntime(Protocol):
     def get_subagent_task(self, task_id: str) -> SubagentTaskSnapshot | None: ...
 
     async def cancel_subagent_task(self, task_id: str) -> TaskCancelResult: ...
+
+    async def list_worktrees(self) -> tuple[WorktreeStatus, ...]: ...
+
+    async def delete_worktree(
+        self, name: str, *, force: bool
+    ) -> WorktreeDeleteResult: ...
 
 
 @dataclass(frozen=True)

@@ -91,8 +91,14 @@ from .subagents import (
     SubagentNotificationQueue,
     SubagentRuntimeFactory,
     SubagentTaskManager,
+    WorkspaceRuntimeBundleFactory,
     build_agent_catalog,
     discover_agent_sources,
+)
+from .worktrees import (
+    WorktreeConfigLoader,
+    WorktreeJanitor,
+    WorktreeLifecycleService,
 )
 
 _ORIGINAL_LOAD_ACTIVE_PROFILE = load_active_profile
@@ -164,11 +170,20 @@ def main(argv: list[str] | None = None) -> int:
     memory_manager: MemoryManager | None = None
     hook_runtime: HookRuntime | None = None
     task_manager: SubagentTaskManager | None = None
+    worktree_janitor: WorktreeJanitor | None = None
     try:
         static_command_registry = create_builtin_command_registry()
         command_registry = DynamicCommandCatalog(static_command_registry)
         interaction_state = InteractionState()
         workspace = Workspace(Path.cwd())
+        worktree_config = WorktreeConfigLoader().load(
+            workspace.root / ".mewcode" / "worktrees.yaml"
+        )
+        worktree_lifecycle = WorktreeLifecycleService(
+            workspace.root,
+            worktree_config,
+        )
+        worktree_janitor = WorktreeJanitor(worktree_lifecycle)
         hook_catalog = HookConfigLoader().load(
             HookPaths.for_workspace(workspace.root)
         )
@@ -407,6 +422,19 @@ def main(argv: list[str] | None = None) -> int:
                 profile_catalog.require(name).context_window
             ),
         )
+        workspace_runtime_factory = WorkspaceRuntimeBundleFactory(
+            subagent_runtime_factory,
+            project_trusted=project_trusted,
+            api_key_environment_names=profile_catalog.api_key_environment_names,
+            hook_once_state=hook_runtime.once_state,
+            hook_process_state=hook_runtime.process_state,
+            frozen_user_mcp=config_result.user_servers,
+            frozen_user_hooks=tuple(
+                rule
+                for rule in hook_catalog.rules
+                if rule.key.source.value == "user"
+            ),
+        )
         notifications = SubagentNotificationQueue()
         task_manager = SubagentTaskManager(notifications)
         subagent_coordinator = SubagentCoordinator(
@@ -416,6 +444,9 @@ def main(argv: list[str] | None = None) -> int:
             rule_store,
             background_capable_names=base_registry.names,
             additions_supplier=lambda: conversation_ref["value"].skill_base_additions(),
+            worktree_additions_supplier=lambda: conversation_ref["value"].subagent_user_additions(),
+            worktree_lifecycle=worktree_lifecycle,
+            workspace_runtime_factory=workspace_runtime_factory,
         )
         agent_tool = AgentTool(subagent_coordinator, task_manager)
         registry = base_registry.merge(ToolRegistry([load_skill, agent_tool]))
@@ -473,6 +504,8 @@ def main(argv: list[str] | None = None) -> int:
             skill_refresher=refresh_skills,
             hook_runtime=hook_runtime,
             task_manager=task_manager,
+            worktree_lifecycle=worktree_lifecycle,
+            worktree_janitor=worktree_janitor,
         )
         conversation_ref["value"] = conversation
         action = "resumed" if opened_session.resumed else "created"
@@ -559,6 +592,11 @@ def main(argv: list[str] | None = None) -> int:
                 asyncio.run(task_manager.close())
             except Exception:
                 sys.stderr.write("Warning: subagent task shutdown failed.\n")
+        if worktree_janitor is not None:
+            try:
+                asyncio.run(worktree_janitor.close())
+            except Exception:
+                sys.stderr.write("Warning: Worktree cleanup shutdown failed.\n")
         if session_binding is not None:
             session_binding.close()
         if context_archive is not None:

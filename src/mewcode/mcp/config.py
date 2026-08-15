@@ -59,6 +59,9 @@ class McpConfigLoadResult:
     servers: tuple[McpServerConfig, ...]
     diagnostics: tuple[McpDiagnostic, ...]
     permission_prefixes: tuple[str, ...]
+    user_servers: tuple[McpServerConfig, ...] = ()
+    project_servers: tuple[McpServerConfig, ...] = ()
+    project_server_names: tuple[str, ...] = ()
 
 
 class McpConfigLoader:
@@ -74,6 +77,8 @@ class McpConfigLoader:
         merged.update(project_servers)
 
         configs: list[McpServerConfig] = []
+        user_configs: list[McpServerConfig] = []
+        project_configs: list[McpServerConfig] = []
         diagnostics: list[McpDiagnostic] = []
         prefixes: list[str] = []
         for raw_name, raw_config in merged.items():
@@ -88,10 +93,52 @@ class McpConfigLoader:
                 configs.append(self._parse_server(name, raw_config))
             except ValueError as exc:
                 diagnostics.append(McpDiagnostic(name, McpPhase.CONFIG, str(exc)))
+        for mapping, target in ((user_servers, user_configs), (project_servers, project_configs)):
+            for raw_name, raw_config in mapping.items():
+                if not isinstance(raw_name, str) or not raw_name.strip():
+                    continue
+                try:
+                    target.append(self._parse_server(raw_name, raw_config))
+                except ValueError:
+                    pass
         return McpConfigLoadResult(
             servers=tuple(configs),
             diagnostics=tuple(diagnostics),
             permission_prefixes=tuple(dict.fromkeys(prefixes)),
+            user_servers=tuple(user_configs),
+            project_servers=tuple(project_configs),
+            project_server_names=tuple(
+                name for name in project_servers if isinstance(name, str) and name.strip()
+            ),
+        )
+
+    def load_project(self, path: Path) -> McpConfigLoadResult:
+        """Load one project layer without touching the live user config file."""
+        raw = self._read_file(path, project=True)
+        server_map = self._server_map(raw, path)
+        configs: list[McpServerConfig] = []
+        diagnostics: list[McpDiagnostic] = []
+        prefixes: list[str] = []
+        names: list[str] = []
+        for raw_name, raw_config in server_map.items():
+            if not isinstance(raw_name, str) or not raw_name.strip():
+                diagnostics.append(
+                    McpDiagnostic(None, McpPhase.CONFIG, "server name must be a non-empty string")
+                )
+                continue
+            names.append(raw_name)
+            prefixes.append(permission_namespace_prefix(raw_name))
+            try:
+                configs.append(self._parse_server(raw_name, raw_config))
+            except ValueError as exc:
+                diagnostics.append(McpDiagnostic(raw_name, McpPhase.CONFIG, str(exc)))
+        frozen = tuple(configs)
+        return McpConfigLoadResult(
+            servers=frozen,
+            diagnostics=tuple(diagnostics),
+            permission_prefixes=tuple(dict.fromkeys(prefixes)),
+            project_servers=frozen,
+            project_server_names=tuple(names),
         )
 
     def _read_file(self, path: Path, *, project: bool) -> dict[str, Any]:

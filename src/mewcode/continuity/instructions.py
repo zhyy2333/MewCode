@@ -36,6 +36,8 @@ class InstructionSource:
 class InstructionSnapshot:
     content: str = ""
     diagnostics: tuple[ContinuityDiagnostic, ...] = ()
+    project_content: str = ""
+    user_content: str = ""
 
 
 class InstructionLoader:
@@ -63,7 +65,36 @@ class InstructionLoader:
                 "User instructions",
             ),
         )
+        return self._load_sources(sources)
+
+    def load_project(self, paths: ContinuityPaths) -> InstructionSnapshot:
+        """Load only Worktree-local project layers, without reading user state."""
+        return self._load_sources(
+            (
+                InstructionSource(
+                    InstructionScope.PROJECT_LOCAL,
+                    paths.project_local_instructions,
+                    paths.workspace_root,
+                    100,
+                    "Project-local instructions",
+                ),
+                InstructionSource(
+                    InstructionScope.PROJECT_ROOT,
+                    paths.project_root_instructions,
+                    paths.workspace_root,
+                    200,
+                    "Project-root instructions",
+                ),
+            )
+        )
+
+    def _load_sources(
+        self,
+        sources: tuple[InstructionSource, ...],
+    ) -> InstructionSnapshot:
         sections: list[str] = []
+        project_sections: list[str] = []
+        user_sections: list[str] = []
         diagnostics: list[ContinuityDiagnostic] = []
         for source in sorted(sources, key=lambda item: item.priority):
             if not source.entry_path.exists():
@@ -77,8 +108,18 @@ class InstructionLoader:
                 entry=True,
             )
             if content.strip():
-                sections.append(f"### {source.title}\n{content.strip()}")
-        return InstructionSnapshot("\n\n".join(sections), tuple(diagnostics))
+                rendered = f"### {source.title}\n{content.strip()}"
+                sections.append(rendered)
+                if source.scope is InstructionScope.USER:
+                    user_sections.append(rendered)
+                else:
+                    project_sections.append(rendered)
+        return InstructionSnapshot(
+            "\n\n".join(sections),
+            tuple(diagnostics),
+            "\n\n".join(project_sections),
+            "\n\n".join(user_sections),
+        )
 
     def _expand(
         self,

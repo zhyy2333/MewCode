@@ -34,6 +34,11 @@ class AgentDefinitionLayer(IntEnum):
     PROJECT = 3
 
 
+class AgentIsolation(StrEnum):
+    SHARED = "shared"
+    WORKTREE = "worktree"
+
+
 @dataclass(frozen=True)
 class AgentDefinitionSource:
     layer: AgentDefinitionLayer
@@ -55,6 +60,7 @@ class AgentDefinition:
     permission_mode: PermissionMode
     system_prompt: str
     source: AgentDefinitionSource
+    isolation: AgentIsolation = AgentIsolation.SHARED
 
 
 @dataclass(frozen=True)
@@ -159,6 +165,20 @@ class SubagentProgress:
 
 
 @dataclass(frozen=True)
+class WorktreeTaskSummary:
+    state: str
+    path: str
+    branch_ref: str
+    reason: str | None = None
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "path", self.path[:1024])
+        object.__setattr__(self, "branch_ref", self.branch_ref[:256])
+        if self.reason is not None:
+            object.__setattr__(self, "reason", self.reason[:MAX_DIAGNOSTIC_CHARS])
+
+
+@dataclass(frozen=True)
 class SubagentTaskSnapshot:
     task_id: str
     kind: SubagentKind
@@ -176,6 +196,7 @@ class SubagentTaskSnapshot:
     truncated: bool = False
     usage: TokenUsage = TokenUsage.zero()
     notification_pending: bool = False
+    worktree: WorktreeTaskSummary | None = None
 
 
 @dataclass(frozen=True)
@@ -188,6 +209,7 @@ class SubagentNotification:
     truncated: bool
     usage: TokenUsage
     completed_at: datetime
+    worktree: WorktreeTaskSummary | None = None
 
 
 @dataclass(frozen=True)
