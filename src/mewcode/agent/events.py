@@ -27,6 +27,7 @@ class StopReason(StrEnum):
     ITERATION_LIMIT = "iteration_limit"
     CANCELLED = "cancelled"
     UNKNOWN_TOOL_LIMIT = "unknown_tool_limit"
+    TOOL_DENIAL_LIMIT = "tool_denial_limit"
     STREAM_ERROR = "stream_error"
     CONTEXT_CAPACITY = "context_capacity"
     CONTEXT_COMPACTION = "context_compaction"

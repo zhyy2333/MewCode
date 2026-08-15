@@ -165,6 +165,35 @@ def test_defined_runtime_uses_frozen_tool_view_and_task_usage(tmp_path: Path) ->
     asyncio.run(runtime.close())
 
 
+def test_subagent_runtime_stops_after_three_noninteractive_denials(
+    tmp_path: Path,
+) -> None:
+    read = ControlledTool("read")
+    tools = ToolRegistry([read])
+    inner = ScriptedAsyncProvider(
+        [
+            [ProviderToolCall(tool_call(str(index), "read"))]
+            for index in range(3)
+        ]
+    )
+    provider = RequestBoundaryProvider(inner)
+    factory = _factory(tmp_path, provider)
+    runtime = factory.create(
+        "denied-task",
+        _defined_launch(tmp_path, factory, tools=tools),
+    )
+
+    asyncio.run(collect_async(runtime.events()))
+
+    assert len(inner.calls) == 3
+    assert read.calls == []
+    assert runtime.outcome.status is SubagentTaskStatus.FAILED
+    assert runtime.outcome.error == (
+        "All tool calls were denied for 3 consecutive iterations."
+    )
+    asyncio.run(runtime.close())
+
+
 def test_fork_runtime_preserves_parent_first_request_and_is_independent(
     tmp_path: Path,
 ) -> None:

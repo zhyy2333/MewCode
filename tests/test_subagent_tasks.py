@@ -9,6 +9,7 @@ import pytest
 from mewcode.agent import AgentSubagentProgress
 from mewcode.providers import TokenUsage
 from mewcode.subagents import (
+    SUBAGENT_EXECUTION_TIMEOUT_SECONDS,
     SubagentDriverOutcome,
     SubagentKind,
     SubagentLaunch,
@@ -19,6 +20,7 @@ from mewcode.subagents import (
     SubagentTaskManager,
     SubagentTaskStatus,
     TaskCancelResult,
+    WorktreeTaskSummary,
 )
 from tests.fakes import collect_async
 
@@ -30,6 +32,7 @@ class FakeDriver:
         *,
         gate: asyncio.Event | None = None,
         fail: BaseException | None = None,
+        cancel_fail: bool = False,
         cleanup_fail: bool = False,
     ) -> None:
         self._outcome = outcome or SubagentDriverOutcome(
@@ -39,6 +42,7 @@ class FakeDriver:
         )
         self.gate = gate
         self.fail = fail
+        self.cancel_fail = cancel_fail
         self.cleanup_fail = cleanup_fail
         self.events_calls = 0
         self.cancel_calls = 0
@@ -61,9 +65,13 @@ class FakeDriver:
         self._outcome = SubagentDriverOutcome(
             SubagentTaskStatus.CANCELLED,
             error="cancelled",
+            usage=self._outcome.usage,
+            worktree=self._outcome.worktree,
         )
         if self.gate is not None:
             self.gate.set()
+        if self.cancel_fail:
+            raise RuntimeError("cancel cleanup")
 
     async def close(self):
         self.close_calls += 1
@@ -90,6 +98,23 @@ def _launch(
 async def _settle() -> None:
     for _ in range(8):
         await asyncio.sleep(0)
+
+
+class ControlledSleeper:
+    def __init__(self) -> None:
+        self.calls: list[tuple[float, asyncio.Future[None]]] = []
+
+    async def __call__(self, delay: float) -> None:
+        future = asyncio.get_running_loop().create_future()
+        self.calls.append((delay, future))
+        await future
+
+    def release(self, delay: float) -> None:
+        for actual, future in self.calls:
+            if actual == pytest.approx(delay) and not future.done():
+                future.set_result(None)
+                return
+        raise AssertionError(f"No pending sleep for {delay} seconds.")
 
 
 def test_public_models_are_frozen_and_status_classification_is_stable() -> None:
@@ -308,27 +333,349 @@ def test_cancel_registered_task_commits_cancelled_without_starting_driver() -> N
 def test_foreground_timeout_is_measured_from_registration() -> None:
     async def scenario():
         now = 100.0
-        delays = []
-
-        async def capture_sleep(delay):
-            delays.append(delay)
-            await asyncio.sleep(0)
+        sleeper = ControlledSleeper()
 
         manager = SubagentTaskManager(
             id_factory=lambda: "task",
             monotonic=lambda: now,
-            sleep=capture_sleep,
+            sleep=sleeper,
         )
         gate = asyncio.Event()
         handle = await manager.start(_launch(lambda task_id: FakeDriver(gate=gate)))
         now = 106.0
-        await collect_async(handle.foreground_events(timeout=10.0))
+        foreground = asyncio.create_task(
+            collect_async(handle.foreground_events(timeout=10.0))
+        )
+        await _settle()
+        sleeper.release(4.0)
+        await foreground
         gate.set()
         await _settle()
+        delays = sorted(delay for delay, _ in sleeper.calls)
         await manager.close()
         return delays
 
-    assert asyncio.run(scenario()) == [4.0]
+    assert asyncio.run(scenario()) == [4.0, 294.0]
+
+
+@pytest.mark.parametrize("value", [0, -1, float("inf"), float("nan")])
+def test_execution_timeout_config_requires_a_positive_finite_value(value) -> None:
+    with pytest.raises(ValueError, match="execution_timeout"):
+        SubagentTaskManager(execution_timeout=value)
+
+
+def test_execution_timeout_fails_and_cleans_a_background_driver() -> None:
+    async def scenario():
+        gate = asyncio.Event()
+        sleeper = ControlledSleeper()
+        driver = FakeDriver(gate=gate)
+        notifications = SubagentNotificationQueue()
+        manager = SubagentTaskManager(
+            notifications,
+            id_factory=lambda: "task",
+            sleep=sleeper,
+            execution_timeout=SUBAGENT_EXECUTION_TIMEOUT_SECONDS,
+        )
+        await manager.start(
+            _launch(
+                lambda task_id: driver,
+                placement=SubagentPlacement.BACKGROUND,
+            )
+        )
+        await _settle()
+
+        sleeper.release(SUBAGENT_EXECUTION_TIMEOUT_SECONDS)
+        await _settle()
+        snapshot = manager.get("task")
+        batch = notifications.consume_batch()
+        await manager.close()
+        return driver, snapshot, batch
+
+    driver, snapshot, batch = asyncio.run(scenario())
+
+    assert snapshot.status is SubagentTaskStatus.FAILED
+    assert snapshot.error == "Subagent task exceeded its 300-second execution timeout."
+    assert snapshot.usage == TokenUsage(3, 2, 5)
+    assert driver.cancel_calls == 1
+    assert driver.close_calls == 1
+    assert [item.task_id for item in batch.notifications] == ["task"]
+    assert batch.notifications[0].status is SubagentTaskStatus.FAILED
+
+
+def test_execution_timeout_handles_driver_factory_failure() -> None:
+    async def scenario():
+        sleeper = ControlledSleeper()
+        factory_started = asyncio.Event()
+        factory_cancelled = asyncio.Event()
+
+        async def blocked_factory(task_id):
+            factory_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                factory_cancelled.set()
+                raise
+
+        manager = SubagentTaskManager(
+            id_factory=lambda: "factory-task",
+            sleep=sleeper,
+            execution_timeout=300.0,
+        )
+        await manager.start(
+            _launch(
+                blocked_factory,
+                placement=SubagentPlacement.BACKGROUND,
+            )
+        )
+        await factory_started.wait()
+        sleeper.release(300.0)
+        await _settle()
+        snapshot = manager.get("factory-task")
+        await manager.close()
+        return snapshot, factory_cancelled.is_set()
+
+    snapshot, factory_cancelled = asyncio.run(scenario())
+
+    assert factory_cancelled is True
+    assert snapshot.status is SubagentTaskStatus.FAILED
+    assert snapshot.error == "Subagent task exceeded its 300-second execution timeout."
+
+
+def test_detach_deadline_does_not_restart_execution() -> None:
+    async def scenario():
+        gate = asyncio.Event()
+        sleeper = ControlledSleeper()
+        driver = FakeDriver(gate=gate)
+        manager = SubagentTaskManager(
+            id_factory=lambda: "task",
+            sleep=sleeper,
+            execution_timeout=300.0,
+        )
+        handle = await manager.start(_launch(lambda task_id: driver))
+        await _settle()
+        foreground = asyncio.create_task(
+            collect_async(handle.foreground_events(timeout=10.0))
+        )
+        await _settle()
+
+        sleeper.release(10.0)
+        await foreground
+        detached = manager.get("task")
+        sleeper.release(300.0)
+        await _settle()
+        terminal = manager.get("task")
+        calls = [delay for delay, _ in sleeper.calls]
+        await manager.close()
+        return driver, detached, terminal, calls
+
+    driver, detached, terminal, calls = asyncio.run(scenario())
+
+    assert detached.placement is SubagentPlacement.BACKGROUND
+    assert terminal.status is SubagentTaskStatus.FAILED
+    assert calls.count(300.0) == 1
+    assert calls.count(10.0) == 1
+    assert driver.events_calls == 1
+
+
+def test_execution_timeout_race_preserves_failed_when_timeout_wins_cancel() -> None:
+    class BlockingCancelDriver(FakeDriver):
+        def __init__(self):
+            super().__init__(gate=asyncio.Event())
+            self.cancel_started = asyncio.Event()
+            self.cancel_release = asyncio.Event()
+
+        async def cancel(self):
+            self.cancel_calls += 1
+            self.cancel_started.set()
+            await self.cancel_release.wait()
+            self._outcome = SubagentDriverOutcome(
+                SubagentTaskStatus.CANCELLED,
+                error="cancelled",
+                usage=TokenUsage(3, 2, 5),
+            )
+            self.gate.set()
+
+    async def scenario():
+        sleeper = ControlledSleeper()
+        driver = BlockingCancelDriver()
+        manager = SubagentTaskManager(
+            id_factory=lambda: "task",
+            sleep=sleeper,
+            execution_timeout=300.0,
+        )
+        await manager.start(
+            _launch(
+                lambda task_id: driver,
+                placement=SubagentPlacement.BACKGROUND,
+            )
+        )
+        await _settle()
+
+        sleeper.release(300.0)
+        await driver.cancel_started.wait()
+        cancel_result = await manager.cancel("task")
+        driver.cancel_release.set()
+        await _settle()
+        snapshot = manager.get("task")
+        await manager.close()
+        return driver, cancel_result, snapshot
+
+    driver, cancel_result, snapshot = asyncio.run(scenario())
+
+    assert cancel_result is TaskCancelResult.ALREADY_REQUESTED
+    assert driver.cancel_calls == 1
+    assert snapshot.status is SubagentTaskStatus.FAILED
+    assert snapshot.error == "Subagent task exceeded its 300-second execution timeout."
+
+
+def test_execution_timeout_race_preserves_cancelled_when_user_cancel_wins() -> None:
+    async def scenario():
+        sleeper = ControlledSleeper()
+        driver = FakeDriver(gate=asyncio.Event())
+        manager = SubagentTaskManager(
+            id_factory=lambda: "task",
+            sleep=sleeper,
+            execution_timeout=300.0,
+        )
+        await manager.start(
+            _launch(
+                lambda task_id: driver,
+                placement=SubagentPlacement.BACKGROUND,
+            )
+        )
+        await _settle()
+        result = await manager.cancel("task")
+        snapshot = manager.get("task")
+        await manager.close()
+        return driver, result, snapshot
+
+    driver, result, snapshot = asyncio.run(scenario())
+
+    assert result is TaskCancelResult.REQUESTED
+    assert driver.cancel_calls == 1
+    assert snapshot.status is SubagentTaskStatus.CANCELLED
+
+
+def test_execution_timeout_race_prefers_completed_driver_when_both_ready() -> None:
+    class ImmediateDriver(FakeDriver):
+        async def events(self):
+            self.events_calls += 1
+            if False:
+                yield SubagentProgress(1, "unused", "unused")
+
+    async def immediate_sleep(delay):
+        return None
+
+    async def scenario():
+        driver = ImmediateDriver()
+        manager = SubagentTaskManager(
+            id_factory=lambda: "task",
+            sleep=immediate_sleep,
+            execution_timeout=300.0,
+        )
+        await manager.start(
+            _launch(
+                lambda task_id: driver,
+                placement=SubagentPlacement.BACKGROUND,
+            )
+        )
+        await _settle()
+        snapshot = manager.get("task")
+        await manager.close()
+        return driver, snapshot
+
+    driver, snapshot = asyncio.run(scenario())
+
+    assert driver.cancel_calls == 0
+    assert snapshot.status is SubagentTaskStatus.COMPLETED
+    assert snapshot.result == "done"
+
+
+def test_execution_timeout_preserves_worktree_cleanup_summary() -> None:
+    async def scenario():
+        sleeper = ControlledSleeper()
+        summary = WorktreeTaskSummary(
+            "retained",
+            "C:/workspace/.mewcode/worktrees/task",
+            "refs/heads/mewcode/task",
+        )
+        driver = FakeDriver(
+            SubagentDriverOutcome(
+                SubagentTaskStatus.COMPLETED,
+                "unused",
+                usage=TokenUsage(7, 3, 10),
+                worktree=summary,
+            ),
+            gate=asyncio.Event(),
+        )
+        manager = SubagentTaskManager(
+            id_factory=lambda: "task",
+            sleep=sleeper,
+            execution_timeout=300.0,
+        )
+        await manager.start(
+            _launch(
+                lambda task_id: driver,
+                placement=SubagentPlacement.BACKGROUND,
+            )
+        )
+        await _settle()
+        sleeper.release(300.0)
+        await _settle()
+        snapshot = manager.get("task")
+        await manager.close()
+        return summary, snapshot
+
+    summary, snapshot = asyncio.run(scenario())
+
+    assert snapshot.status is SubagentTaskStatus.FAILED
+    assert snapshot.worktree == summary
+    assert snapshot.usage == TokenUsage(7, 3, 10)
+
+
+def test_execution_timeout_handles_cancel_and_close_failure() -> None:
+    async def scenario():
+        sleeper = ControlledSleeper()
+        timed_out = FakeDriver(
+            gate=asyncio.Event(),
+            cancel_fail=True,
+            cleanup_fail=True,
+        )
+        ids = iter(("timed-out", "next"))
+        manager = SubagentTaskManager(
+            id_factory=lambda: next(ids),
+            sleep=sleeper,
+            execution_timeout=300.0,
+        )
+        await manager.start(
+            _launch(
+                lambda task_id: timed_out,
+                placement=SubagentPlacement.BACKGROUND,
+            )
+        )
+        await _settle()
+        sleeper.release(300.0)
+        await _settle()
+        first = manager.get("timed-out")
+
+        await manager.start(
+            _launch(
+                lambda task_id: FakeDriver(),
+                placement=SubagentPlacement.BACKGROUND,
+            )
+        )
+        await _settle()
+        second = manager.get("next")
+        await manager.close()
+        return first, second, timed_out
+
+    first, second, timed_out = asyncio.run(scenario())
+
+    assert first.status is SubagentTaskStatus.FAILED
+    assert first.error == "Subagent task exceeded its 300-second execution timeout."
+    assert second.status is SubagentTaskStatus.COMPLETED
+    assert timed_out.cancel_calls == 1
+    assert timed_out.close_calls == 1
 
 
 def test_terminal_events_are_once_and_close_ends_stream() -> None:

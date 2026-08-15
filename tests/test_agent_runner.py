@@ -58,11 +58,17 @@ from tests.fakes import (
 )
 
 
-def _runner(provider, *, max_iterations: int = 20, unknown_limit: int = 3):
+def _runner(
+    provider,
+    *,
+    max_iterations: int = 20,
+    unknown_limit: int = 3,
+    denial_limit: int | None = None,
+):
     return AgentRunner(
         provider,
         ToolScheduler(AllowAllPermissionController()),
-        AgentRunConfig(max_iterations, unknown_limit),
+        AgentRunConfig(max_iterations, unknown_limit, tool_denial_limit=denial_limit),
         id_factory=lambda: "run-1",
     )
 
@@ -608,6 +614,102 @@ def test_unknown_tool_limit_stops_after_three_unknown_rounds() -> None:
     assert run.outcome.reason is StopReason.UNKNOWN_TOOL_LIMIT
     assert len(provider.calls) == 3
     assert len(run.outcome.new_messages) == 7
+
+
+@pytest.mark.parametrize("metadata", [{"permission_denied": True}, {"hook_denied": True}])
+def test_tool_denial_limit_stops_after_three_fully_denied_batches(metadata) -> None:
+    provider = ScriptedAsyncProvider(
+        [[ProviderToolCall(tool_call(str(index), "read"))] for index in range(3)]
+    )
+    denied = ToolResult(False, "read", "", "denied", metadata)
+    tool = ControlledTool("read", result=denied)
+    run = _runner(provider, denial_limit=3).start(
+        [], "inspect", ToolRegistry([tool])
+    )
+
+    asyncio.run(collect_async(run.events()))
+
+    assert run.outcome.reason is StopReason.TOOL_DENIAL_LIMIT
+    assert run.outcome.error == "All tool calls were denied for 3 consecutive iterations."
+    assert len(provider.calls) == 3
+    assert len(tool.calls) == 3
+    assert len(run.outcome.new_messages) == 7
+
+
+@pytest.mark.parametrize(
+    "resetting_result",
+    [
+        pytest.param(ToolResult(True, "read", "progress"), id="success"),
+        pytest.param(
+            ToolResult(False, "read", "", "ordinary failure"),
+            id="ordinary-failure",
+        ),
+    ],
+)
+def test_tool_denial_limit_resets_after_a_non_denied_batch(
+    resetting_result,
+) -> None:
+    class ResultSequenceTool(ControlledTool):
+        def __init__(self):
+            super().__init__("read")
+            self.results = [
+                ToolResult(False, "read", "", "denied", {"permission_denied": True}),
+                ToolResult(False, "read", "", "denied", {"permission_denied": True}),
+                resetting_result,
+                ToolResult(False, "read", "", "denied", {"permission_denied": True}),
+                ToolResult(False, "read", "", "denied", {"permission_denied": True}),
+                ToolResult(False, "read", "", "denied", {"permission_denied": True}),
+            ]
+
+        async def execute(self, arguments):
+            self.calls.append(self.name)
+            return self.results.pop(0)
+
+    provider = ScriptedAsyncProvider(
+        [[ProviderToolCall(tool_call(str(index), "read"))] for index in range(6)]
+    )
+    tool = ResultSequenceTool()
+    run = _runner(provider, denial_limit=3).start(
+        [], "inspect", ToolRegistry([tool])
+    )
+
+    asyncio.run(collect_async(run.events()))
+
+    assert run.outcome.reason is StopReason.TOOL_DENIAL_LIMIT
+    assert len(provider.calls) == 6
+    assert len(tool.calls) == 6
+
+
+def test_tool_denial_limit_is_disabled_for_default_root_config() -> None:
+    provider = ScriptedAsyncProvider(
+        [
+            *[
+                [ProviderToolCall(tool_call(str(index), "read"))]
+                for index in range(3)
+            ],
+            [ProviderTextDelta("done")],
+        ]
+    )
+    denied = ToolResult(
+        False,
+        "read",
+        "",
+        "denied",
+        {"permission_denied": True},
+    )
+    run = _runner(provider).start(
+        [], "inspect", ToolRegistry([ControlledTool("read", result=denied)])
+    )
+
+    asyncio.run(collect_async(run.events()))
+
+    assert run.outcome.reason is StopReason.COMPLETED
+    assert len(provider.calls) == 4
+
+
+def test_tool_denial_limit_config_requires_a_positive_integer() -> None:
+    with pytest.raises(ValueError, match="tool_denial_limit"):
+        AgentRunConfig(tool_denial_limit=0)
 
 
 def test_stream_error_keeps_prior_iteration_and_partial_text_event() -> None:

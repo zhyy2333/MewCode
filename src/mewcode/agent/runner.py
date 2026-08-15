@@ -35,7 +35,7 @@ from mewcode.providers import (
     bind_request_boundary,
 )
 from mewcode.permissions import PermissionMode
-from mewcode.tools import ToolRegistry, ToolSafety
+from mewcode.tools import ToolExecution, ToolRegistry, ToolSafety
 
 from .events import (
     AgentContextStatus,
@@ -80,6 +80,7 @@ class AgentRunConfig:
     unknown_tool_limit: int = 3
     plan_max_investigation_iterations: int = 6
     plan_final_max_tokens: int = PLAN_FINAL_MAX_TOKENS
+    tool_denial_limit: int | None = None
 
     def __post_init__(self) -> None:
         if self.max_iterations < 1:
@@ -90,6 +91,12 @@ class AgentRunConfig:
             raise ValueError("plan_max_investigation_iterations must be at least 1")
         if self.plan_final_max_tokens < 1:
             raise ValueError("plan_final_max_tokens must be at least 1")
+        if self.tool_denial_limit is not None and (
+            isinstance(self.tool_denial_limit, bool)
+            or not isinstance(self.tool_denial_limit, int)
+            or self.tool_denial_limit < 1
+        ):
+            raise ValueError("tool_denial_limit must be a positive integer or None")
 
 
 @dataclass(frozen=True)
@@ -187,6 +194,7 @@ class AgentRun:
         user_committed = False
         cumulative_usage = TokenUsage.zero()
         consecutive_unknown = 0
+        consecutive_denied = 0
         iteration = 0
         final_text = ""
         plan_finalizing = False
@@ -534,6 +542,8 @@ class AgentRun:
                     self._active_schedule = None
 
                 executions = schedule.executions
+                all_denied = _all_tool_calls_denied(executions)
+                consecutive_denied = consecutive_denied + 1 if all_denied else 0
                 if schedule.cancelled:
                     self._cancel_requested.set()
                 group_id = f"{self._run_id}:{iteration}"
@@ -592,6 +602,21 @@ class AgentRun:
                         response.text,
                         new_messages,
                         cumulative_usage,
+                    )
+                    return
+
+                if (
+                    self._config.tool_denial_limit is not None
+                    and consecutive_denied >= self._config.tool_denial_limit
+                ):
+                    limit = self._config.tool_denial_limit
+                    yield self._finish(
+                        StopReason.TOOL_DENIAL_LIMIT,
+                        iteration,
+                        response.text,
+                        new_messages,
+                        cumulative_usage,
+                        f"All tool calls were denied for {limit} consecutive iterations.",
                     )
                     return
 
@@ -698,6 +723,14 @@ class AgentRun:
             usage=usage,
             error=error,
         )
+
+
+def _all_tool_calls_denied(executions: Sequence[ToolExecution]) -> bool:
+    return bool(executions) and all(
+        bool(execution.result.metadata.get("permission_denied"))
+        or bool(execution.result.metadata.get("hook_denied"))
+        for execution in executions
+    )
 
 
 class AgentRunner:

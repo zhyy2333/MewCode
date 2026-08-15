@@ -7,6 +7,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import inspect
+import math
 import time
 from typing import Protocol
 from uuid import uuid4
@@ -22,6 +23,7 @@ from .models import (
     MAX_ACTIVE_TASKS,
     MAX_RESULT_CHARS,
     MAX_RETAINED_TASKS,
+    SUBAGENT_EXECUTION_TIMEOUT_SECONDS,
     TASK_CLOSE_TIMEOUT_SECONDS,
     SubagentDiagnostic,
     SubagentKind,
@@ -97,6 +99,7 @@ class _ManagedSubagentTask:
     registered_monotonic: float
     cancel_requested: bool = False
     cancel_forwarded: bool = False
+    timeout_triggered: bool = False
 
 
 class SubagentTaskHandle:
@@ -128,9 +131,17 @@ class SubagentTaskManager:
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         close_timeout: float = TASK_CLOSE_TIMEOUT_SECONDS,
+        execution_timeout: float = SUBAGENT_EXECUTION_TIMEOUT_SECONDS,
     ) -> None:
         if max_active < 1:
             raise ValueError("max_active must be at least 1")
+        if (
+            isinstance(execution_timeout, bool)
+            or not isinstance(execution_timeout, (int, float))
+            or not math.isfinite(execution_timeout)
+            or execution_timeout <= 0
+        ):
+            raise ValueError("execution_timeout must be a positive finite value")
         self._notifications = notifications or SubagentNotificationQueue()
         self._notifications.set_delivered_callback(self._notification_delivered)
         self._max_active = max_active
@@ -140,6 +151,7 @@ class SubagentTaskManager:
         self._monotonic = monotonic
         self._sleep = sleep
         self._close_timeout = close_timeout
+        self._execution_timeout = float(execution_timeout)
         self._lock = asyncio.Lock()
         self._records: dict[str, _ManagedSubagentTask] = {}
         self._current_foreground: str | None = None
@@ -235,7 +247,7 @@ class SubagentTaskManager:
                 return TaskCancelResult.NOT_FOUND
             if record.snapshot.status.terminal:
                 return TaskCancelResult.ALREADY_TERMINAL
-            if record.cancel_requested:
+            if record.cancel_requested or record.timeout_triggered:
                 return TaskCancelResult.ALREADY_REQUESTED
             record.cancel_requested = True
             driver = record.driver
@@ -306,11 +318,14 @@ class SubagentTaskManager:
 
     async def _drive(self, task_id: str, launch: SubagentLaunch) -> None:
         driver: SubagentTaskDriver | None = None
+        execution_task: asyncio.Task[SubagentDriverOutcome] | None = None
+        deadline_task: asyncio.Task[None] | None = None
         outcome = SubagentDriverOutcome(
             SubagentTaskStatus.FAILED,
             error="Subagent runtime did not produce an outcome.",
         )
         events_completed = False
+        timed_out = False
         try:
             async with self._lock:
                 record = self._records.get(task_id)
@@ -322,22 +337,47 @@ class SubagentTaskManager:
                         status=SubagentTaskStatus.RUNNING,
                         started_at=self._wall_clock(),
                     )
-            created = launch.driver_factory(task_id)
-            driver = await created if inspect.isawaitable(created) else created
-            async with self._lock:
+                remaining = max(
+                    0.0,
+                    self._execution_timeout
+                    - (self._monotonic() - record.registered_monotonic),
+                )
+            execution_task = asyncio.create_task(
+                self._run_driver(task_id, launch)
+            )
+            deadline_task = asyncio.create_task(self._sleep(remaining))
+            done, _ = await asyncio.wait(
+                (execution_task, deadline_task),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if execution_task in done:
+                deadline_task.cancel()
+                await asyncio.gather(deadline_task, return_exceptions=True)
+                outcome = execution_task.result()
+                events_completed = True
+            else:
+                deadline_task.result()
                 record = self._records.get(task_id)
-                if record is None:
-                    return
-                record.driver = driver
-                cancel_now = record.cancel_requested and not record.cancel_forwarded
-                if cancel_now:
-                    record.cancel_forwarded = True
-            if cancel_now:
-                await driver.cancel()
-            async for progress in driver.events():
-                await self._record_progress(task_id, progress)
-            outcome = driver.outcome
-            events_completed = True
+                cancel_won = record is not None and record.cancel_requested
+                if record is not None and not cancel_won:
+                    record.timeout_triggered = True
+                timed_out = not cancel_won
+                driver = self._driver_for(task_id)
+                if timed_out and driver is not None:
+                    try:
+                        await driver.cancel()
+                    except Exception:
+                        pass
+                execution_task.cancel()
+                await asyncio.gather(execution_task, return_exceptions=True)
+                outcome = (
+                    self._timeout_outcome(driver)
+                    if timed_out
+                    else SubagentDriverOutcome(
+                        SubagentTaskStatus.CANCELLED,
+                        error="Subagent task was cancelled.",
+                    )
+                )
         except asyncio.CancelledError:
             outcome = SubagentDriverOutcome(
                 SubagentTaskStatus.CANCELLED,
@@ -349,12 +389,24 @@ class SubagentTaskManager:
                 error=f"Subagent runtime failed: {type(exc).__name__}.",
             )
         finally:
+            pending = [
+                task
+                for task in (execution_task, deadline_task)
+                if task is not None and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            driver = driver or self._driver_for(task_id)
             if driver is not None:
                 try:
                     await driver.close()
                     try:
                         closed_outcome = driver.outcome
-                        if events_completed or closed_outcome.worktree is not None:
+                        if timed_out:
+                            outcome = self._timeout_outcome(driver)
+                        elif events_completed or closed_outcome.worktree is not None:
                             outcome = closed_outcome
                     except RuntimeError:
                         pass
@@ -366,7 +418,55 @@ class SubagentTaskManager:
                             error="Subagent runtime cleanup failed.",
                             usage=outcome.usage,
                         )
-            await self._commit_terminal(task_id, outcome)
+            await self._commit_terminal(
+                task_id,
+                outcome,
+                preserve_failed=timed_out,
+            )
+
+    async def _run_driver(
+        self,
+        task_id: str,
+        launch: SubagentLaunch,
+    ) -> SubagentDriverOutcome:
+        created = launch.driver_factory(task_id)
+        driver = await created if inspect.isawaitable(created) else created
+        record = self._records.get(task_id)
+        if record is None:
+            raise RuntimeError("The subagent task disappeared during startup.")
+        record.driver = driver
+        cancel_now = record.cancel_requested and not record.cancel_forwarded
+        if cancel_now:
+            record.cancel_forwarded = True
+            await driver.cancel()
+        async for progress in driver.events():
+            await self._record_progress(task_id, progress)
+        return driver.outcome
+
+    def _driver_for(self, task_id: str) -> SubagentTaskDriver | None:
+        record = self._records.get(task_id)
+        return record.driver if record is not None else None
+
+    def _timeout_outcome(
+        self,
+        driver: SubagentTaskDriver | None,
+    ) -> SubagentDriverOutcome:
+        usage = TokenUsage.zero()
+        worktree = None
+        if driver is not None:
+            try:
+                current = driver.outcome
+                usage = current.usage
+                worktree = current.worktree
+            except RuntimeError:
+                pass
+        seconds = f"{self._execution_timeout:g}"
+        return SubagentDriverOutcome(
+            SubagentTaskStatus.FAILED,
+            error=f"Subagent task exceeded its {seconds}-second execution timeout.",
+            usage=usage,
+            worktree=worktree,
+        )
 
     async def _record_progress(
         self,
@@ -389,6 +489,8 @@ class SubagentTaskManager:
         self,
         task_id: str,
         outcome: SubagentDriverOutcome,
+        *,
+        preserve_failed: bool = False,
     ) -> None:
         status = outcome.status
         if not status.terminal:
@@ -399,7 +501,11 @@ class SubagentTaskManager:
             record = self._records.get(task_id)
             if record is None or record.snapshot.status.terminal:
                 return
-            if record.cancel_requested and status is not SubagentTaskStatus.COMPLETED:
+            if (
+                record.cancel_requested
+                and status is not SubagentTaskStatus.COMPLETED
+                and not preserve_failed
+            ):
                 status = SubagentTaskStatus.CANCELLED
             pending = (
                 record.snapshot.placement is SubagentPlacement.BACKGROUND
@@ -520,6 +626,18 @@ class SubagentTaskManager:
             *(self.cancel(task_id) for task_id in task_ids),
             return_exceptions=True,
         )
+        drive_tasks = [
+            record.drive_task
+            for task_id in task_ids
+            if (record := self._records.get(task_id)) is not None
+            and record.drive_task is not None
+            and not record.drive_task.done()
+        ]
+        if drive_tasks:
+            await asyncio.gather(
+                *(self._bounded_wait(task) for task in drive_tasks),
+                return_exceptions=True,
+            )
         diagnostics = []
         for task_id, result in zip(task_ids, results, strict=True):
             if isinstance(result, BaseException):

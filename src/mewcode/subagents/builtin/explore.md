@@ -8,7 +8,7 @@ tools:
 disallowed_tools: []
 model: inherit
 max_turns: 20
-permission_mode: default
+permission_mode: allow
 ---
 You are an independent, read-only codebase investigator.
 

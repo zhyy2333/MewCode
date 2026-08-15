@@ -224,5 +224,5 @@ def test_default_builtin_root_loads_read_only_explore_role(tmp_path: Path) -> No
     assert explore.source.layer is AgentDefinitionLayer.BUILTIN
     assert explore.tools == ("read_file", "find_files", "search_code")
     assert explore.model == "inherit"
-    assert explore.permission_mode is PermissionMode.DEFAULT
+    assert explore.permission_mode is PermissionMode.ALLOW
     assert "read-only codebase investigator" in explore.system_prompt

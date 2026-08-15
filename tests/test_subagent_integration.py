@@ -38,8 +38,10 @@ from mewcode.subagents import (
     AgentDefinitionSource,
     AgentTool,
     SubagentCoordinator,
+    SubagentNotificationQueue,
     SubagentRuntimeFactory,
     SubagentTaskManager,
+    SubagentTaskStatus,
 )
 from mewcode.tools import ToolRegistry, ToolSafety, Workspace, create_builtin_registry
 from tests.fakes import ControlledTool, ScriptedAsyncProvider, collect_async, tool_call
@@ -256,6 +258,183 @@ def test_defined_foreground_runs_actual_isolated_runtime_to_completion(
         await manager.close()
 
     asyncio.run(scenario())
+
+
+def test_explore_liveness_executes_frozen_read_only_tools_without_rules(
+    tmp_path: Path,
+) -> None:
+    async def scenario():
+        calls: list[str] = []
+        tools = [
+            ControlledTool("read_file", calls=calls),
+            ControlledTool("find_files", calls=calls),
+            ControlledTool("search_code", calls=calls),
+        ]
+        parent_agent = ControlledTool("agent")
+        registry = ToolRegistry([*tools, parent_agent])
+        workspace = Workspace(tmp_path)
+        catalog = cli._load_agent_catalog(
+            workspace,
+            _profiles(),
+            registry,
+        )
+        inner = ScriptedAsyncProvider(
+            [
+                [ProviderToolCall(tool_call("find", "find_files", value="**/*.py"))],
+                [ProviderToolCall(tool_call("read", "read_file", value="src/app.py"))],
+                [ProviderToolCall(tool_call("search", "search_code", value="Agent"))],
+                [ProviderTextDelta("exploration complete")],
+            ]
+        )
+        provider = RequestBoundaryProvider(inner)
+        runtime_factory = SubagentRuntimeFactory(
+            provider_supplier=lambda profile: provider,
+            prompt_builder=PromptBuilder(PromptEnvironmentProvider(tmp_path)),
+            workspace=workspace,
+            hook_runtime=None,
+            context_config_factory=lambda profile: ContextConfig(128_000),
+        )
+
+        class Writer:
+            def add_local_allow(self, target):
+                raise AssertionError("explore must not persist permission rules")
+
+        coordinator = SubagentCoordinator(
+            catalog,
+            runtime_factory,
+            registry,
+            PermissionRuleStore(PermissionRuleSets(), Writer()),
+            background_capable_names=registry.names,
+        )
+        manager = SubagentTaskManager(id_factory=lambda: "explore-task")
+        context = AgentControlContext(
+            "parent",
+            1,
+            AgentMode.DIRECT,
+            "main",
+            PermissionMode.DEFAULT,
+            20,
+            frozenset({ToolSafety.READ_ONLY}),
+            ModelRequest(PromptPackage("stable", "dynamic"), (), registry, 4096),
+        )
+        operation = AgentTool(coordinator, manager).control_operation(
+            {"type": "defined", "task": "inspect Python sources", "role": "explore"},
+            context,
+        )
+
+        await collect_async(operation.events())
+        result = operation.result
+        request_tools = inner.calls[0].tools.names
+        await manager.close()
+        return calls, result, request_tools, len(inner.calls)
+
+    calls, result, request_tools, request_count = asyncio.run(scenario())
+
+    assert calls == ["find_files", "read_file", "search_code"]
+    assert result.ok and result.content == "exploration complete"
+    assert request_tools == ("read_file", "find_files", "search_code")
+    assert request_count == 4
+
+
+def test_background_execution_timeout_stops_actual_subagent_runtime(
+    tmp_path: Path,
+) -> None:
+    class BlockingProvider(ScriptedAsyncProvider):
+        def __init__(self):
+            super().__init__([])
+            self.started = asyncio.Event()
+
+        async def stream_reply(self, request):
+            self.calls.append(request)
+            self.started.set()
+            await asyncio.Future()
+            if False:
+                yield ProviderTextDelta("")
+
+    async def scenario():
+        read = ControlledTool("read_file")
+        find = ControlledTool("find_files")
+        search = ControlledTool("search_code")
+        parent_agent = ControlledTool("agent")
+        registry = ToolRegistry([read, find, search, parent_agent])
+        workspace = Workspace(tmp_path)
+        catalog = cli._load_agent_catalog(workspace, _profiles(), registry)
+        inner = BlockingProvider()
+        provider = RequestBoundaryProvider(inner)
+        runtime_factory = SubagentRuntimeFactory(
+            provider_supplier=lambda profile: provider,
+            prompt_builder=PromptBuilder(PromptEnvironmentProvider(tmp_path)),
+            workspace=workspace,
+            hook_runtime=None,
+            context_config_factory=lambda profile: ContextConfig(128_000),
+        )
+
+        class Writer:
+            def add_local_allow(self, target):
+                raise AssertionError
+
+        coordinator = SubagentCoordinator(
+            catalog,
+            runtime_factory,
+            registry,
+            PermissionRuleStore(PermissionRuleSets(), Writer()),
+            background_capable_names=registry.names,
+        )
+        deadline = asyncio.Event()
+        delays = []
+
+        async def controlled_sleep(delay):
+            delays.append(delay)
+            await deadline.wait()
+
+        notifications = SubagentNotificationQueue()
+        manager = SubagentTaskManager(
+            notifications,
+            id_factory=lambda: "timeout-task",
+            sleep=controlled_sleep,
+            execution_timeout=300.0,
+        )
+        context = AgentControlContext(
+            "parent",
+            1,
+            AgentMode.DIRECT,
+            "main",
+            PermissionMode.DEFAULT,
+            20,
+            frozenset({ToolSafety.READ_ONLY}),
+            ModelRequest(PromptPackage("stable", "dynamic"), (), registry, 4096),
+        )
+        operation = AgentTool(coordinator, manager).control_operation(
+            {
+                "type": "defined",
+                "task": "wait for external evidence",
+                "role": "explore",
+                "background": True,
+            },
+            context,
+        )
+        await collect_async(operation.events())
+        assert operation.result.ok
+        await asyncio.wait_for(inner.started.wait(), timeout=1.0)
+        deadline.set()
+        for _ in range(20):
+            await asyncio.sleep(0)
+            snapshot = manager.get("timeout-task")
+            if snapshot is not None and snapshot.status.terminal:
+                break
+        snapshot = manager.get("timeout-task")
+        batch = notifications.consume_batch()
+        await manager.close()
+        return operation.result, snapshot, batch, delays, len(inner.calls)
+
+    result, snapshot, batch, delays, request_count = asyncio.run(scenario())
+
+    assert result.ok and result.metadata["placement"] == "background"
+    assert snapshot.status is SubagentTaskStatus.FAILED
+    assert snapshot.error == "Subagent task exceeded its 300-second execution timeout."
+    assert [item.task_id for item in batch.notifications] == ["timeout-task"]
+    assert delays == [300.0]
+    assert request_count == 1
 
 
 def test_anthropic_fork_bytes_preserve_adapter_cache_prefix(monkeypatch) -> None:

@@ -146,7 +146,10 @@ class SubagentRuntimeFactory:
         runner = AgentRunner(
             provider,
             scheduler,
-            AgentRunConfig(max_iterations=max_iterations),
+            AgentRunConfig(
+                max_iterations=max_iterations,
+                tool_denial_limit=3,
+            ),
             prompt_builder=prompt_builder,
             context_manager=context_manager,
             hook_runtime=hook_runtime,
