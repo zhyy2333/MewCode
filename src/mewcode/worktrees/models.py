@@ -151,6 +151,26 @@ class WorktreeState(StrEnum):
     DELETED = "deleted"
 
 
+class WorktreePurpose(StrEnum):
+    SUBAGENT_TASK = "subagent_task"
+    TEAM_MEMBER = "team_member"
+
+
+@dataclass(frozen=True)
+class WorktreeOwner:
+    purpose: WorktreePurpose
+    owner_id: str
+    persistent: bool
+
+    def __post_init__(self) -> None:
+        if not self.owner_id or len(self.owner_id) > 128:
+            raise WorktreeValidationError("Worktree owner_id is invalid.")
+        if not isinstance(self.persistent, bool):
+            raise WorktreeValidationError("Worktree persistent flag must be a boolean.")
+        if self.purpose is WorktreePurpose.TEAM_MEMBER and not self.persistent:
+            raise WorktreeValidationError("Team member Worktrees must be persistent.")
+
+
 @dataclass(frozen=True)
 class WorktreeRecord:
     schema_version: int
@@ -167,6 +187,9 @@ class WorktreeRecord:
     created_at: datetime
     last_used_at: datetime
     retained_reason: str | None = None
+    purpose: WorktreePurpose = WorktreePurpose.SUBAGENT_TASK
+    owner_id: str = ""
+    persistent: bool = False
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION:
@@ -175,6 +198,10 @@ class WorktreeRecord:
             raise WorktreeValidationError("management_id must be 128-bit lowercase hex.")
         if not self.repository_id or not self.task_id:
             raise WorktreeValidationError("Record identity fields must not be empty.")
+        if not self.owner_id:
+            object.__setattr__(self, "owner_id", self.task_id)
+        if self.purpose is WorktreePurpose.TEAM_MEMBER and not self.persistent:
+            raise WorktreeValidationError("Team member Worktrees must be persistent.")
         object.__setattr__(self, "root", _absolute(self.root, "root"))
         object.__setattr__(self, "base_oid", _oid(self.base_oid, "base_oid"))
         object.__setattr__(self, "created_at", _utc(self.created_at))
@@ -193,12 +220,19 @@ class WorktreeMarker:
     git_hooks_path: PurePosixPath | None
     task_id: str
     ready: bool
+    purpose: WorktreePurpose = WorktreePurpose.SUBAGENT_TASK
+    owner_id: str = ""
+    persistent: bool = False
 
     def __post_init__(self) -> None:
         if self.schema_version != SCHEMA_VERSION or not self.ready:
             raise WorktreeValidationError("Worktree marker is not ready.")
         if len(self.management_id) != 32 or any(ch not in "0123456789abcdef" for ch in self.management_id):
             raise WorktreeValidationError("Invalid marker management_id.")
+        if not self.owner_id:
+            object.__setattr__(self, "owner_id", self.task_id)
+        if self.purpose is WorktreePurpose.TEAM_MEMBER and not self.persistent:
+            raise WorktreeValidationError("Team member Worktrees must be persistent.")
         object.__setattr__(self, "base_oid", _oid(self.base_oid, "base_oid"))
 
 
@@ -288,6 +322,7 @@ class WorktreeLease:
     task_id: str
     lock: object
     released: bool = False
+    owner: WorktreeOwner | None = None
 
 
 class WorktreeDeleteStatus(StrEnum):
@@ -326,6 +361,8 @@ class WorktreeStatus:
     branch_ref: str
     last_used_at: datetime
     retained_reason: str | None = None
+    purpose: WorktreePurpose = WorktreePurpose.SUBAGENT_TASK
+    persistent: bool = False
 
 
 @dataclass(frozen=True)

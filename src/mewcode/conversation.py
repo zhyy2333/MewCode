@@ -16,6 +16,7 @@ from .agent import (
     AgentRunOutcome,
     AgentRunStateError,
     AgentRunner,
+    AgentRunView,
 )
 from .context import ContextManager, ContextOperation, ContextStatus
 from .continuity import (
@@ -98,6 +99,9 @@ class Conversation:
         task_manager: SubagentTaskManager | None = None,
         worktree_lifecycle: WorktreeLifecycleService | None = None,
         worktree_janitor: WorktreeJanitor | None = None,
+        team_run_view_composer=None,
+        team_inbound_source=None,
+        team_coordinator=None,
     ) -> None:
         self._runner = runner
         self._tools = tools
@@ -128,6 +132,9 @@ class Conversation:
         self._task_manager = task_manager
         self._worktree_lifecycle = worktree_lifecycle
         self._worktree_janitor = worktree_janitor
+        self._team_run_view_composer = team_run_view_composer
+        self._team_inbound_source = team_inbound_source
+        self._team_coordinator = team_coordinator
         self._started = False
         self._closed = False
 
@@ -441,6 +448,17 @@ class Conversation:
         self._closed = True
         await self.cancel_active()
         diagnostics: list[ContextStatus | ContinuityDiagnostic | SubagentDiagnostic] = []
+        if self._team_coordinator is not None:
+            try:
+                team_diagnostics = await self._team_coordinator.close()
+                diagnostics.extend(
+                    SubagentDiagnostic(None, item.message)
+                    for item in team_diagnostics
+                )
+            except Exception:
+                diagnostics.append(
+                    SubagentDiagnostic(None, "Team shutdown did not finish cleanly.")
+                )
         if self._task_manager is not None:
             try:
                 diagnostics.extend(await self._task_manager.close())
@@ -511,6 +529,18 @@ class Conversation:
     ) -> AsyncIterator[AgentEvent]:
         if self._active_run is not None or self._active_context_operation is not None:
             raise ConversationError("Another conversation operation is already active.")
+        if self._team_run_view_composer is not None:
+            base_provider = run_view_provider
+
+            def combined_view():
+                base = (
+                    base_provider()
+                    if base_provider is not None
+                    else AgentRunView(tools)
+                )
+                return self._team_run_view_composer.compose(base)
+
+            run_view_provider = combined_view
         turn_id = uuid4().hex
         scope = None
         if self._hook_runtime is not None:
@@ -533,6 +563,7 @@ class Conversation:
             prompt_context,
             history_commit_sink=self._session,
             run_view_provider=run_view_provider,
+            inbound_source=self._team_inbound_source,
             request_boundary_factory=(
                 (
                     lambda slot: RootAgentRequestBoundary(

@@ -29,6 +29,7 @@ class MessageKind(StrEnum):
     SUMMARY = "summary"
     BOUNDARY = "boundary"
     RESUME_NOTICE = "resume_notice"
+    TEAM_INBOUND = "team_inbound"
 
 
 @dataclass(frozen=True)

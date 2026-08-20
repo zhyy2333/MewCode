@@ -20,6 +20,8 @@ from .models import (
     WorktreeMarker,
     WorktreeName,
     WorktreeProtection,
+    WorktreePurpose,
+    WorktreeOwner,
     WorktreeRecord,
     WorktreeRuleKind,
     WorktreeState,

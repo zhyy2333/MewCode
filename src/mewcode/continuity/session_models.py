@@ -60,6 +60,7 @@ class SessionState:
     pending_plan: StoredPlan | None = None
     last_activity: datetime | None = None
     active_skills: tuple[StoredSkillActivation, ...] = ()
+    delivered_inbound_ids: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -81,6 +82,7 @@ class SessionReplay:
     invalid_lines: int
     partial_offset: int | None
     valid_start: bool
+    delivered_inbound_ids: frozenset[str] = frozenset()
 
     @property
     def recoverable(self) -> bool:

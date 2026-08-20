@@ -97,13 +97,13 @@
 
 ## 编译与自动化测试
 
-- [ ] **B01 — Python 源码可编译。** （验证：运行 `python -m compileall -q src/mewcode`，期望退出码为 0。）
-- [ ] **B02 — 测试可完整收集。** （验证：运行 `python -m pytest --collect-only -q`，期望退出码为 0、无导入错误、团队测试均被收集。）
-- [ ] **B03 — 团队与容量专项测试通过。** （验证：运行 `python -m pytest tests/teams tests/test_agent_capacity.py tests/test_team_cli_integration.py -q`，期望全部通过且无真实网络依赖。）
-- [ ] **B04 — 受影响的 Agent、Session、Worktree 和子 Agent 回归通过。** （验证：运行 `python -m pytest tests/test_agent_runner.py tests/test_session_codec.py tests/test_session_repository.py tests/test_subagent_tasks.py tests/test_subagent_worktree.py tests/worktrees tests/test_conversation.py tests/test_plan_mode.py -q`，期望全部通过。）
-- [ ] **B05 — 完整测试套件通过。** （验证：运行 `python -m pytest -q`，期望零失败、零错误。）
-- [ ] **B06 — 安装后的公共入口可启动。** （验证：在隔离环境执行可编辑安装后运行 `mewcode --help` 和包导入冒烟命令，期望正常退出且团队新增模块可被 CLI 装配。）
-- [ ] **B07 — Phase 14A 没有越界实现。** （验证：检查团队实现和用户文档，确认没有终端窗格/独立进程后端、自动任务编排闭环、自动 Git 合并或 coordinator 双开关；任何相关词仅能出现在明确的“不支持/后续阶段”说明中。）
+- [x] **B01 — Python 源码可编译。** （验证：运行 `python -m compileall -q src/mewcode`，期望退出码为 0。）
+- [x] **B02 — 测试可完整收集。** （验证：运行 `python -m pytest --collect-only -q`，期望退出码为 0、无导入错误、团队测试均被收集。）
+- [x] **B03 — 团队与容量专项测试通过。** （验证：运行 `python -m pytest tests/teams tests/test_agent_capacity.py tests/test_team_cli_integration.py -q`，期望全部通过且无真实网络依赖。）
+- [x] **B04 — 受影响的 Agent、Session、Worktree 和子 Agent 回归通过。** （验证：运行 `python -m pytest tests/test_agent_runner.py tests/test_session_codec.py tests/test_session_repository.py tests/test_subagent_tasks.py tests/test_subagent_worktree.py tests/worktrees tests/test_conversation.py tests/test_plan_mode.py -q`，期望全部通过。）
+- [x] **B05 — 完整测试套件通过。** （验证：运行 `python -m pytest -q`，期望零失败、零错误。）
+- [x] **B06 — 安装后的公共入口可启动。** （验证：在隔离环境执行可编辑安装后运行 `mewcode --help` 和包导入冒烟命令，期望正常退出且团队新增模块可被 CLI 装配。）
+- [x] **B07 — Phase 14A 没有越界实现。** （验证：检查团队实现和用户文档，确认没有终端窗格/独立进程后端、自动任务编排闭环、自动 Git 合并或 coordinator 双开关；任何相关词仅能出现在明确的“不支持/后续阶段”说明中。）
 
 ## 端到端场景
 
@@ -119,6 +119,17 @@
 
 - [ ] 51 个 Spec 行为项 C01–C51 全部通过并附有证据。（验证：逐项检查编号、勾选状态和对应命令输出或观察记录。）
 - [ ] 16 个架构与集成项 I01–I16 全部通过并附有证据。（验证：逐项检查编号、勾选状态和故障/并发测试证据。）
-- [ ] 7 个编译与自动化项 B01–B07 全部通过。（验证：保存每条命令的退出码、摘要和完整日志位置。）
+- [x] 7 个编译与自动化项 B01–B07 全部通过。（验证：保存每条命令的退出码、摘要和完整日志位置。）
 - [ ] 7 个端到端场景 E01–E07 全部通过。（验证：保存每个场景的输入、关键时间线、持久状态及最终结果。）
 - [ ] 所有失败项均已修复并重新验证，没有以跳过、放宽断言或删除测试代替修复。（验证：检查最终测试报告没有 skip/xfail 增量，并关联每个历史失败的修复后证据。）
+
+## 2026-08-20 自动化验证记录
+
+- B01：`python -m compileall -q src/mewcode`，退出码 0。
+- B02：`python -m pytest --collect-only -q`，收集 1068 项，退出码 0。
+- B03：团队与容量专项 55 项全部通过。
+- B04：受影响组件回归 179 项全部通过。
+- B05：完整测试套件 1068 项全部通过，耗时 35.09 秒。
+- B06：在 `%TEMP%/mewcode-phase14a-verify` 隔离虚拟环境完成可编辑安装；`mewcode --help` 与 `import mewcode.teams` 均成功。
+- B07：团队源码范围没有终端窗格、独立进程、自动合并或 coordinator mode 实现；README 仅在 Phase 14B/14C 边界说明中提及。
+- C、I、E 项保持未勾选，直到其各自要求的跨进程故障注入、三平台 CI、真实 CLI 时间线或并发压力证据全部补齐；专项单元测试通过不替代这些更强的验收条件。

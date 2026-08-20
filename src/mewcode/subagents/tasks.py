@@ -12,7 +12,12 @@ import time
 from typing import Protocol
 from uuid import uuid4
 
-from mewcode.agent import AgentSubagentProgress, ForkRequestSeed
+from mewcode.agent import (
+    AgentCapacityLease,
+    AgentCapacityPool,
+    AgentSubagentProgress,
+    ForkRequestSeed,
+)
 from mewcode.permissions import PermissionMode, PermissionRuleSets
 from mewcode.prompting import PromptAdditions
 from mewcode.providers import TokenUsage
@@ -97,6 +102,7 @@ class _ManagedSubagentTask:
     terminal: asyncio.Event
     updates: asyncio.Queue[SubagentProgress]
     registered_monotonic: float
+    capacity_lease: AgentCapacityLease | None
     cancel_requested: bool = False
     cancel_forwarded: bool = False
     timeout_triggered: bool = False
@@ -132,6 +138,7 @@ class SubagentTaskManager:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         close_timeout: float = TASK_CLOSE_TIMEOUT_SECONDS,
         execution_timeout: float = SUBAGENT_EXECUTION_TIMEOUT_SECONDS,
+        capacity_pool: AgentCapacityPool | None = None,
     ) -> None:
         if max_active < 1:
             raise ValueError("max_active must be at least 1")
@@ -152,6 +159,7 @@ class SubagentTaskManager:
         self._sleep = sleep
         self._close_timeout = close_timeout
         self._execution_timeout = float(execution_timeout)
+        self._capacity_pool = capacity_pool or AgentCapacityPool(max_active)
         self._lock = asyncio.Lock()
         self._records: dict[str, _ManagedSubagentTask] = {}
         self._current_foreground: str | None = None
@@ -192,6 +200,12 @@ class SubagentTaskManager:
                 parent=launch.parent,
                 created_at=now,
             )
+            capacity_lease = await self._capacity_pool.try_acquire(
+                "subagent",
+                task_id,
+            )
+            if capacity_lease is None:
+                raise RuntimeError("The active subagent task limit has been reached.")
             record = _ManagedSubagentTask(
                 snapshot,
                 None,
@@ -200,6 +214,7 @@ class SubagentTaskManager:
                 asyncio.Event(),
                 asyncio.Queue(),
                 self._monotonic(),
+                capacity_lease,
             )
             self._records[task_id] = record
             if launch.placement is SubagentPlacement.FOREGROUND:
@@ -473,6 +488,7 @@ class SubagentTaskManager:
         task_id: str,
         progress: SubagentProgress,
     ) -> None:
+        capacity_lease: AgentCapacityLease | None = None
         bounded = SubagentProgress(
             progress.iteration,
             progress.phase[:128],
@@ -526,6 +542,8 @@ class SubagentTaskManager:
             if self._current_foreground == task_id:
                 self._current_foreground = None
             record.terminal.set()
+            capacity_lease = record.capacity_lease
+            record.capacity_lease = None
             if pending:
                 self._notifications.enqueue_once(
                     SubagentNotification(
@@ -547,6 +565,8 @@ class SubagentTaskManager:
                     (result or error or status.value).splitlines()[0][:200],
                 )
             )
+        if capacity_lease is not None:
+            await capacity_lease.close()
 
     async def _foreground_events(
         self,

@@ -60,6 +60,33 @@ class HistoryCommitSink(Protocol):
     def commit(self, messages: Sequence[ChatMessage]) -> None: ...
 
 
+class InboundHistoryCommitSink(HistoryCommitSink, Protocol):
+    @property
+    def delivered_inbound_ids(self) -> frozenset[str]: ...
+
+    def commit_inbound(
+        self,
+        messages: Sequence[ChatMessage],
+        inbound_ids: Sequence[str],
+    ) -> None: ...
+
+
+@dataclass(frozen=True)
+class AgentInboundBatch:
+    batch_id: str
+    messages: tuple[ChatMessage, ...]
+    mailbox_message_ids: tuple[str, ...]
+
+
+class AgentInboundSource(Protocol):
+    async def poll(
+        self,
+        committed_ids: frozenset[str],
+    ) -> AgentInboundBatch | None: ...
+
+    async def acknowledge(self, batch: AgentInboundBatch) -> None: ...
+
+
 class _HistoryCommitError(RuntimeError):
     pass
 
@@ -137,6 +164,7 @@ class AgentRun:
         prompt_context: PromptRunContext,
         context_manager: ContextManager | None,
         history_commit_sink: HistoryCommitSink | None,
+        inbound_source: AgentInboundSource | None = None,
         run_view_provider: RunViewProvider | None = None,
         hook_runtime: HookRuntime | None = None,
         profile_name: str = "default",
@@ -160,6 +188,7 @@ class AgentRun:
         self._prompt_context = prompt_context
         self._context_manager = context_manager
         self._history_commit_sink = history_commit_sink
+        self._inbound_source = inbound_source
         self._run_view_provider = run_view_provider
         self._hook_runtime = hook_runtime
         self._profile_name = profile_name
@@ -239,6 +268,35 @@ class AgentRun:
                         cumulative_usage,
                     )
                     return
+
+                if self._inbound_source is not None:
+                    sink = self._history_commit_sink
+                    if sink is None or not hasattr(sink, "commit_inbound"):
+                        raise _HistoryCommitError(
+                            "An inbound source requires an inbound-capable session sink."
+                        )
+                    committed_ids = frozenset(
+                        getattr(sink, "delivered_inbound_ids", frozenset())
+                    )
+                    batch = await self._inbound_source.poll(committed_ids)
+                    if batch is not None:
+                        if not user_committed:
+                            self._commit_history(working_messages)
+                            new_messages.append(self._user_message)
+                            user_committed = True
+                        candidate = tuple([*working_messages, *batch.messages])
+                        try:
+                            sink.commit_inbound(  # type: ignore[attr-defined]
+                                candidate,
+                                batch.mailbox_message_ids,
+                            )
+                        except Exception as exc:
+                            raise _HistoryCommitError(
+                                "The current session could not persist inbound messages."
+                            ) from exc
+                        self._committed_history = candidate
+                        working_messages.extend(batch.messages)
+                        await self._inbound_source.acknowledge(batch)
 
                 yield AgentProgress(
                     run_id=self._run_id,
@@ -585,6 +643,16 @@ class AgentRun:
                 working_messages.extend(assistant_messages)
                 working_messages.extend(tool_messages)
 
+                if any(execution.result.metadata.get("safe_pause") for execution in executions):
+                    yield self._finish(
+                        StopReason.SAFE_PAUSE,
+                        iteration,
+                        response.text,
+                        new_messages,
+                        cumulative_usage,
+                    )
+                    return
+
                 if self._cancel_requested.is_set():
                     yield self._finish(
                         StopReason.CANCELLED,
@@ -777,6 +845,7 @@ class AgentRunner:
         mode: AgentMode = AgentMode.DIRECT,
         prompt_context: PromptRunContext | None = None,
         history_commit_sink: HistoryCommitSink | None = None,
+        inbound_source: AgentInboundSource | None = None,
         run_view_provider: RunViewProvider | None = None,
         seed_request: ForkRequestSeed | None = None,
         allowed_safety: frozenset[ToolSafety] | None = None,
@@ -804,6 +873,7 @@ class AgentRunner:
             prompt_context=prompt_context or PromptRunContext(task=user_text),
             context_manager=self._context_manager,
             history_commit_sink=history_commit_sink,
+            inbound_source=inbound_source,
             run_view_provider=run_view_provider,
             hook_runtime=self._hook_runtime,
             profile_name=self._profile_name,

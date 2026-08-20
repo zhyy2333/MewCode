@@ -32,6 +32,7 @@ class StopReason(StrEnum):
     CONTEXT_CAPACITY = "context_capacity"
     CONTEXT_COMPACTION = "context_compaction"
     SESSION_PERSISTENCE = "session_persistence"
+    SAFE_PAUSE = "safe_pause"
     ERROR = "error"
 
 

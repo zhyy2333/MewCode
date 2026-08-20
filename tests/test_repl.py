@@ -985,8 +985,9 @@ def test_cli_without_mcp_config_preserves_existing_tool_and_exit_behavior(monkey
         monkeypatch, McpConfigLoadResult((), (), ()), RuntimeMustNotStart
     )
     assert cli.main([]) == 0
-    assert len(captured["registry"].list()) == 8
-    assert captured["registry"].names[-1] == "agent"
+    assert len(captured["registry"].list()) == 9
+    assert captured["registry"].names[-1] == "team"
+    assert captured["registry"].get("agent") is not None
     assert captured["registry"].get("load_skill") is not None
 
 

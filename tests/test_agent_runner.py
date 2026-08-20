@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from mewcode.agent import (
+    AgentInboundBatch,
     AgentControlContext,
     AgentContextStatus,
     AgentMode,
@@ -33,6 +34,7 @@ from mewcode.context import (
 from mewcode.prompting import PromptAdditions, PromptPackage, PromptRunContext
 from mewcode.providers import (
     ChatMessage,
+    MessageKind,
     ModelResponse,
     ProviderError,
     ProviderEvent,
@@ -113,6 +115,110 @@ class RecordingHistorySink:
         if self.fail:
             raise OSError("disk details must stay private")
         self.commits.append(tuple(messages))
+
+
+class RecordingInboundSink(RecordingHistorySink):
+    def __init__(self, calls: list[str], *, fail: bool = False) -> None:
+        super().__init__()
+        self.calls = calls
+        self.fail_inbound = fail
+        self.delivered_inbound_ids = frozenset()
+
+    def commit_inbound(self, messages, inbound_ids) -> None:
+        self.calls.append("commit")
+        if self.fail_inbound:
+            raise OSError("simulated persistence failure")
+        self.commits.append(tuple(messages))
+        self.delivered_inbound_ids = self.delivered_inbound_ids.union(inbound_ids)
+
+
+class RecordingInboundSource:
+    def __init__(self, calls: list[str]) -> None:
+        self.calls = calls
+        self.sent = False
+
+    async def poll(self, committed_ids):
+        self.calls.append("poll")
+        if self.sent or "mail-1" in committed_ids:
+            return None
+        self.sent = True
+        return AgentInboundBatch(
+            "batch-1",
+            (ChatMessage("user", {"message_id": "mail-1"}, MessageKind.TEAM_INBOUND),),
+            ("mail-1",),
+        )
+
+    async def acknowledge(self, batch):
+        assert batch.mailbox_message_ids == ("mail-1",)
+        self.calls.append("acknowledge")
+
+
+def test_inbound_boundary_commits_then_acknowledges_before_provider() -> None:
+    calls: list[str] = []
+    provider = ScriptedAsyncProvider([[ProviderTextDelta("done")]])
+    sink = RecordingInboundSink(calls)
+    source = RecordingInboundSource(calls)
+    run = _runner(provider).start(
+        [],
+        "work",
+        ToolRegistry([]),
+        history_commit_sink=sink,
+        inbound_source=source,
+    )
+
+    asyncio.run(collect_async(run.events()))
+
+    assert calls == ["poll", "commit", "acknowledge"]
+    assert provider.calls[0].messages[-1].kind is MessageKind.TEAM_INBOUND
+    assert run.outcome.reason is StopReason.COMPLETED
+
+
+def test_inbound_boundary_does_not_acknowledge_failed_commit() -> None:
+    calls: list[str] = []
+    provider = ScriptedAsyncProvider([[ProviderTextDelta("unused")]])
+    sink = RecordingInboundSink(calls, fail=True)
+    source = RecordingInboundSource(calls)
+    run = _runner(provider).start(
+        [],
+        "work",
+        ToolRegistry([]),
+        history_commit_sink=sink,
+        inbound_source=source,
+    )
+
+    asyncio.run(collect_async(run.events()))
+
+    assert calls == ["poll", "commit"]
+    assert provider.calls == []
+    assert run.outcome.reason is StopReason.SESSION_PERSISTENCE
+
+
+def test_safe_pause_stops_after_complete_tool_result_is_persisted() -> None:
+    provider = ScriptedAsyncProvider(
+        [[ProviderToolCall(tool_call("call-1", "request_plan_approval"))]]
+    )
+    tool = ControlledTool(
+        "request_plan_approval",
+        result=ToolResult(
+            True,
+            "request_plan_approval",
+            "waiting",
+            metadata={"safe_pause": "awaiting_approval"},
+        ),
+    )
+    sink = RecordingHistorySink()
+    run = _runner(provider, max_iterations=2).start(
+        [],
+        "work",
+        ToolRegistry([tool]),
+        history_commit_sink=sink,
+    )
+
+    asyncio.run(collect_async(run.events()))
+
+    assert run.outcome.reason is StopReason.SAFE_PAUSE
+    assert sink.commits
+    assert sink.commits[-1][-1].kind is MessageKind.TOOL_RESULT
 
 
 def _summary_response(path: str) -> str:

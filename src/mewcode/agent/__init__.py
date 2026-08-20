@@ -17,6 +17,8 @@ from .events import (
 from .scheduler import ToolSchedule, ToolScheduleStateError, ToolScheduler
 from .streaming import StreamCollector, StreamStateError
 from .runner import (
+    AgentInboundBatch,
+    AgentInboundSource,
     AgentRunView,
     AgentRun,
     AgentRunConfig,
@@ -24,6 +26,7 @@ from .runner import (
     AgentRunStateError,
     AgentRunner,
     HistoryCommitSink,
+    InboundHistoryCommitSink,
 )
 from .control import (
     AgentControlContext,
@@ -34,11 +37,23 @@ from .control import (
     ToolExecutionPolicy,
     ToolPolicyDecision,
 )
+from .capacity import (
+    AgentCapacityClosedError,
+    AgentCapacityError,
+    AgentCapacityLease,
+    AgentCapacityPool,
+)
 
 __all__ = [
     "AgentEvent",
+    "AgentInboundBatch",
+    "AgentInboundSource",
     "AgentContinuityStatus",
     "AgentContextStatus",
+    "AgentCapacityClosedError",
+    "AgentCapacityError",
+    "AgentCapacityLease",
+    "AgentCapacityPool",
     "AgentMode",
     "AgentPermissionDecision",
     "AgentPermissionRequest",
@@ -56,6 +71,7 @@ __all__ = [
     "AgentRunStateError",
     "AgentRunner",
     "HistoryCommitSink",
+    "InboundHistoryCommitSink",
     "AgentStopped",
     "AgentTextDelta",
     "AgentTokenUsage",

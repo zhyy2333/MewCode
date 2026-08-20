@@ -5,8 +5,13 @@ from pathlib import Path
 
 from mewcode.worktrees.config import WorktreeConfigLoader
 from mewcode.worktrees.lifecycle import WorktreeLifecycleService
-from mewcode.worktrees.models import WorktreeDeleteStatus, WorktreeState
-from mewcode.worktrees.paths import WorktreePathPolicy
+from mewcode.worktrees.models import (
+    WorktreeDeleteStatus,
+    WorktreeOwner,
+    WorktreePurpose,
+    WorktreeState,
+)
+from mewcode.worktrees.paths import WorktreeNameFactory, WorktreePathPolicy
 
 from .helpers import repository
 
@@ -51,5 +56,24 @@ def test_clean_exit_deletes_target(tmp_path: Path) -> None:
         result = await service.exit(lease)
         assert result.state is WorktreeState.DELETED
         assert not environment.root.exists()
+
+    asyncio.run(scenario())
+
+
+def test_team_member_suspend_keeps_ready_worktree(tmp_path: Path) -> None:
+    root = repository(tmp_path)
+    name = WorktreeNameFactory().for_team_member("team-one", "member-one")
+    owner = WorktreeOwner(WorktreePurpose.TEAM_MEMBER, "member-one", True)
+
+    async def scenario() -> None:
+        service = _service(root)
+        environment = await service.create_or_recover(name, owner=owner)
+        lease = await service.enter(environment, owner=owner)
+        result = await service.suspend(lease)
+        assert result.state is WorktreeState.READY
+        assert environment.root.exists()
+        recovered = await _service(root).create_or_recover(name, owner=owner)
+        assert recovered.record.owner_id == "member-one"
+        assert recovered.record.persistent is True
 
     asyncio.run(scenario())

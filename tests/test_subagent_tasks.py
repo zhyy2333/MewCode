@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from mewcode.agent import AgentSubagentProgress
+from mewcode.agent import AgentCapacityPool, AgentSubagentProgress
 from mewcode.providers import TokenUsage
 from mewcode.subagents import (
     SUBAGENT_EXECUTION_TIMEOUT_SECONDS,
@@ -93,6 +93,46 @@ def _launch(
         placement,
         factory,
     )
+
+
+def test_shared_capacity_is_released_on_every_subagent_terminal_path() -> None:
+    async def scenario() -> None:
+        pool = AgentCapacityPool(2)
+        team_lease = await pool.acquire("team_member", "member-1")
+        gate = asyncio.Event()
+        ids = iter(("sub-1", "sub-2", "sub-3"))
+        manager = SubagentTaskManager(
+            capacity_pool=pool,
+            id_factory=lambda: next(ids),
+        )
+        await manager.start(
+            _launch(
+                lambda task_id: FakeDriver(gate=gate),
+                placement=SubagentPlacement.BACKGROUND,
+            )
+        )
+        await _settle()
+        with pytest.raises(RuntimeError, match="active subagent task limit"):
+            await manager.start(
+                _launch(
+                    lambda task_id: FakeDriver(),
+                    placement=SubagentPlacement.BACKGROUND,
+                )
+            )
+        gate.set()
+        await _settle()
+        await manager.start(
+            _launch(
+                lambda task_id: FakeDriver(),
+                placement=SubagentPlacement.BACKGROUND,
+            )
+        )
+        await _settle()
+        assert pool.active_count == 1
+        await manager.close()
+        await team_lease.close()
+
+    asyncio.run(scenario())
 
 
 async def _settle() -> None:

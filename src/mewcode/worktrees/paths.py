@@ -54,6 +54,13 @@ class WorktreeNameFactory:
         token = compact if len(compact) == 32 and all(ch in "0123456789abcdef" for ch in compact) else hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:32]
         return WorktreePathPolicy().parse_name(f"task/{token}")
 
+    def for_team_member(self, team_id: str, member_id: str) -> WorktreeName:
+        if not team_id or not member_id:
+            raise WorktreeValidationError("Team and member IDs must not be empty.")
+        team_token = hashlib.sha256(team_id.encode("utf-8")).hexdigest()[:16]
+        member_token = hashlib.sha256(member_id.encode("utf-8")).hexdigest()[:16]
+        return WorktreePathPolicy().parse_name(f"team/{team_token}/{member_token}")
+
 
 class WorktreePathPolicy:
     def parse_name(self, value: str) -> WorktreeName:

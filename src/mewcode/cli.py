@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import inspect
+import os
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 from types import MappingProxyType
 
-from .agent import AgentRunner, ToolScheduler
+from .agent import AgentCapacityPool, AgentMode, AgentRunConfig, AgentRunner, ToolScheduler
 from .commands import (
     CommandRegistrationError,
     InteractionState,
@@ -48,7 +49,7 @@ from .permissions import (
     PermissionRuleStore,
     PermissionTargetBuilder,
 )
-from .prompting import PromptBuilder, PromptEnvironmentProvider
+from .prompting import PromptAdditions, PromptBuilder, PromptEnvironmentProvider, PromptRunContext
 from .providers import (
     ConfigError,
     ProviderError,
@@ -59,7 +60,7 @@ from .providers import (
 )
 from .repl import Repl
 from .terminal import PromptToolkitTerminal
-from .tools import ToolRegistry, Workspace, create_builtin_registry
+from .tools import ToolRegistry, ToolSafety, Workspace, WorkspaceToolBinder, create_builtin_registry
 from .hooks import (
     HookActionExecutor,
     HookConfigError,
@@ -92,9 +93,35 @@ from .subagents import (
     SubagentRuntimeFactory,
     SubagentTaskManager,
     WorkspaceRuntimeBundleFactory,
+    SubagentPermissionController,
     build_agent_catalog,
     discover_agent_sources,
 )
+from .teams import (
+    FrozenRoleFactory,
+    MemberInboundSource,
+    MemberSessionStore,
+    TeamApprovalService,
+    TeamCoordinator,
+    TeamCoordinatorServices,
+    TeamLifecycleTool,
+    TeamMailboxService,
+    TeamMemberRunBundle,
+    TeamMemberRuntimeFactory,
+    TeamMemberScheduler,
+    TeamMemberTool,
+    TeamMessageTool,
+    TeamProtocolRouter,
+    TeamRepository,
+    TeamRepositoryBindingService,
+    TeamRosterService,
+    TeamRunViewComposer,
+    TeamTaskService,
+    TeamTaskTool,
+    TeamLeaseService,
+    build_member_tool_scope,
+)
+from .teams.models import TeamActor, TeamActorKind
 from .worktrees import (
     WorktreeConfigLoader,
     WorktreeJanitor,
@@ -171,11 +198,14 @@ def main(argv: list[str] | None = None) -> int:
     hook_runtime: HookRuntime | None = None
     task_manager: SubagentTaskManager | None = None
     worktree_janitor: WorktreeJanitor | None = None
+    team_coordinator: TeamCoordinator | None = None
+    capacity_pool: AgentCapacityPool | None = None
     try:
         static_command_registry = create_builtin_command_registry()
         command_registry = DynamicCommandCatalog(static_command_registry)
         interaction_state = InteractionState()
         workspace = Workspace(Path.cwd())
+        capacity_pool = AgentCapacityPool()
         worktree_config = WorktreeConfigLoader().load(
             workspace.root / ".mewcode" / "worktrees.yaml"
         )
@@ -436,7 +466,7 @@ def main(argv: list[str] | None = None) -> int:
             ),
         )
         notifications = SubagentNotificationQueue()
-        task_manager = SubagentTaskManager(notifications)
+        task_manager = SubagentTaskManager(notifications, capacity_pool=capacity_pool)
         subagent_coordinator = SubagentCoordinator(
             agent_catalog,
             subagent_runtime_factory,
@@ -449,7 +479,192 @@ def main(argv: list[str] | None = None) -> int:
             workspace_runtime_factory=workspace_runtime_factory,
         )
         agent_tool = AgentTool(subagent_coordinator, task_manager)
-        registry = base_registry.merge(ToolRegistry([load_skill, agent_tool]))
+        registry_without_team = base_registry.merge(ToolRegistry([load_skill, agent_tool]))
+
+        team_repository = TeamRepository(Path.home() / ".mewcode")
+        team_leases = TeamLeaseService(team_repository)
+        team_bindings = TeamRepositoryBindingService()
+        role_factory = FrozenRoleFactory(
+            agent_catalog,
+            profile_names=profile_catalog.entries,
+            permission_rules=rule_store.snapshot(),
+        )
+
+        async def create_team_services(team_name, fence_supplier):
+            approvals = TeamApprovalService(team_repository, team_name)
+            tasks = TeamTaskService(team_repository, team_name)
+            router = TeamProtocolRouter(team_repository, team_name)
+            mailbox = TeamMailboxService(
+                team_repository,
+                team_name,
+                router,
+                lease_fence=fence_supplier,
+            )
+            sessions = MemberSessionStore(team_repository.paths(team_name))
+
+            async def build_member_run(context):
+                actor = TeamActor(
+                    context.member.member_id,
+                    context.member.name,
+                    TeamActorKind.MEMBER,
+                    context.state.manifest.team_id,
+                    fence_supplier(),
+                )
+                permit = None
+                if context.member.requires_approval:
+                    permit = lambda: approvals.side_effect_permit(
+                        actor,
+                        context.member.current_task_id or "no-current-task",
+                    )
+                collaboration = ToolRegistry(
+                    [
+                        TeamTaskTool(lambda: tasks, lambda: actor, permit=permit),
+                        TeamMessageTool(
+                            lambda: mailbox,
+                            lambda: approvals,
+                            lambda: actor,
+                            permit=permit,
+                        ),
+                    ]
+                )
+                scope = build_member_tool_scope(
+                    base_registry,
+                    context.member.role,
+                    collaboration_registry=collaboration,
+                    approvals=approvals,
+                    actor=actor,
+                    task_id=lambda: context.member.current_task_id,
+                )
+                member_workspace = Workspace(context.worktree_lease.environment.root)
+                ordinary = scope.registry.without(collaboration.names)
+                bound = WorkspaceToolBinder().bind(
+                    ordinary,
+                    member_workspace,
+                    process_environment=context.worktree_lease.environment.process_environment,
+                ).merge(collaboration)
+                member_permissions = SubagentPermissionController.from_snapshot(
+                    member_workspace,
+                    context.member.role.permission_rules,
+                    context.member.role.permission_mode,
+                )
+                member_scheduler = ToolScheduler(
+                    member_permissions,
+                    policy=scope.policy,
+                )
+                member_provider = hooked_provider(context.member.role.profile_name)
+                member_archive = ContextArchive(
+                    member_workspace.root,
+                    session_id_factory=lambda: (
+                        f"{context.session.context_archive_id}-{context.member.run_generation}"
+                    ),
+                )
+                member_archive.start(skip_stale_cleanup=True)
+                member_context = ContextManager(
+                    member_provider,
+                    member_archive,
+                    ContextConfig(
+                        profile_catalog.require(context.member.role.profile_name).context_window
+                    ),
+                )
+                member_runner = AgentRunner(
+                    member_provider,
+                    member_scheduler,
+                    AgentRunConfig(
+                        max_iterations=context.member.role.max_turns,
+                        tool_denial_limit=3,
+                    ),
+                    prompt_builder=PromptBuilder(
+                        PromptEnvironmentProvider(member_workspace.root)
+                    ),
+                    context_manager=member_context,
+                    profile_name=context.member.role.profile_name,
+                    permission_mode_supplier=lambda: context.member.role.permission_mode,
+                    hook_component="team_member",
+                )
+                additions = PromptAdditions(
+                    agent_role=context.member.role.system_prompt,
+                )
+                run = member_runner.start(
+                    context.history,
+                    context.resume_prompt,
+                    bound,
+                    AgentMode.DIRECT,
+                    PromptRunContext(context.resume_prompt, additions=additions),
+                    history_commit_sink=context.session,
+                    inbound_source=MemberInboundSource(mailbox, actor),
+                )
+
+                async def close_member_resources():
+                    member_context.close()
+                    member_archive.close()
+
+                return TeamMemberRunBundle(run, close_member_resources)
+
+            member_runtime_factory = TeamMemberRuntimeFactory(
+                worktree_lifecycle,
+                sessions,
+                build_member_run,
+            )
+            member_scheduler = TeamMemberScheduler(
+                team_repository,
+                team_name,
+                capacity_pool,
+                member_runtime_factory,
+                lease_fence=fence_supplier,
+            )
+            mailbox.set_wake_sink(member_scheduler)
+            roster = TeamRosterService(
+                team_repository,
+                team_name,
+                role_factory,
+                worktree_lifecycle,
+                sessions,
+                current_profile_name=lambda: profile_catalog.active_name,
+                stop_sink=member_scheduler.stop,
+            )
+            return TeamCoordinatorServices(
+                scheduler=member_scheduler,
+                mailbox=mailbox,
+                roster=roster,
+                tasks=tasks,
+                approvals=approvals,
+            )
+
+        team_coordinator = TeamCoordinator(
+            team_repository,
+            team_leases,
+            team_bindings,
+            workspace.root,
+            process_id=str(os.getpid()),
+            services_factory=create_team_services,
+        )
+        team_lifecycle_tool = TeamLifecycleTool(
+            team_coordinator,
+            root_session_id=lambda: opened_session.state.session_id,
+        )
+
+        def lead_tools():
+            services = team_coordinator.services
+            if services is None:
+                return ToolRegistry([])
+            return ToolRegistry(
+                [
+                    TeamMemberTool(team_coordinator),
+                    TeamTaskTool(lambda: services.tasks, team_coordinator.lead_actor),
+                    TeamMessageTool(
+                        lambda: services.mailbox,
+                        lambda: services.approvals,
+                        team_coordinator.lead_actor,
+                    ),
+                ]
+            )
+
+        team_view = TeamRunViewComposer(
+            team_coordinator,
+            ToolRegistry([team_lifecycle_tool]),
+            lead_tools,
+        )
+        registry = registry_without_team.merge(ToolRegistry([team_lifecycle_tool]))
         skill_runtime.set_global_tools(registry)
         command_registry.replace(
             create_skill_command_definition(item.name, item.description)
@@ -506,6 +721,9 @@ def main(argv: list[str] | None = None) -> int:
             task_manager=task_manager,
             worktree_lifecycle=worktree_lifecycle,
             worktree_janitor=worktree_janitor,
+            team_run_view_composer=team_view,
+            team_inbound_source=team_coordinator,
+            team_coordinator=team_coordinator,
         )
         conversation_ref["value"] = conversation
         action = "resumed" if opened_session.resumed else "created"
@@ -581,6 +799,11 @@ def main(argv: list[str] | None = None) -> int:
         sys.stderr.write("\n")
         return 130
     finally:
+        if team_coordinator is not None:
+            try:
+                asyncio.run(team_coordinator.close())
+            except Exception:
+                sys.stderr.write("Warning: team coordinator shutdown failed.\n")
         if memory_manager is not None:
             try:
                 for diagnostic in asyncio.run(memory_manager.close()):
@@ -592,6 +815,11 @@ def main(argv: list[str] | None = None) -> int:
                 asyncio.run(task_manager.close())
             except Exception:
                 sys.stderr.write("Warning: subagent task shutdown failed.\n")
+        if capacity_pool is not None:
+            try:
+                asyncio.run(capacity_pool.close())
+            except Exception:
+                sys.stderr.write("Warning: agent capacity shutdown failed.\n")
         if worktree_janitor is not None:
             try:
                 asyncio.run(worktree_janitor.close())

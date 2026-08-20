@@ -30,6 +30,8 @@ from .models import (
     WorktreeMarker,
     MAX_CLEANUP_CANDIDATES,
     WorktreeName,
+    WorktreeOwner,
+    WorktreePurpose,
     WorktreeProtection,
     WorktreeRecord,
     WorktreeState,
@@ -83,9 +85,14 @@ class WorktreeLifecycleService:
     def _lock_for(self, name: WorktreeName) -> asyncio.Lock:
         return self._name_locks.setdefault(name.canonical_key, asyncio.Lock())
 
-    async def create_or_recover(self, name: WorktreeName, *, task_id: str) -> WorktreeEnvironment:
-        if not task_id:
-            raise WorktreeValidationError("Task ID must not be empty.")
+    async def create_or_recover(
+        self,
+        name: WorktreeName,
+        *,
+        task_id: str | None = None,
+        owner: WorktreeOwner | None = None,
+    ) -> WorktreeEnvironment:
+        owner = self._resolve_owner(task_id, owner)
         repository = self._discover()
         layout = self._paths.layout(repository, name)
         async with self._lock_for(name):
@@ -95,7 +102,7 @@ class WorktreeLifecycleService:
                 # The common recovery path is intentionally pure filesystem
                 # reading: no lock-file creation, Git subprocess, or metadata
                 # refresh. enter() obtains occupancy and revalidates afterward.
-                return self._recover(repository, layout, task_id)
+                return self._recover(repository, layout, owner)
             operation = FileLock(layout.lock_path)
             if not await asyncio.to_thread(operation.acquire):
                 operation.close()
@@ -105,7 +112,7 @@ class WorktreeLifecycleService:
                 # first existence check and our operation-lock acquisition.
                 exists = layout.root.exists() or layout.root.is_symlink() or layout.record_path.exists()
                 if exists:
-                    return self._recover(repository, layout, task_id)
+                    return self._recover(repository, layout, owner)
                 if self._config.config is None:
                     raise WorktreeValidationError(self._config.error or "Worktree configuration is invalid.")
                 now = self._wall_clock()
@@ -126,10 +133,13 @@ class WorktreeLifecycleService:
                             layout.branch_ref,
                             base_oid,
                             None,
-                            task_id,
+                            owner.owner_id,
                             WorktreeState.PROVISIONING,
                             now,
                             now,
+                            purpose=owner.purpose,
+                            owner_id=owner.owner_id,
+                            persistent=owner.persistent,
                         )
                         self._records.write_record(record, layout)
                         await self._git.add(repository, layout, base_oid)
@@ -144,8 +154,11 @@ class WorktreeLifecycleService:
                         layout.branch_ref,
                         base_oid,
                         initial.git_hooks_path,
-                        task_id,
+                        owner.owner_id,
                         True,
+                        purpose=owner.purpose,
+                        owner_id=owner.owner_id,
+                        persistent=owner.persistent,
                     )
                     self._records.write_marker(layout, marker)
                     record = replace(record, state=WorktreeState.READY, last_used_at=self._wall_clock())
@@ -158,10 +171,14 @@ class WorktreeLifecycleService:
             finally:
                 await asyncio.to_thread(operation.close)
 
-    def _recover(self, repository: RepositoryIdentity, layout, task_id: str) -> WorktreeEnvironment:
+    def _recover(self, repository: RepositoryIdentity, layout, owner: WorktreeOwner) -> WorktreeEnvironment:
         record = self._records.validate_filesystem_identity(repository, layout, {WorktreeState.READY})
-        if record.task_id != task_id:
-            raise WorktreeValidationError("Existing Worktree belongs to another task.")
+        if (
+            record.owner_id != owner.owner_id
+            or record.purpose is not owner.purpose
+            or record.persistent != owner.persistent
+        ):
+            raise WorktreeValidationError("Existing Worktree belongs to another owner.")
         environment = self._environment_for_record(layout, record)
         return WorktreeEnvironment(repository, layout, record, environment)
 
@@ -172,12 +189,23 @@ class WorktreeLifecycleService:
             hooks = (("core.hooksPath", str(layout.root.joinpath(*record.git_hooks_path.parts))),)
         return merge_process_environment({}, workspace_root=layout.root, git_config=hooks)
 
-    async def enter(self, environment: WorktreeEnvironment, *, task_id: str) -> WorktreeLease:
+    async def enter(
+        self,
+        environment: WorktreeEnvironment,
+        *,
+        task_id: str | None = None,
+        owner: WorktreeOwner | None = None,
+    ) -> WorktreeLease:
+        owner = self._resolve_owner(task_id, owner)
         name = environment.layout.name
         async with self._lock_for(name):
             current = self._records.validate_filesystem_identity(environment.repository, environment.layout, {WorktreeState.READY})
-            if current.task_id != task_id:
-                raise WorktreeValidationError("Worktree task identity does not match.")
+            if (
+                current.owner_id != owner.owner_id
+                or current.purpose is not owner.purpose
+                or current.persistent != owner.persistent
+            ):
+                raise WorktreeValidationError("Worktree owner identity does not match.")
             if name.canonical_key in self._active:
                 raise WorktreeValidationError("Worktree is already active.")
             file_lock = FileLock(environment.layout.lock_path)
@@ -188,12 +216,47 @@ class WorktreeLifecycleService:
                 current = replace(current, state=WorktreeState.ACTIVE, last_used_at=self._wall_clock())
                 self._records.write_record(current, environment.layout)
                 active_environment = replace(environment, record=current)
-                lease = WorktreeLease(active_environment, task_id, file_lock)
+                lease = WorktreeLease(active_environment, owner.owner_id, file_lock, owner=owner)
                 self._active[name.canonical_key] = lease
                 return lease
             except BaseException:
                 file_lock.close()
                 raise
+
+    async def suspend(self, lease: WorktreeLease) -> WorktreeExitResult:
+        environment = lease.environment
+        name = environment.layout.name
+        async with self._lock_for(name):
+            if lease.released:
+                record = self._safe_read(environment)
+                state = record.state if record is not None else WorktreeState.DELETED
+                return WorktreeExitResult(state, environment.root, environment.branch_ref, None)
+            try:
+                current = self._records.validate_filesystem_identity(
+                    environment.repository,
+                    environment.layout,
+                    {WorktreeState.ACTIVE},
+                )
+                if not current.persistent or current.purpose is not WorktreePurpose.TEAM_MEMBER:
+                    raise WorktreeValidationError("Only persistent team Worktrees may be suspended.")
+                updated = self._records.update_record(
+                    environment.layout,
+                    current.management_id,
+                    state=WorktreeState.READY,
+                    last_used_at=self._wall_clock(),
+                    retained_reason=None,
+                )
+                return WorktreeExitResult(
+                    WorktreeState.READY,
+                    environment.root,
+                    environment.branch_ref,
+                    None,
+                    updated.retained_reason,
+                )
+            finally:
+                self._active.pop(name.canonical_key, None)
+                lease.released = True
+                await asyncio.to_thread(lease.lock.close)
 
     async def exit(self, lease: WorktreeLease) -> WorktreeExitResult:
         environment = lease.environment
@@ -296,7 +359,18 @@ class WorktreeLifecycleService:
                 if layout.record_path != path:
                     continue
                 record = self._records.validate_filesystem_identity(repository, layout)
-                results.append(WorktreeStatus(record.name, record.state, record.root, record.branch_ref, record.last_used_at, record.retained_reason))
+                results.append(
+                    WorktreeStatus(
+                        record.name,
+                        record.state,
+                        record.root,
+                        record.branch_ref,
+                        record.last_used_at,
+                        record.retained_reason,
+                        record.purpose,
+                        record.persistent,
+                    )
+                )
             except (OSError, WorktreeError) as exc:
                 diagnostics.append(
                     CleanupDiagnostic(
@@ -324,6 +398,8 @@ class WorktreeLifecycleService:
             # per-Worktree FileLock below is the authoritative occupancy check,
             # so crash-stale ACTIVE records can eventually be reclaimed.
             if now - status.last_used_at < minimum_age:
+                continue
+            if status.persistent or status.purpose is WorktreePurpose.TEAM_MEMBER:
                 continue
             checked += 1
             try:
@@ -399,6 +475,16 @@ class WorktreeLifecycleService:
             return self._records.read_record(environment.layout)
         except WorktreeError:
             return None
+
+    @staticmethod
+    def _resolve_owner(task_id: str | None, owner: WorktreeOwner | None) -> WorktreeOwner:
+        if owner is None:
+            if not task_id:
+                raise WorktreeValidationError("Task ID or Worktree owner must be provided.")
+            return WorktreeOwner(WorktreePurpose.SUBAGENT_TASK, task_id, False)
+        if task_id is not None and task_id != owner.owner_id:
+            raise WorktreeValidationError("Task ID and Worktree owner do not match.")
+        return owner
 
     @staticmethod
     def _prune_empty_control_parents(layout) -> None:

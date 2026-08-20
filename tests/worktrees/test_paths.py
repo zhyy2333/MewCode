@@ -34,6 +34,14 @@ def test_task_name_is_safe_and_layout_is_contained(tmp_path: Path) -> None:
     assert layout.branch_ref.endswith(name.value)
 
 
+def test_team_member_name_is_stable_and_distinct() -> None:
+    factory = WorktreeNameFactory()
+    first = factory.for_team_member("team-one", "member-one")
+    assert first == factory.for_team_member("team-one", "member-one")
+    assert first != factory.for_team_member("team-one", "member-two")
+    assert first.value.startswith("team/")
+
+
 def test_link_ancestor_is_rejected(tmp_path: Path) -> None:
     workspace = (tmp_path / "repo").resolve()
     common = (workspace / ".git").resolve()

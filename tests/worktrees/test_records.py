@@ -10,9 +10,11 @@ from mewcode.worktrees import (
     GitWorktreeBackend,
     SCHEMA_VERSION,
     WorktreeMarker,
+    WorktreeOwner,
     WorktreePathPolicy,
     WorktreeRecord,
     WorktreeRecordStore,
+    WorktreePurpose,
     WorktreeState,
     WorktreeValidationError,
 )
@@ -46,6 +48,36 @@ def test_record_rejects_unknown_duplicate_and_identity_mismatch(tmp_path: Path) 
     layout.record_path.write_text('{"schema_version":1,"schema_version":1}', encoding="utf-8")
     with pytest.raises(WorktreeValidationError):
         WorktreeRecordStore().read_record(layout)
+
+
+def test_legacy_record_defaults_to_subagent_owner(tmp_path: Path) -> None:
+    root = repository(tmp_path)
+    identity = GitWorktreeBackend().discover_repository(root)
+    policy = WorktreePathPolicy()
+    layout = policy.layout(identity, policy.parse_name("task/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"))
+    layout.record_path.parent.mkdir(parents=True)
+    now = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "schema_version": 1,
+        "management_id": "b" * 32,
+        "repository_id": identity.repository_id,
+        "name": layout.name.value,
+        "canonical_key": layout.name.canonical_key,
+        "root": str(layout.root),
+        "branch_ref": layout.branch_ref,
+        "base_oid": git(root, "rev-parse", "HEAD").stdout.strip(),
+        "git_hooks_path": None,
+        "task_id": "legacy-task",
+        "state": "ready",
+        "created_at": now,
+        "last_used_at": now,
+        "retained_reason": None,
+    }
+    layout.record_path.write_text(json.dumps(payload), encoding="utf-8")
+    restored = WorktreeRecordStore().read_record(layout)
+    assert restored.purpose is WorktreePurpose.SUBAGENT_TASK
+    assert restored.owner_id == "legacy-task"
+    assert restored.persistent is False
     layout.record_path.write_text(json.dumps({"unknown": True}), encoding="utf-8")
     with pytest.raises(WorktreeValidationError):
         WorktreeRecordStore().read_record(layout)

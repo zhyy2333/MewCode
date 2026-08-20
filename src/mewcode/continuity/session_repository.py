@@ -21,6 +21,7 @@ from .diagnostics import (
 from .paths import ContinuityPaths
 from .session_codec import (
     encode_history,
+    encode_inbound_history,
     encode_plan,
     encode_skills,
     encode_start,
@@ -55,6 +56,7 @@ class SessionBinding:
         pending_plan: StoredPlan | None,
         active_skills: Sequence[StoredSkillActivation] = (),
         created_at: datetime | None = None,
+        delivered_inbound_ids: Sequence[str] = (),
     ) -> None:
         self._repository = repository
         self.session_id = session_id
@@ -64,6 +66,7 @@ class SessionBinding:
         self._pending_plan = pending_plan
         self._active_skills = tuple(active_skills)
         self._created_at = created_at
+        self._delivered_inbound_ids = frozenset(delivered_inbound_ids)
         self._closed = False
 
     def maintain(self, now: datetime | None = None) -> tuple[ContinuityDiagnostic, ...]:
@@ -93,6 +96,37 @@ class SessionBinding:
 
     def commit(self, messages: Sequence[ChatMessage]) -> None:
         self.commit_history(messages)
+
+    @property
+    def delivered_inbound_ids(self) -> frozenset[str]:
+        return self._delivered_inbound_ids
+
+    def commit_inbound(
+        self,
+        messages: Sequence[ChatMessage],
+        inbound_ids: Sequence[str],
+        *,
+        now: datetime | None = None,
+    ) -> None:
+        self._ensure_open()
+        candidate = tuple(messages)
+        new_ids = tuple(
+            item for item in inbound_ids if item not in self._delivered_inbound_ids
+        )
+        if not new_ids:
+            if candidate != self._messages:
+                raise SessionPersistenceError("Repeated inbound delivery changed session history.")
+            return
+        if len(candidate) < len(self._messages) or candidate[: len(self._messages)] != self._messages:
+            raise SessionPersistenceError("Inbound history must append to the current session.")
+        payload = candidate[len(self._messages) :]
+        if len(payload) != len(new_ids):
+            raise SessionPersistenceError("Inbound messages and delivery IDs do not match.")
+        self._append_record(
+            encode_inbound_history(payload, new_ids, "append", now or self._repository.now())
+        )
+        self._messages = candidate
+        self._delivered_inbound_ids = self._delivered_inbound_ids.union(new_ids)
 
     def commit_plan(
         self,
@@ -129,6 +163,7 @@ class SessionBinding:
                 encode_history((), "replace", current),
                 encode_plan(None, current),
                 encode_skills((), current),
+                encode_inbound_history((), (), "replace", current),
             )
         )
         temporary: Path | None = None
@@ -159,6 +194,7 @@ class SessionBinding:
         self._messages = ()
         self._pending_plan = None
         self._active_skills = ()
+        self._delivered_inbound_ids = frozenset()
 
     def close(self) -> tuple[ContinuityDiagnostic, ...]:
         if self._closed:
@@ -383,6 +419,7 @@ class SessionRepository:
                 replay.pending_plan,
                 replay.active_skills,
                 replay.created_at,
+                replay.delivered_inbound_ids,
             )
             if prefix != len(replay.messages):
                 binding.commit_history(valid_messages, now=now)
@@ -409,6 +446,7 @@ class SessionRepository:
                     replay.pending_plan,
                     now,
                     replay.active_skills,
+                    replay.delivered_inbound_ids,
                 ),
                 tuple(diagnostics),
                 True,

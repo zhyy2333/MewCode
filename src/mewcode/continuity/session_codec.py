@@ -36,6 +36,33 @@ def encode_history(
     )
 
 
+def encode_inbound_history(
+    messages: Sequence[ChatMessage],
+    inbound_ids: Sequence[str],
+    operation: str,
+    at: datetime,
+) -> bytes:
+    """Persist inbound messages and their delivery IDs as one recovery boundary."""
+    if operation not in {"append", "replace"}:
+        raise ValueError("invalid inbound history operation")
+    if any(not isinstance(item, str) or not item for item in inbound_ids):
+        raise ValueError("invalid inbound message id")
+    if len(set(inbound_ids)) != len(inbound_ids):
+        raise ValueError("duplicate inbound message id")
+    if len(messages) != len(inbound_ids):
+        raise ValueError("inbound messages and ids must have matching lengths")
+    return _encode(
+        {
+            "version": SESSION_VERSION,
+            "type": "inbound_history",
+            "at": _time(at),
+            "operation": operation,
+            "messages": [encode_message(message) for message in messages],
+            "inbound_ids": list(inbound_ids),
+        }
+    )
+
+
 def encode_plan(plan: StoredPlan | None, at: datetime) -> bytes:
     payload = None if plan is None else {"task": plan.task, "text": plan.text}
     return _encode(
@@ -98,6 +125,7 @@ def replay_file(path: Path, session_id: str) -> SessionReplay:
     invalid = 0
     partial_offset: int | None = None
     valid_start = False
+    delivered_inbound_ids: set[str] = set()
     offset = 0
     with path.open("rb") as handle:
         while True:
@@ -130,6 +158,20 @@ def replay_file(path: Path, session_id: str) -> SessionReplay:
                         messages = list(decoded)
                     else:
                         raise ValueError("invalid history operation")
+                elif record_type == "inbound_history":
+                    operation = record.get("operation")
+                    decoded = tuple(decode_message(item) for item in _require_list(record.get("messages")))
+                    inbound_ids = _decode_inbound_ids(record.get("inbound_ids"))
+                    if len(decoded) != len(inbound_ids):
+                        raise ValueError("inbound messages and ids do not match")
+                    if operation == "append":
+                        messages.extend(decoded)
+                        delivered_inbound_ids.update(inbound_ids)
+                    elif operation == "replace":
+                        messages = list(decoded)
+                        delivered_inbound_ids = set(inbound_ids)
+                    else:
+                        raise ValueError("invalid inbound history operation")
                 elif record_type == "plan_state":
                     pending = _decode_plan(record.get("pending_plan"))
                 elif record_type == "skill_state":
@@ -149,6 +191,7 @@ def replay_file(path: Path, session_id: str) -> SessionReplay:
         invalid,
         partial_offset,
         valid_start,
+        frozenset(delivered_inbound_ids),
     )
 
 
@@ -188,6 +231,24 @@ def scan_file(path: Path, session_id: str) -> SessionScan:
                         message_count += len(decoded)
                     else:
                         raise ValueError("invalid history operation")
+                elif record_type == "inbound_history":
+                    decoded = tuple(
+                        decode_message(item)
+                        for item in _require_list(record.get("messages"))
+                    )
+                    _decode_inbound_ids(record.get("inbound_ids"))
+                    if len(decoded) != len(record.get("inbound_ids")):
+                        raise ValueError("inbound messages and ids do not match")
+                    operation = record.get("operation")
+                    if operation == "replace":
+                        message_count = len(decoded)
+                        title = session_title(decoded, session_id)
+                    elif operation == "append":
+                        if title == session_id:
+                            title = session_title(decoded, session_id)
+                        message_count += len(decoded)
+                    else:
+                        raise ValueError("invalid inbound history operation")
                 elif record_type == "plan_state":
                     _decode_plan(record.get("pending_plan"))
                 elif record_type == "skill_state":
@@ -314,6 +375,15 @@ def _require_list(value: Any) -> list[Any]:
     if not isinstance(value, list):
         raise ValueError("expected list")
     return value
+
+
+def _decode_inbound_ids(value: Any) -> tuple[str, ...]:
+    values = _require_list(value)
+    if any(not isinstance(item, str) or not item for item in values):
+        raise ValueError("invalid inbound message id")
+    if len(set(values)) != len(values):
+        raise ValueError("duplicate inbound message id")
+    return tuple(values)
 
 
 def _validate_json(value: Any) -> None:

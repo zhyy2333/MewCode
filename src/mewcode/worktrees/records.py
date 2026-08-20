@@ -12,6 +12,7 @@ from .models import (
     RepositoryIdentity,
     WorktreeLayout,
     WorktreeMarker,
+    WorktreePurpose,
     WorktreeRecord,
     WorktreeState,
     WorktreeValidationError,
@@ -24,10 +25,12 @@ _RECORD_FIELDS = {
     "root", "branch_ref", "base_oid", "git_hooks_path", "task_id", "state",
     "created_at", "last_used_at", "retained_reason",
 }
+_RECORD_OWNER_FIELDS = _RECORD_FIELDS | {"purpose", "owner_id", "persistent"}
 _MARKER_FIELDS = {
     "schema_version", "management_id", "repository_id", "name", "branch_ref",
     "base_oid", "git_hooks_path", "task_id", "ready",
 }
+_MARKER_OWNER_FIELDS = _MARKER_FIELDS | {"purpose", "owner_id", "persistent"}
 
 
 def _pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -116,6 +119,9 @@ def _record_payload(record: WorktreeRecord) -> dict[str, Any]:
         "created_at": record.created_at.isoformat(),
         "last_used_at": record.last_used_at.isoformat(),
         "retained_reason": record.retained_reason,
+        "purpose": record.purpose.value,
+        "owner_id": record.owner_id,
+        "persistent": record.persistent,
     }
 
 
@@ -130,18 +136,28 @@ def _marker_payload(marker: WorktreeMarker) -> dict[str, Any]:
         "git_hooks_path": str(marker.git_hooks_path) if marker.git_hooks_path else None,
         "task_id": marker.task_id,
         "ready": marker.ready,
+        "purpose": marker.purpose.value,
+        "owner_id": marker.owner_id,
+        "persistent": marker.persistent,
     }
 
 
 class WorktreeRecordStore:
     def read_record(self, layout: WorktreeLayout) -> WorktreeRecord:
         raw = _read_json(layout.record_path)
-        if set(raw) != _RECORD_FIELDS:
+        if set(raw) != _RECORD_FIELDS and set(raw) != _RECORD_OWNER_FIELDS:
             raise WorktreeValidationError("Worktree record fields do not match the schema.")
         try:
             state = WorktreeState(raw["state"])
         except (TypeError, ValueError) as exc:
             raise WorktreeValidationError("Worktree record state is invalid.") from exc
+        try:
+            purpose = WorktreePurpose(raw.get("purpose", WorktreePurpose.SUBAGENT_TASK.value))
+        except (TypeError, ValueError) as exc:
+            raise WorktreeValidationError("Worktree record purpose is invalid.") from exc
+        persistent = raw.get("persistent", False)
+        if not isinstance(persistent, bool):
+            raise WorktreeValidationError("Worktree record persistent flag is invalid.")
         return WorktreeRecord(
             raw["schema_version"],
             _string(raw["management_id"], "management_id"),
@@ -157,12 +173,22 @@ class WorktreeRecordStore:
             _time(raw["created_at"]),
             _time(raw["last_used_at"]),
             raw["retained_reason"] if raw["retained_reason"] is None else _string(raw["retained_reason"], "retained_reason"),
+            purpose,
+            _string(raw.get("owner_id", raw["task_id"]), "owner_id"),
+            persistent,
         )
 
     def read_marker(self, layout: WorktreeLayout) -> WorktreeMarker:
         raw = _read_json(layout.marker_path)
-        if set(raw) != _MARKER_FIELDS or not isinstance(raw["ready"], bool):
+        if (set(raw) != _MARKER_FIELDS and set(raw) != _MARKER_OWNER_FIELDS) or not isinstance(raw["ready"], bool):
             raise WorktreeValidationError("Worktree marker fields do not match the schema.")
+        try:
+            purpose = WorktreePurpose(raw.get("purpose", WorktreePurpose.SUBAGENT_TASK.value))
+        except (TypeError, ValueError) as exc:
+            raise WorktreeValidationError("Worktree marker purpose is invalid.") from exc
+        persistent = raw.get("persistent", False)
+        if not isinstance(persistent, bool):
+            raise WorktreeValidationError("Worktree marker persistent flag is invalid.")
         return WorktreeMarker(
             raw["schema_version"],
             _string(raw["management_id"], "management_id"),
@@ -173,6 +199,9 @@ class WorktreeRecordStore:
             _optional_path(raw["git_hooks_path"]),
             _string(raw["task_id"], "task_id"),
             raw["ready"],
+            purpose,
+            _string(raw.get("owner_id", raw["task_id"]), "owner_id"),
+            persistent,
         )
 
     def write_record(self, record: WorktreeRecord, layout: WorktreeLayout | None = None) -> None:
@@ -208,6 +237,9 @@ class WorktreeRecordStore:
             and record.base_oid == marker.base_oid
             and record.git_hooks_path == marker.git_hooks_path
             and record.task_id == marker.task_id
+            and record.purpose == marker.purpose
+            and record.owner_id == marker.owner_id
+            and record.persistent == marker.persistent
             and (allowed_states is None or record.state in allowed_states)
             and marker.ready
         )
