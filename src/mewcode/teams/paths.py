@@ -132,6 +132,23 @@ class TeamPaths:
         safe = TeamNamePolicy().safe_id(member_id, "member_id")
         return self._child(self.members_root, f"{safe}.recovery.lock")
 
+    def member_control_file(self, member_id: str) -> Path:
+        safe = TeamNamePolicy().safe_id(member_id, "member_id")
+        return self._child(self.members_root, f"{safe}.control.json")
+
+    def member_pane_binding_file(self, member_id: str) -> Path:
+        safe = TeamNamePolicy().safe_id(member_id, "member_id")
+        return self._child(self.members_root, f"{safe}.pane.json")
+
+    def member_run_file(self, member_id: str, run_id: str) -> Path:
+        safe_member = TeamNamePolicy().safe_id(member_id, "member_id")
+        safe_run = TeamNamePolicy().safe_id(run_id, "run_id")
+        return self._child(self.members_root, f"{safe_member}.run.{safe_run}.json")
+
+    def member_run_result_file(self, member_id: str, run_id: str) -> Path:
+        source = self.member_run_file(member_id, run_id)
+        return self._child(self.members_root, f"{source.stem}.result.json")
+
     def journal_file(self, transaction_id: str) -> Path:
         safe = TeamNamePolicy().safe_id(transaction_id, "transaction_id")
         return self._child(self.transactions_root, f"{safe}.json")

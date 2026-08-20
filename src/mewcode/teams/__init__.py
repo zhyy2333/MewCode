@@ -1,12 +1,29 @@
 """Persistent team collaboration domain."""
 
 from .models import (
+    MemberBackendRequest,
+    MemberWakeReceipt,
+    MemberWakeStatus,
+    PaneHealth,
     PlanApprovalStatus,
     PlanDecision,
     TeamMemberBackend,
+    TeamMemberRuntimeView,
     TeamMemberStatus,
     TeamProtocol,
     TeamTaskStatus,
+    TerminalPaneBinding,
+)
+from .backends import BackendCapability, MemberBackendResolver
+from .control import MemberControlBroker
+from .member_worker import run_member_worker_file
+from .member_runtime_builder import TeamMemberRunAssembler
+from .pane_host import run_pane_host
+from .panes import (
+    TerminalHostProvisioner,
+    TmuxPaneAdapter,
+    WindowsTerminalPaneAdapter,
+    run_process,
 )
 from .sessions import MemberSessionBinding, MemberSessionStore
 from .inbound import LeadInboundSource, MemberInboundSource, render_inbound_batch
@@ -22,6 +39,9 @@ from .runtime import (
     TeamMemberRunBundle,
     TeamMemberRuntime,
     TeamMemberRuntimeFactory,
+    TeamMemberRuntimeRouter,
+    TerminalMemberRuntime,
+    TerminalMemberRuntimeFactory,
     TeamRuntimeBuildContext,
 )
 from .scheduler import TeamMemberScheduler
@@ -41,6 +61,20 @@ from .repository_binding import TeamRepositoryBindingService
 from .tasks import TeamTaskService
 
 __all__ = [
+    "MemberBackendRequest",
+    "MemberWakeReceipt",
+    "MemberWakeStatus",
+    "PaneHealth",
+    "BackendCapability",
+    "MemberBackendResolver",
+    "MemberControlBroker",
+    "run_member_worker_file",
+    "TeamMemberRunAssembler",
+    "run_pane_host",
+    "TerminalHostProvisioner",
+    "TmuxPaneAdapter",
+    "WindowsTerminalPaneAdapter",
+    "run_process",
     "PlanApprovalStatus",
     "PlanDecision",
     "MemberSessionBinding",
@@ -57,6 +91,9 @@ __all__ = [
     "TeamMemberRunBundle",
     "TeamMemberRuntime",
     "TeamMemberRuntimeFactory",
+    "TeamMemberRuntimeRouter",
+    "TerminalMemberRuntime",
+    "TerminalMemberRuntimeFactory",
     "TeamRuntimeBuildContext",
     "TeamMemberScheduler",
     "NullInboundSource",
@@ -75,7 +112,9 @@ __all__ = [
     "TeamRepositoryBindingService",
     "TeamTaskService",
     "TeamMemberBackend",
+    "TeamMemberRuntimeView",
     "TeamMemberStatus",
     "TeamProtocol",
     "TeamTaskStatus",
+    "TerminalPaneBinding",
 ]

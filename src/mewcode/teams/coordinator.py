@@ -14,6 +14,7 @@ from mewcode.prompting import PromptAdditions
 from mewcode.tools import ToolRegistry
 
 from .inbound import LeadInboundSource
+from .control import MemberControlBroker
 from .leases import LEASE_HEARTBEAT_SECONDS, TeamLeaseService
 from .models import (
     MailboxRegistration,
@@ -47,6 +48,7 @@ ServicesFactory = Callable[
     [TeamName, Callable[[], tuple[str, int]]],
     TeamCoordinatorServices | Awaitable[TeamCoordinatorServices],
 ]
+ControlBrokerFactory = Callable[[TeamName], MemberControlBroker]
 
 
 class NullInboundSource:
@@ -68,6 +70,8 @@ class TeamCoordinator:
         *,
         process_id: str,
         services_factory: ServicesFactory | None = None,
+        control_broker: MemberControlBroker | None = None,
+        control_broker_factory: ControlBrokerFactory | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         new_id: Callable[[], str] = lambda: uuid.uuid4().hex,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -78,6 +82,8 @@ class TeamCoordinator:
         self._workspace = Path(workspace)
         self._process_id = process_id
         self._services_factory = services_factory
+        self._control_broker = control_broker
+        self._control_broker_factory = control_broker_factory
         self._now = now
         self._new_id = new_id
         self._sleep = sleep
@@ -158,9 +164,16 @@ class TeamCoordinator:
             process_id=self._process_id,
         )
         try:
+            if self._control_broker is None and self._control_broker_factory is not None:
+                self._control_broker = self._control_broker_factory(team_name)
             converged = self._converge_interrupted(state, lease.fence)
             self._attachment = TeamAttachment(converged, lease, root_session_id)
             self._lease_valid = True
+            if self._control_broker is not None:
+                await self._control_broker.open(
+                    converged.manifest.team_id,
+                    control_generation=lease.record.generation,
+                )
             if self._services_factory is not None:
                 created = self._services_factory(team_name, self.current_fence)
                 self._services = await created if inspect.isawaitable(created) else created
@@ -175,6 +188,10 @@ class TeamCoordinator:
         except BaseException:
             self._attachment = None
             self._lease_valid = False
+            if self._control_broker is not None:
+                await self._control_broker.close()
+            if self._control_broker_factory is not None:
+                self._control_broker = None
             await self._leases.release(lease)
             raise
 
@@ -227,6 +244,10 @@ class TeamCoordinator:
     @property
     def services(self) -> TeamCoordinatorServices | None:
         return self._services if self._lease_valid else None
+
+    @property
+    def control_broker(self) -> MemberControlBroker | None:
+        return self._control_broker if self._lease_valid else None
 
     def current_fence(self) -> tuple[str, int]:
         return self._require_attachment().lease.fence
@@ -319,6 +340,8 @@ class TeamCoordinator:
                 self._lease_valid = False
                 if self._services is not None and self._services.scheduler is not None:
                     await self._services.scheduler.close()
+                if self._control_broker is not None:
+                    await self._control_broker.close()
                 return
 
     async def _shutdown_attachment(self, *, force: bool) -> None:
@@ -334,6 +357,8 @@ class TeamCoordinator:
         services = self._services
         if services is not None and services.scheduler is not None:
             await services.scheduler.close()
+        if self._control_broker is not None:
+            await self._control_broker.close()
         if services is not None and services.mailbox is not None:
             try:
                 await services.mailbox.flush_outbox()
@@ -348,6 +373,8 @@ class TeamCoordinator:
         await self._leases.release(attachment.lease)
         self._lease_valid = False
         self._services = None
+        if self._control_broker_factory is not None:
+            self._control_broker = None
         self._attachment = None
 
     def _require_attachment(self) -> TeamAttachment:

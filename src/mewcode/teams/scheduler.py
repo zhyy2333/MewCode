@@ -11,7 +11,9 @@ from mewcode.locking import FileLock
 
 from . import domain
 from .models import (
+    MemberWakeReceipt,
     MemberWakeReason,
+    MemberWakeStatus,
     SCHEMA_VERSION,
     TeamMemberOutcome,
     TeamMemberOutcomeKind,
@@ -23,7 +25,7 @@ from .models import (
     TeamValidationError,
 )
 from .repository import TeamMutationRunner, TeamRepository
-from .runtime import TeamMemberRuntime, TeamMemberRuntimeFactory
+from .runtime import TeamMemberRuntime, TeamMemberRuntimeFactory, TerminalMemberRuntime
 
 TEAM_CLOSE_TIMEOUT_SECONDS = 5.0
 
@@ -51,7 +53,8 @@ class TeamMemberScheduler:
         self._close_timeout = close_timeout
         self._mutations = TeamMutationRunner(repository)
         self._drivers: dict[str, asyncio.Task[None]] = {}
-        self._runtimes: dict[str, TeamMemberRuntime] = {}
+        self._runtimes: dict[str, TeamMemberRuntime | TerminalMemberRuntime] = {}
+        self._startup: dict[str, asyncio.Future[MemberWakeReceipt]] = {}
         self._lock = asyncio.Lock()
         self._closed = False
 
@@ -70,7 +73,8 @@ class TeamMemberScheduler:
             member = state.members.get(entry.member_id)
             if member is None or member.status is not TeamMemberStatus.QUEUED:
                 continue
-            if await self._ensure_driver(entry.member_id):
+            created, _startup = await self._ensure_driver(entry.member_id)
+            if created:
                 restored.append(entry.member_id)
         return tuple(restored)
 
@@ -80,7 +84,7 @@ class TeamMemberScheduler:
         *,
         message_ids: Sequence[str],
         reason: MemberWakeReason = MemberWakeReason.MESSAGE,
-    ) -> None:
+    ) -> MemberWakeReceipt:
         queue_id = self._new_id()
 
         def transform(state):
@@ -99,8 +103,22 @@ class TeamMemberScheduler:
             lease_fence=self._lease_fence(),
             transform=transform,
         )
+        member = committed.members[member_id]
+        if member.status is TeamMemberStatus.RUNNING:
+            return MemberWakeReceipt(member_id, MemberWakeStatus.RUNNING)
+        if member.status is TeamMemberStatus.STOPPED:
+            return MemberWakeReceipt(member_id, MemberWakeStatus.NOT_APPLICABLE)
         if any(item.member_id == member_id for item in committed.queue):
-            await self._ensure_driver(member_id)
+            created, startup = await self._ensure_driver(member_id)
+            if created and startup is not None:
+                return await startup
+            current = self._repository.load(self._team).members[member_id]
+            if current.status is TeamMemberStatus.RUNNING:
+                return MemberWakeReceipt(member_id, MemberWakeStatus.RUNNING)
+            if current.status is TeamMemberStatus.FAILED:
+                return MemberWakeReceipt(member_id, MemberWakeStatus.FAILED, current.last_error)
+            return MemberWakeReceipt(member_id, MemberWakeStatus.QUEUED)
+        return MemberWakeReceipt(member_id, MemberWakeStatus.NOT_APPLICABLE)
 
     async def stop(self, member_id: str) -> None:
         runtime = self._runtimes.get(member_id)
@@ -154,28 +172,38 @@ class TeamMemberScheduler:
                         task.cancel()
                 await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _ensure_driver(self, member_id: str) -> bool:
+    async def _ensure_driver(
+        self,
+        member_id: str,
+    ) -> tuple[bool, asyncio.Future[MemberWakeReceipt] | None]:
         async with self._lock:
             if self._closed:
-                return False
+                return False, None
             existing = self._drivers.get(member_id)
             if existing is not None and not existing.done():
-                return False
+                return False, self._startup.get(member_id)
+            startup: asyncio.Future[MemberWakeReceipt] = asyncio.get_running_loop().create_future()
             task = asyncio.create_task(self._drive(member_id))
             self._drivers[member_id] = task
-            return True
+            self._startup[member_id] = startup
+            return True, startup
 
     async def _drive(self, member_id: str) -> None:
         capacity_lease = None
         recovery_lock = FileLock(
             self._repository.paths(self._team).member_recovery_lock(member_id)
         )
-        runtime: TeamMemberRuntime | None = None
+        runtime: TeamMemberRuntime | TerminalMemberRuntime | None = None
         run_id: str | None = None
         generation: int | None = None
         outcome: TeamMemberOutcome | None = None
+        startup = self._startup.get(member_id)
         try:
-            capacity_lease = await self._capacity.acquire("team_member", member_id)
+            capacity_lease = await self._capacity.try_acquire("team_member", member_id)
+            if capacity_lease is None:
+                if startup is not None and not startup.done():
+                    startup.set_result(MemberWakeReceipt(member_id, MemberWakeStatus.QUEUED))
+                capacity_lease = await self._capacity.acquire("team_member", member_id)
             if not await asyncio.to_thread(recovery_lock.acquire):
                 return
             run_id = self._new_id()
@@ -209,6 +237,8 @@ class TeamMemberScheduler:
             )
             capacity_lease = None  # owned by runtime
             self._runtimes[member_id] = runtime
+            if startup is not None and not startup.done():
+                startup.set_result(MemberWakeReceipt(member_id, MemberWakeStatus.RUNNING))
             try:
                 async for _progress in runtime.events():
                     pass
@@ -233,12 +263,28 @@ class TeamMemberScheduler:
                     TeamMemberOutcomeKind.FAILED,
                     error=f"Member startup failed: {type(exc).__name__}.",
                 )
+            else:
+                diagnostic = f"Member startup failed: {type(exc).__name__}."
+                try:
+                    self._commit_queued_failure(member_id, diagnostic)
+                except Exception:
+                    pass
+                if startup is not None and not startup.done():
+                    startup.set_result(
+                        MemberWakeReceipt(member_id, MemberWakeStatus.FAILED, diagnostic)
+                    )
         finally:
             if run_id is not None and generation is not None and outcome is not None:
                 try:
                     self._commit_outcome(member_id, run_id, generation, outcome)
                 except Exception:
                     pass
+            if startup is not None and not startup.done():
+                startup.set_result(MemberWakeReceipt(
+                    member_id,
+                    MemberWakeStatus.FAILED,
+                    outcome.error if outcome is not None else "Member wake did not start.",
+                ))
             self._runtimes.pop(member_id, None)
             if runtime is not None:
                 try:
@@ -251,6 +297,27 @@ class TeamMemberScheduler:
             async with self._lock:
                 if self._drivers.get(member_id) is asyncio.current_task():
                     self._drivers.pop(member_id, None)
+                self._startup.pop(member_id, None)
+
+    def _commit_queued_failure(self, member_id: str, diagnostic: str) -> None:
+        def transform(state):
+            member = state.members.get(member_id)
+            if member is None or member.status is not TeamMemberStatus.QUEUED:
+                return state
+            candidate = domain.dequeue_member(state, member_id, now=self._now())
+            return domain.transition_member(
+                candidate,
+                member_id,
+                TeamMemberStatus.FAILED,
+                now=self._now(),
+                error=diagnostic,
+            )
+
+        self._mutations.run(
+            self._team,
+            lease_fence=self._lease_fence(),
+            transform=transform,
+        )
 
     def _commit_outcome(
         self,

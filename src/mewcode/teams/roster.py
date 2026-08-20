@@ -16,21 +16,28 @@ from mewcode.worktrees import (
 )
 
 from . import domain
+from .backends import MemberBackendResolver
+from .codec import decode_model
 from .models import (
     MAX_MEMBERS,
     MailboxRegistration,
     MemberRemovalResult,
+    MemberBackendRequest,
     MemberWakeReason,
+    PaneHealth,
     TeamActor,
     TeamActorKind,
     TeamMemberBackend,
     TeamMemberRecord,
+    TeamMemberRuntimeView,
     TeamMemberStatus,
     TeamName,
     TeamPermissionError,
     TeamTaskStatus,
     TeamValidationError,
+    TerminalPaneBinding,
 )
+from .panes import TerminalHostProvisioner
 from .paths import TeamNamePolicy
 from .policy import FrozenRoleFactory
 from .repository import TeamMutationRunner, TeamProvisioningJournalStore, TeamRepository
@@ -48,6 +55,9 @@ class TeamRosterService:
         *,
         current_profile_name: Callable[[], str],
         stop_sink: Callable[[str], Awaitable[None]] | None = None,
+        wake_sink: object | None = None,
+        backend_resolver: MemberBackendResolver | None = None,
+        terminal_hosts: TerminalHostProvisioner | None = None,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         new_id: Callable[[], str] = lambda: uuid.uuid4().hex,
     ) -> None:
@@ -58,6 +68,9 @@ class TeamRosterService:
         self._sessions = sessions
         self._current_profile_name = current_profile_name
         self._stop_sink = stop_sink
+        self._wake_sink = wake_sink
+        self._backend_resolver = backend_resolver or MemberBackendResolver()
+        self._terminal_hosts = terminal_hosts
         self._now = now
         self._new_id = new_id
         self._mutations = TeamMutationRunner(repository)
@@ -65,22 +78,26 @@ class TeamRosterService:
         self._name_policy = TeamNamePolicy()
         self._worktree_names = WorktreeNameFactory()
 
+    def set_wake_sink(self, wake_sink: object | None) -> None:
+        self._wake_sink = wake_sink
+
     async def add_member(
         self,
         actor: TeamActor,
         *,
         name: str,
         role_name: str,
-        backend: str | TeamMemberBackend,
+        backend: str | MemberBackendRequest | TeamMemberBackend = MemberBackendRequest.AUTO,
         requires_approval: bool,
     ) -> TeamMemberRecord:
         self._require_lead(actor)
-        try:
-            selected_backend = TeamMemberBackend(backend)
-        except ValueError as exc:
-            raise TeamValidationError("Unknown team member backend.") from exc
-        if selected_backend is not TeamMemberBackend.IN_PROCESS:
-            raise TeamValidationError("This phase only supports the in_process member backend.")
+        requested = backend.value if isinstance(backend, TeamMemberBackend) else backend
+        selected_backend = self._backend_resolver.resolve(requested)
+        if selected_backend is not TeamMemberBackend.IN_PROCESS and self._terminal_hosts is None:
+            raise TeamValidationError(
+                f"Requested team member backend '{selected_backend.value}' is unavailable: "
+                "terminal host provisioning is not configured."
+            )
         member_name = self._name_policy.parse(name)
         initial = self._repository.load(self._team)
         self._validate_new_member(initial, member_name)
@@ -103,10 +120,12 @@ class TeamRosterService:
                 "member_id": member_id,
                 "member_name": member_name.value,
                 "worktree_name": worktree_name.value,
+                "backend": selected_backend.value,
             },
         )
         session: MemberSessionBinding | None = None
         worktree_created = False
+        pane_binding: TerminalPaneBinding | None = None
         published = False
         try:
             environment = await self._worktrees.create_or_recover(
@@ -139,6 +158,25 @@ class TeamRosterService:
             mailbox.parent.mkdir(parents=True, exist_ok=True)
             with mailbox.open("xb"):
                 pass
+            if selected_backend is not TeamMemberBackend.IN_PROCESS:
+                assert self._terminal_hosts is not None
+                pane_binding = await self._terminal_hosts.provision(
+                    initial.manifest.team_id,
+                    member,
+                )
+                member = replace(member, pane_binding=pane_binding, updated_at=self._now())
+                self._journals.write(
+                    transaction_id,
+                    {
+                        "operation": "add_member",
+                        "stage": "pane_registered",
+                        "member_id": member_id,
+                        "member_name": member_name.value,
+                        "worktree_name": worktree_name.value,
+                        "backend": selected_backend.value,
+                        "pane_binding": self._binding_payload(pane_binding),
+                    },
+                )
 
             def publish(state):
                 self._validate_new_member(state, member_name)
@@ -173,6 +211,7 @@ class TeamRosterService:
                     worktree_name,
                     session,
                     worktree_created,
+                    pane_binding,
                 )
                 if rolled_back:
                     self._journals.delete(transaction_id)
@@ -181,10 +220,20 @@ class TeamRosterService:
             if session is not None:
                 session.close()
 
-    def list_members(self, actor: TeamActor) -> tuple[TeamMemberRecord, ...]:
+    def list_members(self, actor: TeamActor) -> tuple[TeamMemberRuntimeView, ...]:
         state = self._repository.load(self._team)
         self._require_participant(actor, state.manifest.team_id)
-        return tuple(sorted(state.members.values(), key=lambda item: item.name.canonical_key))
+        views = []
+        for member in sorted(state.members.values(), key=lambda item: item.name.canonical_key):
+            if member.backend is TeamMemberBackend.IN_PROCESS:
+                health = PaneHealth.NOT_APPLICABLE
+            elif self._terminal_hosts is None:
+                health = PaneHealth.UNAVAILABLE
+            else:
+                health = self._terminal_hosts.health(member.member_id)
+            diagnostic = member.pane_binding.last_error if member.pane_binding is not None else member.last_error
+            views.append(TeamMemberRuntimeView(member, health, diagnostic))
+        return tuple(views)
 
     async def refresh_role(
         self,
@@ -253,6 +302,13 @@ class TeamRosterService:
             lease_fence=actor.lease_fence,
             transform=transform,
         )
+        if self._wake_sink is not None:
+            await self._wake_sink.request_wake(
+                member_id,
+                message_ids=(),
+                reason=MemberWakeReason.EXPLICIT_RESUME,
+            )
+            committed = self._repository.load(self._team)
         return committed.members[member_id]
 
     async def stop(
@@ -317,7 +373,12 @@ class TeamRosterService:
         transaction_id = self._new_id()
         self._journals.write(
             transaction_id,
-            {"operation": "remove_member", "stage": "intent", "member_id": member_id},
+            {
+                "operation": "remove_member",
+                "stage": "intent",
+                "member_id": member_id,
+                "pane_binding": self._binding_payload(member.pane_binding) if member.pane_binding else None,
+            },
         )
         try:
             def deregister(current):
@@ -345,6 +406,10 @@ class TeamRosterService:
                 lease_fence=actor.lease_fence,
                 transform=deregister,
             )
+            if member.pane_binding is not None:
+                if self._terminal_hosts is None:
+                    raise TeamValidationError("Terminal pane host cleanup is unavailable.")
+                await self._terminal_hosts.terminate(member.pane_binding)
             name = self._worktree_names.for_team_member(state.manifest.team_id, member_id)
             deleted = await self._worktrees.delete(name, force=False)
             if deleted.status not in {
@@ -381,6 +446,11 @@ class TeamRosterService:
                 continue
             name = self._worktree_names.for_team_member(state.manifest.team_id, member_id)
             if operation == "remove_member":
+                binding = self._binding_from_payload(payload.get("pane_binding"))
+                if binding is not None:
+                    if self._terminal_hosts is None:
+                        continue
+                    await self._terminal_hosts.terminate(binding)
                 result = await self._worktrees.delete(name, force=False)
                 if result.status not in {
                     WorktreeDeleteStatus.DELETED,
@@ -398,6 +468,7 @@ class TeamRosterService:
                 name,
                 None,
                 True,
+                self._binding_from_payload(payload.get("pane_binding")),
             )
             if rolled_back:
                 self._journals.delete(transaction_id)
@@ -410,12 +481,20 @@ class TeamRosterService:
         worktree_name,
         session: MemberSessionBinding | None,
         worktree_created: bool,
+        pane_binding: TerminalPaneBinding | None = None,
     ) -> bool:
         if session is not None:
             session.close()
         paths = self._repository.paths(self._team)
         paths.member_session_file(member_id).unlink(missing_ok=True)
         paths.mailbox_file(member_id).unlink(missing_ok=True)
+        if pane_binding is not None:
+            if self._terminal_hosts is None:
+                return False
+            try:
+                await self._terminal_hosts.terminate(pane_binding)
+            except Exception:
+                return False
         if worktree_created:
             result = await self._worktrees.delete(worktree_name, force=False)
             return result.status in {
@@ -423,6 +502,28 @@ class TeamRosterService:
                 WorktreeDeleteStatus.ALREADY_ABSENT,
             }
         return True
+
+    @staticmethod
+    def _binding_payload(binding: TerminalPaneBinding) -> dict[str, object]:
+        return {
+            "schema_version": binding.schema_version,
+            "backend": binding.backend.value,
+            "host_id": binding.host_id,
+            "backend_handle": binding.backend_handle,
+            "created_at": binding.created_at.isoformat(),
+            "last_connected_at": (
+                binding.last_connected_at.isoformat()
+                if binding.last_connected_at is not None
+                else None
+            ),
+            "last_error": binding.last_error,
+        }
+
+    @staticmethod
+    def _binding_from_payload(value: object) -> TerminalPaneBinding | None:
+        if value is None:
+            return None
+        return decode_model(TerminalPaneBinding, value)
 
     @staticmethod
     def _member(state, member_id: str) -> TeamMemberRecord:

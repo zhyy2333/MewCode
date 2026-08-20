@@ -12,7 +12,14 @@ from mewcode.agent import AgentControlContext, AgentMode
 from mewcode.tools import PermissionTargetKind, ToolPermissionSpec, ToolResult, ToolSafety
 
 from .coordinator import TeamCoordinator
-from .models import PlanDecision, TeamActor, TeamProtocol, TeamTaskStatus, TeamValidationError
+from .models import (
+    PlanDecision,
+    TeamActor,
+    TeamMemberRuntimeView,
+    TeamProtocol,
+    TeamTaskStatus,
+    TeamValidationError,
+)
 
 
 TEAM_SCHEMA = {
@@ -199,7 +206,7 @@ class TeamMemberTool(_BaseTeamTool):
         actor = self._coordinator.lead_actor()
         specs = {
             "list": ({"action"}, set()),
-            "add": ({"action", "name", "role", "backend", "requires_approval"}, {"name", "role", "backend", "requires_approval"}),
+            "add": ({"action", "name", "role", "backend", "requires_approval"}, {"name", "role", "requires_approval"}),
             "refresh_role": ({"action", "member_id", "role"}, {"member_id", "role"}),
             "resume": ({"action", "member_id", "reason"}, {"member_id", "reason"}),
             "stop": ({"action", "member_id", "reason"}, {"member_id", "reason"}),
@@ -213,7 +220,7 @@ class TeamMemberTool(_BaseTeamTool):
                 actor,
                 name=_string(arguments, "name"),
                 role_name=_string(arguments, "role"),
-                backend=_string(arguments, "backend"),
+                backend=str(arguments.get("backend", "auto")),
                 requires_approval=_boolean(arguments, "requires_approval"),
             )
         elif action == "refresh_role":
@@ -324,6 +331,8 @@ class TeamMessageTool(_BaseTeamTool):
                 sent = await mailbox.send(actor, recipient=_string(arguments, "recipient"), summary=_string(arguments, "summary"), body=_string(arguments, "body"), protocol=TeamProtocol(_string(arguments, "protocol")), payload=payload)
                 if sent.safe_pause:
                     metadata["safe_pause"] = "awaiting_approval"
+                if sent.wake is not None:
+                    metadata["wake"] = sent.wake.status.value
                 return sent
             if action == "broadcast":
                 return await mailbox.broadcast(actor, summary=_string(arguments, "summary"), body=_string(arguments, "body"), protocol=TeamProtocol(_string(arguments, "protocol")), payload=payload)
@@ -409,6 +418,19 @@ def _encode(value: object) -> str:
 
 
 def _jsonable(value: object) -> object:
+    if isinstance(value, TeamMemberRuntimeView):
+        member = value.member
+        return {
+            "member_id": member.member_id,
+            "name": member.name.value,
+            "role": member.role.role_name,
+            "backend": member.backend.value,
+            "status": member.status.value,
+            "requires_approval": member.requires_approval,
+            "current_task_id": member.current_task_id,
+            "pane_health": value.pane_health.value,
+            "diagnostic": value.diagnostic,
+        }
     if dataclasses.is_dataclass(value):
         return {field.name: _jsonable(getattr(value, field.name)) for field in dataclasses.fields(value)}
     if isinstance(value, Mapping):

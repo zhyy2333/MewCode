@@ -6,6 +6,7 @@ from dataclasses import replace
 from mewcode.agent import AgentCapacityPool
 from mewcode.teams.codec import encode_lead_lease
 from mewcode.teams.models import (
+    MemberWakeStatus,
     SCHEMA_VERSION,
     TeamLeadLeaseRecord,
     TeamMemberOutcome,
@@ -51,6 +52,12 @@ class _RuntimeFactory:
         return _Runtime(capacity_lease)
 
 
+class _FailingRuntimeFactory:
+    async def create(self, state, member_id, capacity_lease, *, reason):
+        await capacity_lease.close()
+        raise RuntimeError("terminal secret must not escape")
+
+
 def _repository(tmp_path, clock):
     repository = TeamRepository(tmp_path, now=clock.now)
     state = repository.create(state_with_members(tmp_path, 1, clock))
@@ -92,8 +99,10 @@ def test_wake_coalesces_while_capacity_waits_then_runs_once(tmp_path) -> None:
             now=clock.now,
             new_id=lambda: next(ids),
         )
-        await scheduler.request_wake("member-1", message_ids=("mail-1",))
-        await scheduler.request_wake("member-1", message_ids=("mail-2",))
+        first = await scheduler.request_wake("member-1", message_ids=("mail-1",))
+        second = await scheduler.request_wake("member-1", message_ids=("mail-2",))
+        assert first.status is MemberWakeStatus.QUEUED
+        assert second.status is MemberWakeStatus.QUEUED
         queued = repository.load(team_name())
         assert len(queued.queue) == 1
         assert queued.queue[0].message_ids == ("mail-1", "mail-2")
@@ -103,6 +112,29 @@ def test_wake_coalesces_while_capacity_waits_then_runs_once(tmp_path) -> None:
         assert repository.load(team_name()).members["member-1"].current_task_id is None
         await scheduler.close()
         assert pool.active_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_startup_failure_returns_failed_receipt_and_converges_member(tmp_path) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        repository = _repository(tmp_path, clock)
+        scheduler = TeamMemberScheduler(
+            repository,
+            team_name(),
+            AgentCapacityPool(1),
+            _FailingRuntimeFactory(),  # type: ignore[arg-type]
+            lease_fence=lambda: ("lease-1", 1),
+            now=clock.now,
+            new_id=lambda: "run-1",
+        )
+        receipt = await scheduler.request_wake("member-1", message_ids=("mail-1",))
+        assert receipt.status is MemberWakeStatus.FAILED
+        assert "RuntimeError" in (receipt.diagnostic or "")
+        assert "secret" not in (receipt.diagnostic or "")
+        assert repository.load(team_name()).members["member-1"].status is TeamMemberStatus.FAILED
+        await scheduler.close()
 
     asyncio.run(scenario())
 

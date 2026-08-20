@@ -12,6 +12,7 @@ from mewcode.providers import ChatMessage
 
 
 SCHEMA_VERSION = 1
+PANE_BINDING_SCHEMA_VERSION = 1
 MAX_TEAMS = 128
 MAX_MEMBERS = 32
 MAX_NAME_CHARS = 64
@@ -105,6 +106,29 @@ class TeamMemberStatus(StrEnum):
 
 class TeamMemberBackend(StrEnum):
     IN_PROCESS = "in_process"
+    WINDOWS_TERMINAL = "windows_terminal"
+    TMUX = "tmux"
+
+
+class MemberBackendRequest(StrEnum):
+    AUTO = "auto"
+    IN_PROCESS = "in_process"
+    WINDOWS_TERMINAL = "windows_terminal"
+    TMUX = "tmux"
+
+
+class PaneHealth(StrEnum):
+    NOT_APPLICABLE = "not_applicable"
+    CONNECTED = "connected"
+    MISSING = "missing"
+    UNAVAILABLE = "unavailable"
+
+
+class MemberWakeStatus(StrEnum):
+    RUNNING = "running"
+    QUEUED = "queued"
+    FAILED = "failed"
+    NOT_APPLICABLE = "not_applicable"
 
 
 class TeamTaskStatus(StrEnum):
@@ -271,6 +295,43 @@ class FrozenRoleSnapshot:
 
 
 @dataclass(frozen=True)
+class TerminalPaneBinding:
+    schema_version: int
+    backend: TeamMemberBackend
+    host_id: str
+    backend_handle: str | None
+    created_at: datetime
+    last_connected_at: datetime | None = None
+    last_error: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.schema_version != PANE_BINDING_SCHEMA_VERSION:
+            raise TeamValidationError("Unsupported terminal pane binding version.")
+        if self.backend is TeamMemberBackend.IN_PROCESS:
+            raise TeamValidationError("In-process members cannot have a terminal pane binding.")
+        require_identifier(self.host_id, "host_id")
+        if self.backend is TeamMemberBackend.WINDOWS_TERMINAL:
+            if self.backend_handle is not None:
+                raise TeamValidationError("Windows Terminal pane bindings do not use a backend handle.")
+        elif self.backend is TeamMemberBackend.TMUX:
+            handle = self.backend_handle
+            if (
+                not isinstance(handle, str)
+                or not handle.startswith("%")
+                or not handle[1:].isdigit()
+            ):
+                raise TeamValidationError("Tmux pane binding handle is invalid.")
+        object.__setattr__(self, "created_at", require_utc(self.created_at, "created_at"))
+        if self.last_connected_at is not None:
+            object.__setattr__(
+                self,
+                "last_connected_at",
+                require_utc(self.last_connected_at, "last_connected_at"),
+            )
+        object.__setattr__(self, "last_error", bounded_text(self.last_error))
+
+
+@dataclass(frozen=True)
 class TeamMemberRecord:
     member_id: str
     name: TeamName
@@ -289,6 +350,7 @@ class TeamMemberRecord:
     last_error: str | None
     created_at: datetime
     updated_at: datetime
+    pane_binding: TerminalPaneBinding | None = None
 
     def __post_init__(self) -> None:
         for field_name in ("member_id", "worktree_name", "worktree_owner_id", "mailbox_name", "session_name"):
@@ -301,6 +363,37 @@ class TeamMemberRecord:
         object.__setattr__(self, "last_error", bounded_text(self.last_error))
         object.__setattr__(self, "created_at", require_utc(self.created_at, "created_at"))
         object.__setattr__(self, "updated_at", require_utc(self.updated_at, "updated_at"))
+        if self.backend is TeamMemberBackend.IN_PROCESS and self.pane_binding is not None:
+            raise TeamValidationError("In-process members cannot have a terminal pane binding.")
+        if self.backend is not TeamMemberBackend.IN_PROCESS:
+            if self.pane_binding is not None and self.pane_binding.backend is not self.backend:
+                raise TeamValidationError("Terminal pane binding backend does not match the member backend.")
+
+
+@dataclass(frozen=True)
+class TeamMemberRuntimeView:
+    member: TeamMemberRecord
+    pane_health: PaneHealth
+    diagnostic: str | None = None
+
+    def __post_init__(self) -> None:
+        if self.member.backend is TeamMemberBackend.IN_PROCESS:
+            if self.pane_health is not PaneHealth.NOT_APPLICABLE:
+                raise TeamValidationError("In-process member pane health must be not_applicable.")
+        elif self.pane_health is PaneHealth.NOT_APPLICABLE:
+            raise TeamValidationError("Terminal member pane health cannot be not_applicable.")
+        object.__setattr__(self, "diagnostic", bounded_text(self.diagnostic))
+
+
+@dataclass(frozen=True)
+class MemberWakeReceipt:
+    member_id: str
+    status: MemberWakeStatus
+    diagnostic: str | None = None
+
+    def __post_init__(self) -> None:
+        require_identifier(self.member_id, "member_id")
+        object.__setattr__(self, "diagnostic", bounded_text(self.diagnostic))
 
 
 @dataclass(frozen=True)
@@ -586,6 +679,7 @@ class DeliveryResult:
     delivered: bool
     error: str | None = None
     safe_pause: bool = False
+    wake: MemberWakeReceipt | None = None
 
 
 @dataclass(frozen=True)
@@ -604,6 +698,12 @@ class MailboxPage:
 class OutboxFlushResult:
     delivered_ids: tuple[str, ...] = ()
     failed_ids: tuple[str, ...] = ()
+    wake_receipts: Mapping[str, MemberWakeReceipt] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "delivered_ids", tuple(self.delivered_ids))
+        object.__setattr__(self, "failed_ids", tuple(self.failed_ids))
+        object.__setattr__(self, "wake_receipts", frozen_mapping(self.wake_receipts))
 
 
 @dataclass(frozen=True)

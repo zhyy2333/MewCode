@@ -6,6 +6,7 @@ import inspect
 import os
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from types import MappingProxyType
 
@@ -99,15 +100,17 @@ from .subagents import (
 )
 from .teams import (
     FrozenRoleFactory,
-    MemberInboundSource,
+    MemberBackendResolver,
+    MemberControlBroker,
     MemberSessionStore,
     TeamApprovalService,
     TeamCoordinator,
     TeamCoordinatorServices,
     TeamLifecycleTool,
     TeamMailboxService,
-    TeamMemberRunBundle,
+    TeamMemberRunAssembler,
     TeamMemberRuntimeFactory,
+    TeamMemberRuntimeRouter,
     TeamMemberScheduler,
     TeamMemberTool,
     TeamMessageTool,
@@ -119,9 +122,19 @@ from .teams import (
     TeamTaskService,
     TeamTaskTool,
     TeamLeaseService,
-    build_member_tool_scope,
+    TerminalHostProvisioner,
+    TerminalMemberRuntimeFactory,
+    TmuxPaneAdapter,
+    WindowsTerminalPaneAdapter,
+    run_member_worker_file,
+    run_pane_host,
+    run_process,
 )
-from .teams.models import TeamActor, TeamActorKind
+from .teams.models import TeamMemberBackend, TeamValidationError
+from .teams.repository import TeamMutationRunner
+from .teams.codec import decode_lead_lease
+from .teams.paths import TeamNamePolicy, TeamPaths
+from .teams.member_worker import MemberRunDescriptorStore
 from .worktrees import (
     WorktreeConfigLoader,
     WorktreeJanitor,
@@ -162,6 +175,11 @@ def _argument_parser() -> argparse.ArgumentParser:
         metavar="ID",
         help="resume a specific session ID",
     )
+    hidden = parser.add_mutually_exclusive_group()
+    hidden.add_argument("--team-pane-host", action="store_true", help=argparse.SUPPRESS)
+    hidden.add_argument("--team-member-worker", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--control-file", help=argparse.SUPPRESS)
+    parser.add_argument("--run-file", help=argparse.SUPPRESS)
     return parser
 
 
@@ -189,8 +207,161 @@ def _optional_keyword(factory, name: str, value: object) -> dict[str, object]:
     return {name: value} if name in parameters else {}
 
 
+async def _run_hidden_member_worker(run_file: Path) -> int:
+    candidate = Path(run_file)
+    if (
+        not candidate.is_absolute()
+        or candidate.parent.name != "members"
+        or ".run." not in candidate.name
+        or not candidate.name.endswith(".json")
+    ):
+        raise TeamValidationError("Member run descriptor path is invalid.")
+    team_root = candidate.parent.parent
+    if team_root.parent.name != "teams":
+        raise TeamValidationError("Member run descriptor path is invalid.")
+    paths = TeamPaths.for_user(
+        team_root.parent.parent,
+        TeamNamePolicy().parse(team_root.name),
+    )
+    repository = TeamRepository(paths.user_root)
+    team_name = TeamNamePolicy().parse(paths.team_root.name)
+    state = repository.load(team_name)
+    lease = decode_lead_lease(paths.lease_file.read_bytes())
+    if lease.team_id != state.manifest.team_id:
+        raise TeamValidationError("Member worker Lead lease belongs to another team.")
+    fence = lambda: (lease.lease_id, lease.generation)
+    profiles = _load_profiles()
+    workspace = Workspace(state.manifest.repository.workspace_root)
+    run_parts = candidate.name.split(".run.", 1)
+    if len(run_parts) != 2 or not run_parts[1].endswith(".json"):
+        raise TeamValidationError("Member run descriptor path is invalid.")
+    descriptor = MemberRunDescriptorStore(paths).read_descriptor(
+        run_parts[0], run_parts[1][:-5]
+    )
+    worktree_config = WorktreeConfigLoader().load(
+        workspace.root / ".mewcode" / "worktrees.yaml"
+    )
+    worktrees = WorktreeLifecycleService(workspace.root, worktree_config)
+    approvals = TeamApprovalService(repository, team_name)
+    tasks = TeamTaskService(repository, team_name)
+    mailbox = TeamMailboxService(
+        repository,
+        team_name,
+        TeamProtocolRouter(repository, team_name),
+        lease_fence=fence,
+    )
+    sessions = MemberSessionStore(paths)
+    hook_catalog = HookConfigLoader().load(HookPaths.for_workspace(workspace.root))
+    trust_store = WorkspaceTrustStore.for_user_home()
+    project_trusted = (
+        trust_store.read(workspace.root)
+        if hook_catalog.requires_project_trust
+        else False
+    )
+    if hook_catalog.rules:
+        hook_runtime = HookRuntime(
+            hook_catalog,
+            HookActionExecutor(
+                workspace.root,
+                api_key_environment_names=tuple(profiles.api_key_environment_names),
+            ),
+            workspace=workspace.root,
+            session_id=f"team-worker-{descriptor.run_id}",
+            resumed=True,
+            project_trusted=project_trusted,
+            diagnostics=HookDiagnosticLogger(
+                Path.home() / ".mewcode" / "logs" / "hooks.jsonl",
+                sensitive_values=tuple(
+                    entry.profile.api_key for entry in profiles.entries.values()
+                ),
+            ),
+        )
+    else:
+        hook_runtime = HookRuntime.empty(
+            workspace.root,
+            f"team-worker-{descriptor.run_id}",
+            resumed=True,
+        )
+    wrapped_providers: dict[str, object] = {}
+
+    def worker_provider(name: str):
+        wrapped = wrapped_providers.get(name)
+        if wrapped is None:
+            wrapped = HookedProvider(
+                RequestBoundaryProvider(profiles.provider(name)),
+                hook_runtime,
+                name,
+            )
+            wrapped_providers[name] = wrapped
+        return wrapped
+
+    builtin_registry = create_builtin_registry(workspace)
+    static_commands = create_builtin_command_registry()
+    command_identifiers = {
+        identifier
+        for definition in static_commands.definitions()
+        for identifier in (definition.name, *definition.aliases)
+    }
+    skill_sources = discover_sources(SkillRoots.defaults(workspace.root))
+    pre_catalog = build_skill_catalog(
+        skill_sources,
+        system_command_identifiers=command_identifiers,
+        profiles=profiles,
+    )
+    config_result = McpConfigLoader().load(McpConfigPaths.for_workspace(workspace))
+    mcp_runtime: McpRuntime | None = None
+    mcp_tools = ()
+    if config_result.servers:
+        mcp_runtime = McpRuntime(workspace.root)
+        mcp_tools = mcp_runtime.start(
+            config_result.servers,
+            {
+                *builtin_registry.names,
+                "load_skill",
+                "agent",
+                *(
+                    tool.public_name
+                    for definition in pre_catalog.definitions.values()
+                    for tool in definition.package_tools
+                ),
+            },
+        ).tools
+    base_registry = builtin_registry.merge(ToolRegistry(mcp_tools))
+    assembler = TeamMemberRunAssembler(
+        base_registry=base_registry,
+        provider_for_profile=worker_provider,
+        profile_catalog=profiles,
+        approvals=approvals,
+        tasks=tasks,
+        mailbox=mailbox,
+        fence_supplier=fence,
+    )
+    factory = TeamMemberRuntimeFactory(worktrees, sessions, assembler.build)
+    try:
+        return await run_member_worker_file(
+            candidate,
+            runtime_factory=factory,
+            state_loader=lambda _team_id: repository.load(team_name),
+        )
+    finally:
+        await hook_runtime.close()
+        if mcp_runtime is not None:
+            mcp_runtime.close()
+
+
 def main(argv: list[str] | None = None) -> int:
-    arguments = _argument_parser().parse_args(argv)
+    parser = _argument_parser()
+    arguments = parser.parse_args(argv)
+    if arguments.team_pane_host:
+        if not arguments.control_file or arguments.run_file:
+            parser.error("--team-pane-host requires --control-file only")
+        return asyncio.run(run_pane_host(Path(arguments.control_file)))
+    if arguments.team_member_worker:
+        if not arguments.run_file or arguments.control_file:
+            parser.error("--team-member-worker requires --run-file only")
+        return asyncio.run(_run_hidden_member_worker(Path(arguments.run_file)))
+    if arguments.control_file or arguments.run_file:
+        parser.error("hidden team file arguments require a matching hidden mode")
     mcp_runtime: McpRuntime | None = None
     context_archive: ContextArchive | None = None
     session_binding: SessionBinding | None = None
@@ -491,6 +662,9 @@ def main(argv: list[str] | None = None) -> int:
         )
 
         async def create_team_services(team_name, fence_supplier):
+            broker = team_coordinator.control_broker
+            if broker is None:
+                raise TeamValidationError("Team member control broker is unavailable.")
             approvals = TeamApprovalService(team_repository, team_name)
             tasks = TeamTaskService(team_repository, team_name)
             router = TeamProtocolRouter(team_repository, team_name)
@@ -502,114 +676,76 @@ def main(argv: list[str] | None = None) -> int:
             )
             sessions = MemberSessionStore(team_repository.paths(team_name))
 
-            async def build_member_run(context):
-                actor = TeamActor(
-                    context.member.member_id,
-                    context.member.name,
-                    TeamActorKind.MEMBER,
-                    context.state.manifest.team_id,
-                    fence_supplier(),
-                )
-                permit = None
-                if context.member.requires_approval:
-                    permit = lambda: approvals.side_effect_permit(
-                        actor,
-                        context.member.current_task_id or "no-current-task",
-                    )
-                collaboration = ToolRegistry(
-                    [
-                        TeamTaskTool(lambda: tasks, lambda: actor, permit=permit),
-                        TeamMessageTool(
-                            lambda: mailbox,
-                            lambda: approvals,
-                            lambda: actor,
-                            permit=permit,
-                        ),
-                    ]
-                )
-                scope = build_member_tool_scope(
-                    base_registry,
-                    context.member.role,
-                    collaboration_registry=collaboration,
-                    approvals=approvals,
-                    actor=actor,
-                    task_id=lambda: context.member.current_task_id,
-                )
-                member_workspace = Workspace(context.worktree_lease.environment.root)
-                ordinary = scope.registry.without(collaboration.names)
-                bound = WorkspaceToolBinder().bind(
-                    ordinary,
-                    member_workspace,
-                    process_environment=context.worktree_lease.environment.process_environment,
-                ).merge(collaboration)
-                member_permissions = SubagentPermissionController.from_snapshot(
-                    member_workspace,
-                    context.member.role.permission_rules,
-                    context.member.role.permission_mode,
-                )
-                member_scheduler = ToolScheduler(
-                    member_permissions,
-                    policy=scope.policy,
-                )
-                member_provider = hooked_provider(context.member.role.profile_name)
-                member_archive = ContextArchive(
-                    member_workspace.root,
-                    session_id_factory=lambda: (
-                        f"{context.session.context_archive_id}-{context.member.run_generation}"
-                    ),
-                )
-                member_archive.start(skip_stale_cleanup=True)
-                member_context = ContextManager(
-                    member_provider,
-                    member_archive,
-                    ContextConfig(
-                        profile_catalog.require(context.member.role.profile_name).context_window
-                    ),
-                )
-                member_runner = AgentRunner(
-                    member_provider,
-                    member_scheduler,
-                    AgentRunConfig(
-                        max_iterations=context.member.role.max_turns,
-                        tool_denial_limit=3,
-                    ),
-                    prompt_builder=PromptBuilder(
-                        PromptEnvironmentProvider(member_workspace.root)
-                    ),
-                    context_manager=member_context,
-                    profile_name=context.member.role.profile_name,
-                    permission_mode_supplier=lambda: context.member.role.permission_mode,
-                    hook_component="team_member",
-                )
-                additions = PromptAdditions(
-                    agent_role=context.member.role.system_prompt,
-                )
-                run = member_runner.start(
-                    context.history,
-                    context.resume_prompt,
-                    bound,
-                    AgentMode.DIRECT,
-                    PromptRunContext(context.resume_prompt, additions=additions),
-                    history_commit_sink=context.session,
-                    inbound_source=MemberInboundSource(mailbox, actor),
-                )
-
-                async def close_member_resources():
-                    member_context.close()
-                    member_archive.close()
-
-                return TeamMemberRunBundle(run, close_member_resources)
-
+            member_run_assembler = TeamMemberRunAssembler(
+                base_registry=base_registry,
+                provider_for_profile=hooked_provider,
+                profile_catalog=profile_catalog,
+                approvals=approvals,
+                tasks=tasks,
+                mailbox=mailbox,
+                fence_supplier=fence_supplier,
+            )
             member_runtime_factory = TeamMemberRuntimeFactory(
                 worktree_lifecycle,
                 sessions,
-                build_member_run,
+                member_run_assembler.build,
+            )
+            backend_resolver = MemberBackendResolver()
+            adapters = {
+                TeamMemberBackend.WINDOWS_TERMINAL: WindowsTerminalPaneAdapter(
+                    backend_resolver, run_process
+                ),
+                TeamMemberBackend.TMUX: TmuxPaneAdapter(backend_resolver, run_process),
+            }
+            terminal_hosts = TerminalHostProvisioner(broker, adapters)
+
+            async def ensure_terminal_connection(member):
+                existing = broker.connection(member.member_id)
+                if existing is not None:
+                    return existing
+                binding = await terminal_hosts.provision(
+                    team_repository.load(team_name).manifest.team_id,
+                    member,
+                )
+                try:
+                    def publish(current):
+                        latest = current.members.get(member.member_id)
+                        if (
+                            latest is None
+                            or latest.active_run_id != member.active_run_id
+                            or latest.run_generation != member.run_generation
+                        ):
+                            raise TeamValidationError("Terminal member changed during pane recovery.")
+                        members = dict(current.members)
+                        members[member.member_id] = replace(latest, pane_binding=binding)
+                        return replace(current, members=members)
+
+                    TeamMutationRunner(team_repository).run(
+                        team_name,
+                        lease_fence=fence_supplier(),
+                        transform=publish,
+                    )
+                except BaseException:
+                    await terminal_hosts.terminate(binding)
+                    raise
+                connection = broker.connection(member.member_id)
+                if connection is None:
+                    raise TeamValidationError("Terminal pane host disappeared after registration.")
+                return connection
+
+            terminal_runtime_factory = TerminalMemberRuntimeFactory(
+                broker,
+                ensure_connection=ensure_terminal_connection,
+            )
+            runtime_router = TeamMemberRuntimeRouter(
+                member_runtime_factory,
+                terminal_runtime_factory,
             )
             member_scheduler = TeamMemberScheduler(
                 team_repository,
                 team_name,
                 capacity_pool,
-                member_runtime_factory,
+                runtime_router,
                 lease_fence=fence_supplier,
             )
             mailbox.set_wake_sink(member_scheduler)
@@ -621,6 +757,9 @@ def main(argv: list[str] | None = None) -> int:
                 sessions,
                 current_profile_name=lambda: profile_catalog.active_name,
                 stop_sink=member_scheduler.stop,
+                wake_sink=member_scheduler,
+                backend_resolver=backend_resolver,
+                terminal_hosts=terminal_hosts,
             )
             return TeamCoordinatorServices(
                 scheduler=member_scheduler,
@@ -637,6 +776,9 @@ def main(argv: list[str] | None = None) -> int:
             workspace.root,
             process_id=str(os.getpid()),
             services_factory=create_team_services,
+            control_broker_factory=lambda name: MemberControlBroker(
+                paths=team_repository.paths(name)
+            ),
         )
         team_lifecycle_tool = TeamLifecycleTool(
             team_coordinator,

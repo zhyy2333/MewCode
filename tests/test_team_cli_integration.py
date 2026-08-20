@@ -7,6 +7,7 @@ import sys
 from mewcode.agent import AgentCapacityPool
 from mewcode.subagents import SubagentTaskManager
 from mewcode.teams import TeamCoordinator, TeamMemberScheduler
+from mewcode import cli
 
 
 def test_wiring_public_types_import_and_share_capacity_contract() -> None:
@@ -37,3 +38,25 @@ def test_installed_module_help_entry_starts() -> None:
     )
     assert completed.returncode == 0
     assert "usage:" in completed.stdout.lower()
+    assert "team-pane-host" not in completed.stdout
+    assert "team-member-worker" not in completed.stdout
+
+
+def test_hidden_modes_short_circuit_normal_cli_bootstrap(tmp_path, monkeypatch) -> None:
+    calls = []
+
+    async def pane(path):
+        calls.append(("pane", path))
+        return 7
+
+    async def worker(path):
+        calls.append(("worker", path))
+        return 9
+
+    monkeypatch.setattr(cli, "run_pane_host", pane)
+    monkeypatch.setattr(cli, "_run_hidden_member_worker", worker)
+    control = tmp_path / "member.control.json"
+    run = tmp_path / "member.run.run-1.json"
+    assert cli.main(["--team-pane-host", "--control-file", str(control)]) == 7
+    assert cli.main(["--team-member-worker", "--run-file", str(run)]) == 9
+    assert calls == [("pane", control), ("worker", run)]

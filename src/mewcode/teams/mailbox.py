@@ -18,6 +18,8 @@ from .models import (
     MailboxMessageRecord,
     MailboxPage,
     MailboxReadRecord,
+    MemberWakeReceipt,
+    MemberWakeStatus,
     OutboxFlushResult,
     TeamActor,
     TeamCorruptionError,
@@ -35,7 +37,12 @@ from .repository import TeamMutationRunner, TeamRepository
 
 
 class MemberWakeSink(Protocol):
-    async def request_wake(self, member_id: str, *, message_ids: Sequence[str]) -> None: ...
+    async def request_wake(
+        self,
+        member_id: str,
+        *,
+        message_ids: Sequence[str],
+    ) -> MemberWakeReceipt: ...
 
 
 class TeamMailboxStore:
@@ -181,12 +188,18 @@ class TeamMailboxService:
         await self._router.committed(transition)
         flushed = await self.flush_outbox()
         delivered = transition.message.message_id in flushed.delivered_ids
+        wake = flushed.wake_receipts.get(transition.message.message_id)
+        if delivered and wake is not None and wake.status is MemberWakeStatus.FAILED:
+            error = f"Message delivered, member not started: {wake.diagnostic or 'backend unavailable.'}"
+        else:
+            error = None if delivered else "Message is safely queued for retry."
         return DeliveryResult(
             transition.message.recipient_id,
             transition.message.message_id,
             delivered,
-            None if delivered else "Message is safely queued for retry.",
+            error,
             transition.safe_pause,
+            wake,
         )
 
     async def broadcast(
@@ -252,16 +265,53 @@ class TeamMailboxService:
     async def flush_outbox(self) -> OutboxFlushResult:
         delivered: list[str] = []
         failed: list[str] = []
+        wake_receipts: dict[str, MemberWakeReceipt] = {}
         state = self._repository.load(self._team)
         for entry in tuple(item for item in state.outbox if not item.delivered):
             try:
                 await self._store.append_message(entry.message.recipient_id, entry.message)
                 self._mark_delivered(entry.outbox_id)
                 delivered.append(entry.message.message_id)
-                await self._wake_if_needed(entry.message)
             except Exception:
                 failed.append(entry.message.message_id)
-        return OutboxFlushResult(tuple(delivered), tuple(failed))
+                continue
+            try:
+                receipt = await self._wake_if_needed(entry.message)
+            except Exception as exc:
+                receipt = MemberWakeReceipt(
+                    entry.message.recipient_id,
+                    MemberWakeStatus.FAILED,
+                    f"Member wake failed: {type(exc).__name__}.",
+                )
+            if receipt is not None:
+                wake_receipts[entry.message.message_id] = receipt
+        refreshed = self._repository.load(self._team)
+        newly_delivered = set(delivered)
+        for entry in refreshed.outbox:
+            message = entry.message
+            if not entry.delivered or message.message_id in newly_delivered:
+                continue
+            if message.sender_id not in refreshed.members:
+                continue
+            if message.recipient_id not in refreshed.members:
+                continue
+            persisted = self._store.messages(message.recipient_id)
+            if not any(
+                item.message_id == message.message_id and not item.read
+                for item in persisted
+            ):
+                continue
+            try:
+                receipt = await self._wake_if_needed(message)
+            except Exception as exc:
+                receipt = MemberWakeReceipt(
+                    message.recipient_id,
+                    MemberWakeStatus.FAILED,
+                    f"Member wake failed: {type(exc).__name__}.",
+                )
+            if receipt is not None:
+                wake_receipts[message.message_id] = receipt
+        return OutboxFlushResult(tuple(delivered), tuple(failed), wake_receipts)
 
     def _mark_delivered(self, outbox_id: str) -> None:
         now = self._now()
@@ -276,18 +326,30 @@ class TeamMailboxService:
 
         self._mutations.run(self._team, lease_fence=self._lease_fence(), transform=transform)
 
-    async def _wake_if_needed(self, message: TeamMessage) -> None:
+    async def _wake_if_needed(self, message: TeamMessage) -> MemberWakeReceipt | None:
         if self._wake_sink is None:
-            return
+            return None
         state = self._repository.load(self._team)
         member = state.members.get(message.recipient_id)
-        if member is None or member.status not in {
+        if member is None:
+            return None
+        if member.status is TeamMemberStatus.RUNNING:
+            return MemberWakeReceipt(member.member_id, MemberWakeStatus.RUNNING)
+        if member.status is TeamMemberStatus.QUEUED:
+            return MemberWakeReceipt(member.member_id, MemberWakeStatus.QUEUED)
+        if member.status not in {
             TeamMemberStatus.IDLE,
             TeamMemberStatus.INTERRUPTED,
             TeamMemberStatus.FAILED,
         }:
-            return
-        await self._wake_sink.request_wake(member.member_id, message_ids=(message.message_id,))
+            return MemberWakeReceipt(member.member_id, MemberWakeStatus.NOT_APPLICABLE)
+        receipt = await self._wake_sink.request_wake(
+            member.member_id,
+            message_ids=(message.message_id,),
+        )
+        if receipt is None:
+            return MemberWakeReceipt(member.member_id, MemberWakeStatus.NOT_APPLICABLE)
+        return receipt
 
     @staticmethod
     def _registration(state: TeamState, participant_id: str):

@@ -17,6 +17,7 @@ from .models import (
     TeamCorruptionError,
     TeamLeadLeaseRecord,
     TeamState,
+    TerminalPaneBinding,
 )
 
 
@@ -208,6 +209,48 @@ def encode_team_state(state: TeamState) -> bytes:
 
 def decode_team_state(payload: bytes | str) -> TeamState:
     return decode_model(TeamState, decode_json(payload))
+
+
+def encode_terminal_pane_binding(binding: TerminalPaneBinding) -> bytes:
+    return encode_json(binding)
+
+
+def decode_terminal_pane_binding(payload: bytes | str) -> TerminalPaneBinding:
+    return decode_model(TerminalPaneBinding, decode_json(payload))
+
+
+def encode_control_descriptor(descriptor: object) -> bytes:
+    from .control import ControlDescriptor
+
+    if not isinstance(descriptor, ControlDescriptor):
+        raise TeamCorruptionError("Control descriptor model is invalid.")
+    return encode_json(descriptor)
+
+
+def decode_control_descriptor(payload: bytes | str) -> object:
+    from .control import ControlDescriptor
+
+    return decode_model(ControlDescriptor, decode_json(payload))
+
+
+def encode_member_run_record(record: object) -> bytes:
+    from .member_worker import MemberRunDescriptor, MemberRunResult
+
+    if not isinstance(record, (MemberRunDescriptor, MemberRunResult)):
+        raise TeamCorruptionError("Member run record model is invalid.")
+    return encode_json(record)
+
+
+def decode_member_run_descriptor(payload: bytes | str) -> object:
+    from .member_worker import MemberRunDescriptor
+
+    return decode_model(MemberRunDescriptor, decode_json(payload))
+
+
+def decode_member_run_result(payload: bytes | str) -> object:
+    from .member_worker import MemberRunResult
+
+    return decode_model(MemberRunResult, decode_json(payload))
 
 
 def encode_lead_lease(record: TeamLeadLeaseRecord) -> bytes:

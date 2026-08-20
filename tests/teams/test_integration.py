@@ -52,6 +52,17 @@ class _Mailbox:
         self.order.append("flush")
 
 
+class _Broker:
+    def __init__(self, order) -> None:
+        self.order = order
+
+    async def open(self, team_id, *, control_generation):
+        self.order.append(f"broker.open:{team_id}:{control_generation}")
+
+    async def close(self):
+        self.order.append("broker.close")
+
+
 def test_create_attach_detach_and_close_order(tmp_path) -> None:
     async def scenario() -> None:
         clock = FakeClock()
@@ -78,15 +89,16 @@ def test_create_attach_detach_and_close_order(tmp_path) -> None:
             tmp_path,
             process_id="process-1",
             services_factory=services,
+            control_broker=_Broker(order),  # type: ignore[arg-type]
             now=clock.now,
             new_id=lambda: "team-1",
         )
         attachment = await coordinator.create("Alpha", root_session_id="root-1")
         assert attachment.state.manifest.name.value == "Alpha"
-        assert order[:2] == ["flush", "restore"]
+        assert order[:3] == ["broker.open:team-1:1", "flush", "restore"]
         assert coordinator.active_attachment() is not None
         await coordinator.detach()
-        assert order[-2:] == ["scheduler.close", "flush"]
+        assert order[-3:] == ["scheduler.close", "broker.close", "flush"]
         assert coordinator.active_attachment() is None
 
         await coordinator.attach("Alpha", root_session_id="root-2")

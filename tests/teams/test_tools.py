@@ -21,9 +21,12 @@ from mewcode.teams.tools import (
     TEAM_SCHEMA,
     TEAM_TASK_SCHEMA,
     TeamLifecycleTool,
+    TeamMemberTool,
     TeamMessageTool,
     TeamTaskTool,
+    _encode,
 )
+from mewcode.teams.models import PaneHealth, TeamMemberBackend, TeamMemberRuntimeView
 from mewcode.teams.policy import ApprovalGuardedTool, build_member_tool_scope
 
 from .helpers import FakeClock, actor, role, state_with_members
@@ -116,6 +119,52 @@ def test_team_tool_schemas_are_fixed_and_do_not_embed_runtime_names() -> None:
     assert len(set(encoded)) == 4
     assert all("member-1" not in item and "task-1" not in item for item in encoded)
     assert [TEAM_SCHEMA["required"], TEAM_MEMBER_SCHEMA["required"]] == [["action"], ["action"]]
+
+
+def test_member_add_defaults_backend_to_auto() -> None:
+    state = state_with_members(__import__("pathlib").Path.cwd(), 1, FakeClock())
+
+    class Roster:
+        received = None
+
+        async def add_member(self, actor, **arguments):
+            del actor
+            self.received = arguments
+            return {"member_id": "member-new"}
+
+    roster = Roster()
+
+    class Coordinator:
+        services = type("Services", (), {"roster": roster})()
+
+        def lead_actor(self):
+            return actor(state)
+
+    tool = TeamMemberTool(Coordinator())  # type: ignore[arg-type]
+    result = asyncio.run(tool._safe_invoke(
+        {"action": "add", "name": "Coder", "role": "coder", "requires_approval": False},
+        _control_context(AgentMode.DIRECT),
+    ))
+    assert result.ok
+    assert roster.received["backend"] == "auto"
+
+
+def test_member_runtime_view_output_exposes_health_without_private_context(tmp_path) -> None:
+    from dataclasses import replace
+
+    state = state_with_members(tmp_path, 1, FakeClock())
+    original = state.members["member-1"]
+    member = replace(
+        original,
+        backend=TeamMemberBackend.TMUX,
+        role=replace(original.role, system_prompt="SECRET-CONTEXT"),
+    )
+    encoded = _encode(TeamMemberRuntimeView(member, PaneHealth.MISSING, "pane unavailable"))
+    assert '"backend":"tmux"' in encoded
+    assert '"pane_health":"missing"' in encoded
+    assert "pane unavailable" in encoded
+    assert "SECRET-CONTEXT" not in encoded
+    assert str(member.worktree_root) not in encoded
 
 
 class _LifecycleCoordinator:
