@@ -283,3 +283,73 @@ def decode_mailbox_record(payload: bytes | str) -> MailboxMessageRecord | Mailbo
     if value["record_type"] == "read":
         return decode_model(MailboxReadRecord, value["value"])
     raise TeamCorruptionError("Mailbox record type is unknown.")
+
+
+def encode_coordinator_settings(value: object) -> bytes:
+    from .coordinator_models import CoordinatorSettings
+
+    if not isinstance(value, CoordinatorSettings):
+        raise TeamCorruptionError("Coordinator settings model is invalid.")
+    return encode_json(value)
+
+
+def decode_coordinator_settings(payload: bytes | str) -> object:
+    from .coordinator_models import CoordinatorSettings
+
+    return decode_model(CoordinatorSettings, decode_json(payload))
+
+
+def encode_decomposition_run(value: object) -> bytes:
+    from .coordinator_models import DecompositionRun
+
+    if not isinstance(value, DecompositionRun):
+        raise TeamCorruptionError("Decomposition run model is invalid.")
+    return encode_json(value)
+
+
+def decode_decomposition_run(payload: bytes | str) -> object:
+    from .coordinator_models import DecompositionRun
+
+    return decode_model(DecompositionRun, decode_json(payload))
+
+
+def encode_integration_batch(value: object) -> bytes:
+    from .coordinator_models import IntegrationBatch
+
+    if not isinstance(value, IntegrationBatch):
+        raise TeamCorruptionError("Integration batch model is invalid.")
+    return encode_json(value)
+
+
+def decode_integration_batch(payload: bytes | str) -> object:
+    from .coordinator_models import IntegrationBatch
+
+    return decode_model(IntegrationBatch, decode_json(payload))
+
+
+def encode_integration_step(value: object) -> bytes:
+    from .coordinator_models import IntegrationStep
+
+    if not isinstance(value, IntegrationStep):
+        raise TeamCorruptionError("Integration step model is invalid.")
+    return encode_json(value)
+
+
+def decode_integration_step(payload: bytes | str) -> object:
+    from .coordinator_models import IntegrationStep
+
+    return decode_model(IntegrationStep, decode_json(payload))
+
+
+def encode_coordinator_journal(value: object) -> bytes:
+    from .coordinator_models import CoordinatorJournal
+
+    if not isinstance(value, CoordinatorJournal):
+        raise TeamCorruptionError("Coordinator journal model is invalid.")
+    return encode_json(value)
+
+
+def decode_coordinator_journal(payload: bytes | str) -> object:
+    from .coordinator_models import CoordinatorJournal
+
+    return decode_model(CoordinatorJournal, decode_json(payload))

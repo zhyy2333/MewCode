@@ -25,6 +25,39 @@ DEFAULT_CONTEXT_WINDOW = 128_000
 MIN_CONTEXT_WINDOW = 21_193
 
 
+def load_coordinator_configuration_enabled(path: Path = DEFAULT_CONFIG_PATH) -> bool:
+    """Read the coordinator capability switch without resolving provider secrets."""
+    if not path.exists():
+        raise ConfigError(
+            f"Config file not found at {path}. Create it from examples/config.yaml."
+        )
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except yaml.YAMLError as exc:
+        raise ConfigError(f"Invalid YAML in config file: {exc}") from exc
+    if not isinstance(raw, dict):
+        raise ConfigError("Config file must contain a YAML object.")
+    teams = raw.get("teams")
+    if teams is None:
+        return False
+    if not isinstance(teams, dict):
+        raise ConfigError("Config field 'teams' must be a YAML object.")
+    coordinator = teams.get("coordinator")
+    if coordinator is None:
+        return False
+    if not isinstance(coordinator, dict):
+        raise ConfigError("Config field 'teams.coordinator' must be a YAML object.")
+    unknown = set(coordinator).difference({"enabled"})
+    if unknown:
+        raise ConfigError(
+            "Unknown teams.coordinator field(s): " + ", ".join(sorted(unknown)) + "."
+        )
+    enabled = coordinator.get("enabled", False)
+    if type(enabled) is not bool:
+        raise ConfigError("Config field 'teams.coordinator.enabled' must be a boolean.")
+    return enabled
+
+
 def load_active_profile(path: Path = DEFAULT_CONFIG_PATH) -> ProviderProfile:
     active, profiles = _read_config(path)
     selected = _find_profile(profiles, active)

@@ -6,9 +6,11 @@ from datetime import datetime, timezone
 import uuid
 
 from . import domain
+from .coordinator_models import CoordinatorTaskSpec
 from .models import (
     SCHEMA_VERSION,
     TeamActor,
+    TeamActorKind,
     TeamMessage,
     TeamName,
     TeamOutboxEntry,
@@ -55,6 +57,54 @@ class TeamTaskService:
 
         committed = self._mutations.run(self._team, lease_fence=actor.lease_fence, transform=transform)
         return domain.task_view(committed, committed.tasks[task_id])
+
+    async def create_batch(
+        self,
+        actor: TeamActor,
+        specs: Sequence[CoordinatorTaskSpec],
+    ) -> tuple[TeamTaskView, ...]:
+        """Publish one coordinator decomposition in a single team-state CAS."""
+        if actor.kind is not TeamActorKind.LEAD:
+            raise TeamValidationError("Only the Team Lead may publish a coordinator task batch.")
+        ordered = self._ordered_specs(specs)
+        current = self._repository.load(self._team)
+        self._validate_actor(current, actor)
+        if all(item.task_id in current.tasks for item in ordered):
+            self._validate_existing_batch(current, actor, ordered)
+            return tuple(
+                domain.task_view(current, current.tasks[item.task_id])
+                for item in sorted(specs, key=lambda value: (value.ordinal, value.task_id))
+            )
+
+        def transform(state: TeamState) -> TeamState:
+            existing = [spec for spec in ordered if spec.task_id in state.tasks]
+            if existing:
+                if len(existing) != len(ordered):
+                    raise TeamValidationError("Coordinator task batch is only partially present.")
+                self._validate_existing_batch(state, actor, ordered)
+                return state
+
+            candidate = state
+            created_at = self._now()
+            for spec in ordered:
+                candidate, _view = domain.create_task(
+                    candidate,
+                    actor,
+                    task_id=spec.task_id,
+                    title=spec.title,
+                    description=spec.description,
+                    dependency_ids=spec.dependency_task_ids,
+                    now=created_at,
+                )
+            return candidate
+
+        committed = self._mutations.run(
+            self._team,
+            lease_fence=actor.lease_fence,
+            transform=transform,
+        )
+        by_ordinal = sorted(specs, key=lambda item: (item.ordinal, item.task_id))
+        return tuple(domain.task_view(committed, committed.tasks[item.task_id]) for item in by_ordinal)
 
     def get(self, actor: TeamActor, task_id: str) -> TeamTaskView:
         state = self._repository.load(self._team)
@@ -253,3 +303,46 @@ class TeamTaskService:
             raise TeamValidationError("Actor belongs to another team.")
         if actor.participant_id not in {item.participant_id for item in state.registry.values()}:
             raise TeamValidationError("Actor is not registered in this team.")
+
+    @staticmethod
+    def _ordered_specs(specs: Sequence[CoordinatorTaskSpec]) -> tuple[CoordinatorTaskSpec, ...]:
+        values = tuple(specs)
+        if not values:
+            raise TeamValidationError("Coordinator task batch must not be empty.")
+        by_local = {item.local_id: item for item in values}
+        if len(by_local) != len(values) or len({item.task_id for item in values}) != len(values):
+            raise TeamValidationError("Coordinator task batch contains duplicate identifiers.")
+        if any(dependency not in by_local for item in values for dependency in item.dependency_local_ids):
+            raise TeamValidationError("Coordinator task batch contains an unknown dependency.")
+
+        pending = set(by_local)
+        completed: set[str] = set()
+        ordered: list[CoordinatorTaskSpec] = []
+        while pending:
+            ready = sorted(
+                (by_local[item] for item in pending if set(by_local[item].dependency_local_ids) <= completed),
+                key=lambda item: (item.ordinal, item.task_id),
+            )
+            if not ready:
+                raise TeamValidationError("Coordinator task batch contains a dependency cycle.")
+            for item in ready:
+                ordered.append(item)
+                pending.remove(item.local_id)
+                completed.add(item.local_id)
+        return tuple(ordered)
+
+    @staticmethod
+    def _validate_existing_batch(
+        state: TeamState,
+        actor: TeamActor,
+        specs: Sequence[CoordinatorTaskSpec],
+    ) -> None:
+        for spec in specs:
+            task = state.tasks[spec.task_id]
+            if (
+                task.title != spec.title
+                or task.description != spec.description
+                or task.dependency_ids != spec.dependency_task_ids
+                or task.created_by != actor.participant_id
+            ):
+                raise TeamValidationError("Coordinator task batch conflicts with existing tasks.")

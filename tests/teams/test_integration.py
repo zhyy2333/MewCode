@@ -52,6 +52,17 @@ class _Mailbox:
         self.order.append("flush")
 
 
+class _Delivery:
+    def __init__(self, order) -> None:
+        self.order = order
+
+    async def open(self):
+        self.order.append("delivery.open")
+
+    async def close(self):
+        self.order.append("delivery.close")
+
+
 class _Broker:
     def __init__(self, order) -> None:
         self.order = order
@@ -105,5 +116,39 @@ def test_create_attach_detach_and_close_order(tmp_path) -> None:
         await coordinator.close()
         assert coordinator.active_attachment() is None
         assert await coordinator.close() == ()
+
+    asyncio.run(scenario())
+
+
+def test_enabled_delivery_opens_before_wake_restore_and_closes_first(tmp_path) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        repository = TeamRepository(tmp_path, now=clock.now)
+        leases = TeamLeaseService(repository, now=clock.now, new_id=lambda: "lease-1")
+        order = []
+
+        def services(team, fence):
+            del team, fence
+            return TeamCoordinatorServices(
+                scheduler=_Scheduler(order),
+                mailbox=_Mailbox(order),
+                delivery=_Delivery(order),
+            )
+
+        coordinator = TeamCoordinator(
+            repository,
+            leases,
+            _Bindings(tmp_path, clock),
+            tmp_path,
+            process_id="process-1",
+            services_factory=services,
+            control_broker=_Broker(order),  # type: ignore[arg-type]
+            now=clock.now,
+            new_id=lambda: "team-1",
+        )
+        await coordinator.create("Alpha", root_session_id="root-1")
+        assert order == ["broker.open:team-1:1", "delivery.open", "flush", "restore"]
+        await coordinator.close()
+        assert order[-4:] == ["delivery.close", "scheduler.close", "broker.close", "flush"]
 
     asyncio.run(scenario())

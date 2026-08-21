@@ -4,7 +4,11 @@ from pathlib import Path
 
 import pytest
 
-from mewcode.config import load_active_profile, load_profile_catalog
+from mewcode.config import (
+    load_active_profile,
+    load_coordinator_configuration_enabled,
+    load_profile_catalog,
+)
 from mewcode.providers import ConfigError, ProviderProfile, ThinkingMode
 
 
@@ -67,6 +71,43 @@ profiles:
     )
 
     assert load_active_profile(config_path).context_window == 200_000
+
+
+@pytest.mark.parametrize(
+    ("fragment", "expected"),
+    [
+        ("", False),
+        ("teams: {}", False),
+        ("teams:\n  coordinator:\n    enabled: false", False),
+        ("teams:\n  coordinator:\n    enabled: true", True),
+    ],
+)
+def test_coordinator_capability_is_read_without_resolving_api_key(tmp_path, fragment, expected) -> None:
+    path = tmp_path / "config.yaml"
+    write_config(
+        path,
+        f"""active: main
+profiles: []
+{fragment}
+""",
+    )
+    assert load_coordinator_configuration_enabled(path) is expected
+
+
+@pytest.mark.parametrize(
+    "fragment",
+    [
+        "teams: true",
+        "teams:\n  coordinator: true",
+        "teams:\n  coordinator:\n    enabled: 1",
+        "teams:\n  coordinator:\n    enabled: false\n    surprise: true",
+    ],
+)
+def test_coordinator_capability_rejects_invalid_shape(tmp_path, fragment) -> None:
+    path = tmp_path / "config.yaml"
+    write_config(path, f"active: main\nprofiles: []\n{fragment}\n")
+    with pytest.raises(ConfigError):
+        load_coordinator_configuration_enabled(path)
 
 
 @pytest.mark.parametrize("value", ["true", "1.5", "21192", "text"])

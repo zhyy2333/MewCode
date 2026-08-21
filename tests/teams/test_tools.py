@@ -20,6 +20,10 @@ from mewcode.teams.tools import (
     TEAM_MESSAGE_SCHEMA,
     TEAM_SCHEMA,
     TEAM_TASK_SCHEMA,
+    TEAM_COORDINATOR_SCHEMA,
+    TEAM_GIT_SCHEMA,
+    TeamCoordinatorTool,
+    TeamGitTool,
     TeamLifecycleTool,
     TeamMemberTool,
     TeamMessageTool,
@@ -114,9 +118,12 @@ def test_approval_guarded_tool_rechecks_before_side_effect(tmp_path) -> None:
 def test_team_tool_schemas_are_fixed_and_do_not_embed_runtime_names() -> None:
     encoded = [
         __import__("json").dumps(item, sort_keys=True)
-        for item in (TEAM_SCHEMA, TEAM_MEMBER_SCHEMA, TEAM_TASK_SCHEMA, TEAM_MESSAGE_SCHEMA)
+        for item in (
+            TEAM_SCHEMA, TEAM_MEMBER_SCHEMA, TEAM_TASK_SCHEMA, TEAM_MESSAGE_SCHEMA,
+            TEAM_COORDINATOR_SCHEMA, TEAM_GIT_SCHEMA,
+        )
     ]
-    assert len(set(encoded)) == 4
+    assert len(set(encoded)) == 6
     assert all("member-1" not in item and "task-1" not in item for item in encoded)
     assert [TEAM_SCHEMA["required"], TEAM_MEMBER_SCHEMA["required"]] == [["action"], ["action"]]
 
@@ -307,3 +314,82 @@ def test_task_and_message_side_effect_actions_use_current_approval_permit(tmp_pa
     assert asyncio.run(task_tool.execute({"action": "list"})).ok
     assert asyncio.run(message_tool.execute({"action": "list"})).ok
     assert denied.entries == 2
+
+
+def test_coordinator_tools_expose_only_structured_persisted_id_actions() -> None:
+    class Delivery:
+        settings = type("Settings", (), {"enabled": True})()
+
+        def snapshot(self):
+            return {"enabled": True}
+
+        def integration_status(self):
+            return ()
+
+    class Coordinator:
+        services = type("Services", (), {"delivery": Delivery()})()
+
+    context = _control_context(AgentMode.DIRECT)
+    coordinator = Coordinator()
+    status = asyncio.run(TeamCoordinatorTool(coordinator)._safe_invoke({"action": "status"}, context))
+    git_status = asyncio.run(TeamGitTool(coordinator)._safe_invoke({"action": "status"}, context))
+    injected = asyncio.run(
+        TeamGitTool(coordinator)._safe_invoke(
+            {"action": "integrate", "batch_id": "batch-1", "argv": ["push"]}, context,
+        )
+    )
+    assert status.ok and git_status.ok
+    assert not injected.ok and "Unknown argument" in injected.error
+    assert "command" not in TEAM_GIT_SCHEMA["properties"]
+    assert "path" not in TEAM_GIT_SCHEMA["properties"]
+
+
+def test_enabled_coordinator_lead_view_removes_generic_write_tools() -> None:
+    lifecycle = ToolRegistry((_Tool("team"),))
+    lead = ToolRegistry((_Tool("team_member"), _Tool("team_coordinator"), _Tool("team_git")))
+
+    class Coordinator:
+        services = type(
+            "Services", (), {"delivery": type("Delivery", (), {"settings": type("Settings", (), {"enabled": True})()})()}
+        )()
+
+        def active_attachment(self):
+            return type("A", (), {"state": type("S", (), {"manifest": type("M", (), {"name": type("N", (), {"value": "Alpha"})()})()})()})()
+
+    base = ToolRegistry(
+        (
+            _Tool("read_file"),
+            _Tool("write_file", ToolSafety.SIDE_EFFECT),
+            _Tool("run_command", ToolSafety.SIDE_EFFECT),
+            _Tool("agent"),
+            _Tool("load_skill"),
+        )
+    )
+    view = TeamRunViewComposer(Coordinator(), lifecycle, lambda: lead).compose(AgentRunView(base))
+    assert set(view.tools.names) == {"read_file", "team", "team_member", "team_coordinator", "team_git"}
+    assert "do not implement directly" in view.additions.agent_role
+
+
+def test_disabled_coordinator_keeps_existing_lead_write_permissions() -> None:
+    lifecycle = ToolRegistry((_Tool("team"),))
+
+    class Coordinator:
+        services = type("Services", (), {"delivery": None})()
+
+        def active_attachment(self):
+            return type("A", (), {"state": type("S", (), {"manifest": type("M", (), {"name": type("N", (), {"value": "Alpha"})()})()})()})()
+
+    base = ToolRegistry(
+        (
+            _Tool("read_file"),
+            _Tool("write_file", ToolSafety.SIDE_EFFECT),
+            _Tool("run_command", ToolSafety.SIDE_EFFECT),
+            _Tool("agent"),
+            _Tool("load_skill"),
+        )
+    )
+    view = TeamRunViewComposer(Coordinator(), lifecycle, lambda: ToolRegistry((_Tool("team_member"),))).compose(
+        AgentRunView(base)
+    )
+    assert {"write_file", "run_command", "agent", "load_skill"} <= set(view.tools.names)
+    assert "team_coordinator" not in view.tools.names and "team_git" not in view.tools.names

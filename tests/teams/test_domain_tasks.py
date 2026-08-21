@@ -16,6 +16,7 @@ from mewcode.teams.domain import (
     update_task,
     validate_team_state,
 )
+from mewcode.teams.coordinator_models import CoordinatorTaskSpec, DeliveryKind
 from mewcode.teams.models import (
     MailboxRegistration,
     MemberWakeReason,
@@ -130,5 +131,35 @@ def test_task_service_commits_assignment_and_terminal_outbox(tmp_path) -> None:
         started = await service.transition(member, created.task.task_id, TeamTaskStatus.IN_PROGRESS, expected_revision=1)
         await service.transition(member, created.task.task_id, TeamTaskStatus.COMPLETED, expected_revision=2, result="done")
         assert repository.load(state.manifest.name).outbox[-1].message.protocol.value == "task_status"
+
+    asyncio.run(scenario())
+
+
+def test_task_service_publishes_coordinator_batch_atomically_and_idempotently(tmp_path) -> None:
+    clock = FakeClock()
+    repository = TeamRepository(tmp_path, now=clock.now)
+    state = repository.create(state_with_members(tmp_path, clock=clock))
+    leases = TeamLeaseService(repository, now=clock.now, new_id=FakeIds())
+    specs = (
+        CoordinatorTaskSpec(
+            "second", "task-2", 1, "second", "depends on first",
+            ("first",), ("task-1",), "member-2", None, (), ("tests pass",),
+            DeliveryKind.GIT,
+        ),
+        CoordinatorTaskSpec(
+            "first", "task-1", 0, "first", "foundation",
+            (), (), "member-1", None, (), ("tests pass",), DeliveryKind.GIT,
+        ),
+    )
+
+    async def scenario() -> None:
+        lease = await leases.acquire(state.manifest.name, root_session_id="root-1", process_id="process-1")
+        lead = shared_actor(state, fence=lease.fence)
+        service = TeamTaskService(repository, state.manifest.name, now=clock.now)
+        created = await service.create_batch(lead, specs)
+        repeated = await service.create_batch(lead, specs)
+        assert [item.task.task_id for item in created] == ["task-1", "task-2"]
+        assert [item.task.task_id for item in repeated] == ["task-1", "task-2"]
+        assert repository.load(state.manifest.name).revision == 1
 
     asyncio.run(scenario())

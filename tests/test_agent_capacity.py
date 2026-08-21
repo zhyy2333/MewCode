@@ -66,3 +66,22 @@ def test_close_wakes_waiters_and_rejects_new_requests() -> None:
         assert pool.active_count == 0
 
     asyncio.run(scenario())
+
+
+def test_capacity_reservation_transfers_once_and_releases() -> None:
+    async def scenario() -> None:
+        pool = AgentCapacityPool(1)
+        reservation = await pool.try_reserve("member", "reserved")
+        assert reservation is not None
+        assert pool.active_count == 1
+
+        lease = reservation.consume()
+        with pytest.raises(AgentCapacityError):
+            reservation.consume()
+        await reservation.close()
+        assert pool.active_count == 1
+
+        await lease.close()
+        assert pool.active_count == 0
+
+    asyncio.run(scenario())

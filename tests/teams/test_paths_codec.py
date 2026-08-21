@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -15,11 +15,18 @@ from mewcode.teams.models import (
     TerminalPaneBinding,
 )
 from mewcode.teams.codec import (
+    decode_coordinator_settings,
     decode_json,
     decode_team_state,
     decode_terminal_pane_binding,
+    encode_coordinator_settings,
     encode_team_state,
     encode_terminal_pane_binding,
+)
+from mewcode.teams.coordinator_models import (
+    COORDINATOR_POLICY_VERSION,
+    COORDINATOR_SCHEMA_VERSION,
+    CoordinatorSettings,
 )
 from mewcode.teams.paths import TeamNamePolicy, TeamPaths
 
@@ -52,6 +59,35 @@ def test_team_paths_are_contained_and_stable(tmp_path) -> None:
         paths.mailbox_file("../escape")
     with pytest.raises(TeamValidationError):
         paths.member_run_file("member-1", "../escape")
+
+
+def test_coordinator_paths_are_separate_and_branch_lock_is_stable(tmp_path) -> None:
+    paths = TeamPaths.for_user(tmp_path, TeamNamePolicy().parse("Alpha"))
+    paths.ensure_directories()
+    assert not paths.coordinator_root.exists()
+    paths.ensure_coordinator_directories()
+    assert paths.coordinator_settings_file.parent == paths.coordinator_root
+    assert paths.coordinator_decomposition_file("run-1").parent == paths.coordinator_decompositions_root
+    first = paths.coordinator_branch_lock("repository-1", "refs/heads/main")
+    second = paths.coordinator_branch_lock("repository-1", "refs/heads/main")
+    assert first == second and first.is_absolute()
+    with pytest.raises(TeamValidationError):
+        paths.coordinator_decomposition_file("../escape")
+
+
+def test_coordinator_settings_codec_is_strict_and_versioned() -> None:
+    settings = CoordinatorSettings(
+        COORDINATOR_SCHEMA_VERSION, True, True, True, COORDINATOR_POLICY_VERSION,
+        True, datetime(2026, 8, 21, tzinfo=timezone.utc),
+    )
+    payload = encode_coordinator_settings(settings)
+    assert decode_coordinator_settings(payload) == settings
+    raw = json.loads(payload)
+    raw["schema_version"] = 2
+    with pytest.raises(TeamCorruptionError):
+        decode_coordinator_settings(json.dumps(raw))
+    with pytest.raises(TeamCorruptionError):
+        decode_coordinator_settings(payload.decode().replace('"enabled":true', '"enabled":true,"enabled":true'))
 
 
 def test_models_reject_naive_time(tmp_path) -> None:

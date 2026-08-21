@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 import uuid
 
-from mewcode.agent import AgentCapacityPool
+from mewcode.agent import AgentCapacityPool, AgentCapacityReservation
 from mewcode.locking import FileLock
 
 from . import domain
@@ -55,6 +55,7 @@ class TeamMemberScheduler:
         self._drivers: dict[str, asyncio.Task[None]] = {}
         self._runtimes: dict[str, TeamMemberRuntime | TerminalMemberRuntime] = {}
         self._startup: dict[str, asyncio.Future[MemberWakeReceipt]] = {}
+        self._reservations: dict[str, AgentCapacityReservation] = {}
         self._lock = asyncio.Lock()
         self._closed = False
 
@@ -121,6 +122,10 @@ class TeamMemberScheduler:
         return MemberWakeReceipt(member_id, MemberWakeStatus.NOT_APPLICABLE)
 
     async def stop(self, member_id: str) -> None:
+        async with self._lock:
+            reservation = self._reservations.pop(member_id, None)
+        if reservation is not None:
+            await reservation.close()
         runtime = self._runtimes.get(member_id)
         if runtime is not None:
             await runtime.cancel(explicit_stop=True)
@@ -156,6 +161,12 @@ class TeamMemberScheduler:
             self._closed = True
             runtimes = tuple(self._runtimes.values())
             tasks = tuple(self._drivers.values())
+            reservations = tuple(self._reservations.values())
+            self._reservations.clear()
+        await asyncio.gather(
+            *(reservation.close() for reservation in reservations),
+            return_exceptions=True,
+        )
         await asyncio.gather(
             *(runtime.cancel(explicit_stop=False) for runtime in runtimes),
             return_exceptions=True,
@@ -199,7 +210,12 @@ class TeamMemberScheduler:
         outcome: TeamMemberOutcome | None = None
         startup = self._startup.get(member_id)
         try:
-            capacity_lease = await self._capacity.try_acquire("team_member", member_id)
+            async with self._lock:
+                reservation = self._reservations.pop(member_id, None)
+            if reservation is not None:
+                capacity_lease = reservation.consume()
+            else:
+                capacity_lease = await self._capacity.try_acquire("team_member", member_id)
             if capacity_lease is None:
                 if startup is not None and not startup.done():
                     startup.set_result(MemberWakeReceipt(member_id, MemberWakeStatus.QUEUED))
@@ -318,6 +334,38 @@ class TeamMemberScheduler:
             lease_fence=self._lease_fence(),
             transform=transform,
         )
+
+    @property
+    def reserved_member_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(self._reservations))
+
+    async def try_reserve(self, member_id: str) -> AgentCapacityReservation | None:
+        state = self._repository.load(self._team)
+        member = state.members.get(member_id)
+        if (
+            member is None
+            or member.status is not TeamMemberStatus.IDLE
+            or member.current_task_id is not None
+            or member.active_run_id is not None
+        ):
+            return None
+        async with self._lock:
+            if self._closed or member_id in self._reservations:
+                return None
+            driver = self._drivers.get(member_id)
+            if driver is not None and not driver.done():
+                return None
+            reservation = await self._capacity.try_reserve("team_member", member_id)
+            if reservation is not None:
+                self._reservations[member_id] = reservation
+            return reservation
+
+    async def release_reservation(self, reservation: AgentCapacityReservation) -> None:
+        async with self._lock:
+            current = self._reservations.get(reservation.owner_id)
+            if current is reservation:
+                self._reservations.pop(reservation.owner_id, None)
+        await reservation.close()
 
     def _commit_outcome(
         self,

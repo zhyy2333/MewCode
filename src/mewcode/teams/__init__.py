@@ -51,7 +51,43 @@ from .coordinator import (
     TeamCoordinatorServices,
     TeamRunViewComposer,
 )
-from .tools import TeamLifecycleTool, TeamMemberTool, TeamMessageTool, TeamTaskTool
+from .tools import (
+    TeamCoordinatorTool,
+    TeamGitTool,
+    TeamLifecycleTool,
+    TeamMemberTool,
+    TeamMessageTool,
+    TeamTaskTool,
+)
+from .coordinator_git import (
+    CoordinatorGitBackend,
+    CoordinatorGitError,
+    GitRecoveryDecision,
+    GitTargetSnapshot,
+    MemberGitSnapshot,
+)
+from .coordinator_models import (
+    CoordinatorSettings,
+    CoordinatorTaskSpec,
+    DecompositionRun,
+    DeliveryReview,
+    IntegrationBatch,
+    IntegrationStep,
+)
+from .coordinator_repository import CoordinatorRepository
+from .coordinator_settings import (
+    COORDINATOR_ENVIRONMENT_VARIABLE,
+    CoordinatorSettingsResolver,
+    CoordinatorSettingsResult,
+    TerminalBackendReadiness,
+)
+from .integration import TeamIntegrationService
+from .orchestration import (
+    CoordinatorSnapshot,
+    CoordinatorTaskDraft,
+    DecompositionRequest,
+    TeamDeliveryCoordinator,
+)
 from .approvals import TeamApprovalService
 from .leases import TeamLeaseService
 from .mailbox import TeamMailboxService
@@ -101,6 +137,8 @@ __all__ = [
     "TeamCoordinatorServices",
     "TeamRunViewComposer",
     "TeamLifecycleTool",
+    "TeamCoordinatorTool",
+    "TeamGitTool",
     "TeamMemberTool",
     "TeamMessageTool",
     "TeamTaskTool",
@@ -117,4 +155,25 @@ __all__ = [
     "TeamProtocol",
     "TeamTaskStatus",
     "TerminalPaneBinding",
+    "CoordinatorGitBackend",
+    "CoordinatorGitError",
+    "GitRecoveryDecision",
+    "GitTargetSnapshot",
+    "MemberGitSnapshot",
+    "CoordinatorSettings",
+    "CoordinatorTaskSpec",
+    "DecompositionRun",
+    "DeliveryReview",
+    "IntegrationBatch",
+    "IntegrationStep",
+    "CoordinatorRepository",
+    "COORDINATOR_ENVIRONMENT_VARIABLE",
+    "CoordinatorSettingsResolver",
+    "CoordinatorSettingsResult",
+    "TerminalBackendReadiness",
+    "TeamIntegrationService",
+    "CoordinatorSnapshot",
+    "CoordinatorTaskDraft",
+    "DecompositionRequest",
+    "TeamDeliveryCoordinator",
 ]

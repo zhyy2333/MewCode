@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import os
 from pathlib import Path
 import re
@@ -111,6 +112,89 @@ class TeamPaths:
             path.mkdir(parents=True, exist_ok=True)
             if is_link_or_reparse(path):
                 raise TeamValidationError("Team directory must not be a link.")
+
+    @property
+    def coordinator_root(self) -> Path:
+        return self._child(self.team_root, "coordinator")
+
+    @property
+    def coordinator_settings_file(self) -> Path:
+        return self._child(self.coordinator_root, "settings.json")
+
+    @property
+    def coordinator_decompositions_root(self) -> Path:
+        return self._child(self.coordinator_root, "decompositions")
+
+    @property
+    def coordinator_integrations_root(self) -> Path:
+        return self._child(self.coordinator_root, "integrations")
+
+    @property
+    def coordinator_steps_root(self) -> Path:
+        return self._child(self.coordinator_root, "steps")
+
+    @property
+    def coordinator_journals_root(self) -> Path:
+        return self._child(self.coordinator_root, "journals")
+
+    @property
+    def coordinator_locks_root(self) -> Path:
+        return self._child(self.coordinator_root, "locks")
+
+    def ensure_coordinator_directories(self) -> None:
+        self.validate_containment()
+        roots = (
+            self.coordinator_root,
+            self.coordinator_decompositions_root,
+            self.coordinator_integrations_root,
+            self.coordinator_steps_root,
+            self.coordinator_journals_root,
+            self.coordinator_locks_root,
+        )
+        current = self.team_root
+        for part in self.coordinator_root.relative_to(self.team_root).parts:
+            current = current / part
+            if current.exists() and is_link_or_reparse(current):
+                raise TeamValidationError("Coordinator path contains a link or reparse point.")
+        for path in roots:
+            path.mkdir(parents=True, exist_ok=True)
+            if is_link_or_reparse(path):
+                raise TeamValidationError("Coordinator directory must not be a link.")
+
+    def coordinator_decomposition_file(self, run_id: str) -> Path:
+        safe = TeamNamePolicy().safe_id(run_id, "run_id")
+        return self._child(self.coordinator_decompositions_root, f"{safe}.json")
+
+    def coordinator_integration_file(self, batch_id: str) -> Path:
+        safe = TeamNamePolicy().safe_id(batch_id, "batch_id")
+        return self._child(self.coordinator_integrations_root, f"{safe}.json")
+
+    def coordinator_step_file(self, step_id: str) -> Path:
+        safe = TeamNamePolicy().safe_id(step_id, "step_id")
+        return self._child(self.coordinator_steps_root, f"{safe}.json")
+
+    def coordinator_journal_file(self, journal_id: str) -> Path:
+        safe = TeamNamePolicy().safe_id(journal_id, "journal_id")
+        return self._child(self.coordinator_journals_root, f"{safe}.json")
+
+    def coordinator_lock_file(self, kind: str, identifier: str) -> Path:
+        safe_kind = TeamNamePolicy().safe_id(kind, "lock kind")
+        safe_id = TeamNamePolicy().safe_id(identifier, "lock identifier")
+        root = self._child(self.coordinator_locks_root, safe_kind)
+        return self._child(root, f"{safe_id}.lock")
+
+    def coordinator_branch_lock(self, repository_id: str, branch_ref: str) -> Path:
+        safe_repository = TeamNamePolicy().safe_id(repository_id, "repository_id")
+        digest = hashlib.sha256(branch_ref.encode("utf-8")).hexdigest()
+        root = self._child(self.teams_root, ".coordinator-locks")
+        repository_root = self._child(root, safe_repository)
+        result = self._child(repository_root, f"{digest}.lock")
+        current = self.teams_root
+        for part in result.parent.relative_to(self.teams_root).parts:
+            current = current / part
+            if current.exists() and is_link_or_reparse(current):
+                raise TeamValidationError("Coordinator branch lock path contains a link.")
+        return result
 
     def mailbox_file(self, participant_id: str) -> Path:
         safe = TeamNamePolicy().safe_id(participant_id, "participant_id")

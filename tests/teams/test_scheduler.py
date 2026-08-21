@@ -164,3 +164,33 @@ def test_restore_only_starts_persisted_queue_not_interrupted_member(tmp_path) ->
         await scheduler.close()
 
     asyncio.run(scenario())
+
+
+def test_reserved_capacity_is_consumed_by_the_matching_wake_once(tmp_path) -> None:
+    async def scenario() -> None:
+        clock = FakeClock()
+        repository = _repository(tmp_path, clock)
+        pool = AgentCapacityPool(1)
+        factory = _RuntimeFactory()
+        ids = (f"reserved-{index}" for index in range(20))
+        scheduler = TeamMemberScheduler(
+            repository,
+            team_name(),
+            pool,
+            factory,
+            lease_fence=lambda: ("lease-1", 1),
+            now=clock.now,
+            new_id=lambda: next(ids),
+        )
+        reservation = await scheduler.try_reserve("member-1")
+        assert reservation is not None
+        assert scheduler.reserved_member_ids == ("member-1",)
+        receipt = await scheduler.request_wake("member-1", message_ids=("mail-1",))
+        assert receipt.status is MemberWakeStatus.RUNNING
+        await _settle_status(repository, TeamMemberStatus.IDLE)
+        assert scheduler.reserved_member_ids == ()
+        assert factory.created == [(1, "persistent wake queue")]
+        await scheduler.close()
+        assert pool.active_count == 0
+
+    asyncio.run(scenario())

@@ -51,6 +51,34 @@ class AgentCapacityLease:
         await self.close()
 
 
+class AgentCapacityReservation:
+    """An immediately acquired capacity lease that may be transferred once."""
+
+    def __init__(self, lease: AgentCapacityLease) -> None:
+        self.owner_kind = lease.owner_kind
+        self.owner_id = lease.owner_id
+        self._lease: AgentCapacityLease | None = lease
+        self._consumed = False
+
+    @property
+    def consumed(self) -> bool:
+        return self._consumed
+
+    def consume(self) -> AgentCapacityLease:
+        if self._consumed or self._lease is None:
+            raise AgentCapacityError("This capacity reservation has already been consumed.")
+        lease = self._lease
+        self._lease = None
+        self._consumed = True
+        return lease
+
+    async def close(self) -> None:
+        lease = self._lease
+        self._lease = None
+        if lease is not None:
+            await lease.close()
+
+
 class AgentCapacityPool:
     """A process-local FIFO capacity pool shared by all agent runtimes."""
 
@@ -83,6 +111,14 @@ class AgentCapacityPool:
             if len(self._active) >= self.limit or self._waiters:
                 return None
             return self._grant(owner)
+
+    async def try_reserve(
+        self,
+        owner_kind: str,
+        owner_id: str,
+    ) -> AgentCapacityReservation | None:
+        lease = await self.try_acquire(owner_kind, owner_id)
+        return None if lease is None else AgentCapacityReservation(lease)
 
     async def acquire(self, owner_kind: str, owner_id: str) -> AgentCapacityLease:
         owner = self._validate_owner(owner_kind, owner_id)

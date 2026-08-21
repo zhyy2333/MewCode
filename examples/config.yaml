@@ -1,4 +1,9 @@
 active: anthropic-main
+teams:
+  # Also requires MEWCODE_ENABLE_TEAM_COORDINATOR=1.
+  coordinator:
+    enabled: false
+
 profiles:
   - name: anthropic-main
     protocol: anthropic

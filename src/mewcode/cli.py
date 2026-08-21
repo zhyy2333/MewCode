@@ -105,7 +105,11 @@ from .teams import (
     MemberSessionStore,
     TeamApprovalService,
     TeamCoordinator,
+    TeamCoordinatorTool,
     TeamCoordinatorServices,
+    TeamDeliveryCoordinator,
+    TeamGitTool,
+    TeamIntegrationService,
     TeamLifecycleTool,
     TeamMailboxService,
     TeamMemberRunAssembler,
@@ -116,6 +120,9 @@ from .teams import (
     TeamMessageTool,
     TeamProtocolRouter,
     TeamRepository,
+    CoordinatorRepository,
+    CoordinatorSettingsResolver,
+    CoordinatorGitBackend,
     TeamRepositoryBindingService,
     TeamRosterService,
     TeamRunViewComposer,
@@ -376,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
         command_registry = DynamicCommandCatalog(static_command_registry)
         interaction_state = InteractionState()
         workspace = Workspace(Path.cwd())
+        coordinator_settings = CoordinatorSettingsResolver().resolve().settings
         capacity_pool = AgentCapacityPool()
         worktree_config = WorktreeConfigLoader().load(
             workspace.root / ".mewcode" / "worktrees.yaml"
@@ -761,12 +769,34 @@ def main(argv: list[str] | None = None) -> int:
                 backend_resolver=backend_resolver,
                 terminal_hosts=terminal_hosts,
             )
+            delivery = None
+            if coordinator_settings.enabled:
+                coordinator_repository = CoordinatorRepository(team_repository, team_name)
+                coordinator_repository.initialize(coordinator_settings)
+                coordinator_git = CoordinatorGitBackend()
+                integration = TeamIntegrationService(
+                    coordinator_repository,
+                    coordinator_git,
+                )
+                delivery = TeamDeliveryCoordinator(
+                    coordinator_settings,
+                    team_repository,
+                    coordinator_repository,
+                    team_name,
+                    team_coordinator.lead_actor(),
+                    tasks,
+                    mailbox,
+                    member_scheduler,
+                    coordinator_git,
+                    integration,
+                )
             return TeamCoordinatorServices(
                 scheduler=member_scheduler,
                 mailbox=mailbox,
                 roster=roster,
                 tasks=tasks,
                 approvals=approvals,
+                delivery=delivery,
             )
 
         team_coordinator = TeamCoordinator(
@@ -789,8 +819,7 @@ def main(argv: list[str] | None = None) -> int:
             services = team_coordinator.services
             if services is None:
                 return ToolRegistry([])
-            return ToolRegistry(
-                [
+            tools = [
                     TeamMemberTool(team_coordinator),
                     TeamTaskTool(lambda: services.tasks, team_coordinator.lead_actor),
                     TeamMessageTool(
@@ -799,7 +828,9 @@ def main(argv: list[str] | None = None) -> int:
                         team_coordinator.lead_actor,
                     ),
                 ]
-            )
+            if services.delivery is not None:
+                tools.extend((TeamCoordinatorTool(team_coordinator), TeamGitTool(team_coordinator)))
+            return ToolRegistry(tools)
 
         team_view = TeamRunViewComposer(
             team_coordinator,

@@ -11,7 +11,7 @@ import uuid
 
 from mewcode.agent import AgentInboundBatch, AgentRunView
 from mewcode.prompting import PromptAdditions
-from mewcode.tools import ToolRegistry
+from mewcode.tools import ToolRegistry, ToolSafety
 
 from .inbound import LeadInboundSource
 from .control import MemberControlBroker
@@ -42,6 +42,7 @@ class TeamCoordinatorServices:
     roster: Any = None
     tasks: Any = None
     approvals: Any = None
+    delivery: Any = None
 
 
 ServicesFactory = Callable[
@@ -179,6 +180,8 @@ class TeamCoordinator:
                 self._services = await created if inspect.isawaitable(created) else created
                 if self._services.roster is not None:
                     await self._services.roster.recover()
+                if self._services.delivery is not None:
+                    await self._services.delivery.open()
                 if self._services.mailbox is not None:
                     await self._services.mailbox.flush_outbox()
                 if self._services.scheduler is not None:
@@ -186,6 +189,12 @@ class TeamCoordinator:
             self._background = asyncio.create_task(self._maintenance_loop())
             return self._attachment
         except BaseException:
+            if self._services is not None:
+                if self._services.delivery is not None:
+                    await self._services.delivery.close()
+                if self._services.scheduler is not None:
+                    await self._services.scheduler.close()
+                self._services = None
             self._attachment = None
             self._lease_valid = False
             if self._control_broker is not None:
@@ -338,6 +347,8 @@ class TeamCoordinator:
                     )
                 )
                 self._lease_valid = False
+                if self._services is not None and self._services.delivery is not None:
+                    await self._services.delivery.close()
                 if self._services is not None and self._services.scheduler is not None:
                     await self._services.scheduler.close()
                 if self._control_broker is not None:
@@ -355,6 +366,8 @@ class TeamCoordinator:
             background.cancel()
             await asyncio.gather(background, return_exceptions=True)
         services = self._services
+        if services is not None and services.delivery is not None:
+            await services.delivery.close()
         if services is not None and services.scheduler is not None:
             await services.scheduler.close()
         if self._control_broker is not None:
@@ -399,7 +412,16 @@ class TeamRunViewComposer:
         self._lead_tools = lead_tools
 
     def compose(self, base: AgentRunView) -> AgentRunView:
-        tools = base.tools.without(self._lifecycle_tools.names).merge(self._lifecycle_tools)
+        services = getattr(self._coordinator, "services", None)
+        delivery = None if services is None else getattr(services, "delivery", None)
+        enabled = bool(delivery is not None and delivery.settings.enabled)
+        if enabled:
+            tools = base.tools.select_safety({ToolSafety.READ_ONLY}).without(
+                {"write_file", "edit_file", "apply_patch", "run_command", "agent", "load_skill"}
+            )
+            tools = tools.without(self._lifecycle_tools.names).merge(self._lifecycle_tools)
+        else:
+            tools = base.tools.without(self._lifecycle_tools.names).merge(self._lifecycle_tools)
         additions = base.additions
         attachment = self._coordinator.active_attachment()
         if attachment is not None:
@@ -407,7 +429,12 @@ class TeamRunViewComposer:
             tools = tools.without(lead_tools.names).merge(lead_tools)
             lead_prompt = (
                 f"You are Team Lead for persistent team {attachment.state.manifest.name.value}. "
-                "Decompose work into shared tasks, delegate implementation, and make final decisions."
+                + (
+                    "Coordinator mode is enabled: only orchestrate, review, stop or resume members, "
+                    "and integrate verified Git deliveries through the structured team tools; do not implement directly."
+                    if enabled
+                    else "Decompose work into shared tasks, delegate implementation, and make final decisions."
+                )
             )
             additions = (additions or PromptAdditions()).merged(agent_role=lead_prompt)
         return AgentRunView(tools, additions)

@@ -41,6 +41,7 @@ from .capacity import (
     AgentCapacityClosedError,
     AgentCapacityError,
     AgentCapacityLease,
+    AgentCapacityReservation,
     AgentCapacityPool,
 )
 
@@ -53,6 +54,7 @@ __all__ = [
     "AgentCapacityClosedError",
     "AgentCapacityError",
     "AgentCapacityLease",
+    "AgentCapacityReservation",
     "AgentCapacityPool",
     "AgentMode",
     "AgentPermissionDecision",

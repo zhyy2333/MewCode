@@ -12,6 +12,8 @@ from mewcode.agent import AgentControlContext, AgentMode
 from mewcode.tools import PermissionTargetKind, ToolPermissionSpec, ToolResult, ToolSafety
 
 from .coordinator import TeamCoordinator
+from .coordinator_models import DeliveryKind, DeliveryReviewStatus, DispatchAction
+from .orchestration import CoordinatorTaskDraft, DecompositionRequest
 from .models import (
     PlanDecision,
     TeamActor,
@@ -80,6 +82,34 @@ TEAM_MESSAGE_SCHEMA = {
         "request_id": {"type": "string"},
         "decision": {"type": "string"},
         "feedback": {"type": "string"},
+    },
+    "required": ["action"],
+}
+TEAM_COORDINATOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string"},
+        "run_id": {"type": "string"},
+        "task_id": {"type": "string"},
+        "user_goal": {"type": "string"},
+        "target_branch": {"type": "string"},
+        "tasks": {"type": "array", "items": {"type": "object"}},
+        "auto_integrate": {"type": "boolean"},
+        "decision": {"type": "string"},
+        "member_id": {"type": "string"},
+        "reason_code": {"type": "string"},
+        "reason": {"type": "string"},
+        "review_status": {"type": "string"},
+        "evidence": {"type": "string"},
+    },
+    "required": ["action"],
+}
+TEAM_GIT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "action": {"type": "string"},
+        "run_id": {"type": "string"},
+        "batch_id": {"type": "string"},
     },
     "required": ["action"],
 }
@@ -354,6 +384,107 @@ class TeamMessageTool(_BaseTeamTool):
         return value, metadata
 
 
+class TeamCoordinatorTool(_BaseTeamTool):
+    name = "team_coordinator"
+    description = "Controlled Team Lead decomposition, dispatch, review, and decision operations."
+    parameters_schema = TEAM_COORDINATOR_SCHEMA
+
+    def __init__(self, coordinator: TeamCoordinator) -> None:
+        self._coordinator = coordinator
+
+    async def _invoke(self, arguments, context):
+        action = _action(arguments, {"status", "decompose", "reconcile", "decide", "review"})
+        _require_root_context(context)
+        if context.mode is AgentMode.PLAN and action != "status":
+            raise TeamValidationError("PLAN mode only permits reading coordinator status.")
+        services = self._coordinator.services
+        delivery = None if services is None else getattr(services, "delivery", None)
+        if delivery is None or not delivery.settings.enabled:
+            raise TeamValidationError("Team coordinator mode is not enabled for this attachment.")
+        specs = {
+            "status": ({"action"}, set()),
+            "decompose": ({"action", "user_goal", "target_branch", "tasks", "auto_integrate"}, {"user_goal", "target_branch", "tasks"}),
+            "reconcile": ({"action", "run_id"}, set()),
+            "decide": ({"action", "run_id", "task_id", "decision", "member_id", "reason_code", "reason"}, {"run_id", "task_id", "decision", "reason_code", "reason"}),
+            "review": ({"action", "run_id", "task_id", "review_status", "evidence"}, {"run_id", "task_id", "review_status", "evidence"}),
+        }
+        _fields(arguments, *specs[action])
+        if action == "status":
+            value = delivery.snapshot()
+        elif action == "decompose":
+            auto_integrate = (
+                _boolean(arguments, "auto_integrate") if "auto_integrate" in arguments else False
+            )
+            value = await delivery.decompose(
+                DecompositionRequest(
+                    _string(arguments, "user_goal"),
+                    _string(arguments, "target_branch"),
+                    _task_drafts(arguments.get("tasks")),
+                    auto_integrate,
+                )
+            )
+        elif action == "reconcile":
+            value = await delivery.reconcile(arguments.get("run_id"))
+        elif action == "decide":
+            member_id = arguments.get("member_id")
+            if member_id is not None and not isinstance(member_id, str):
+                raise TeamValidationError("member_id must be a string")
+            value = await delivery.decide(
+                _string(arguments, "run_id"),
+                _string(arguments, "task_id"),
+                DispatchAction(_string(arguments, "decision")),
+                member_id=member_id,
+                reason_code=_string(arguments, "reason_code"),
+                reason=_string(arguments, "reason"),
+            )
+        else:
+            value = await delivery.review(
+                _string(arguments, "run_id"),
+                _string(arguments, "task_id"),
+                DeliveryReviewStatus(_string(arguments, "review_status")),
+                evidence=_string(arguments, "evidence"),
+            )
+        return value, {}
+
+
+class TeamGitTool(_BaseTeamTool):
+    name = "team_git"
+    description = "Controlled local Git inspection, integration, and recovery by persisted IDs."
+    parameters_schema = TEAM_GIT_SCHEMA
+
+    def __init__(self, coordinator: TeamCoordinator) -> None:
+        self._coordinator = coordinator
+
+    async def _invoke(self, arguments, context):
+        action = _action(arguments, {"status", "inspect", "plan", "integrate", "recover"})
+        _require_root_context(context)
+        if context.mode is AgentMode.PLAN and action not in {"status", "inspect"}:
+            raise TeamValidationError("PLAN mode only permits reading Git integration state.")
+        services = self._coordinator.services
+        delivery = None if services is None else getattr(services, "delivery", None)
+        if delivery is None or not delivery.settings.enabled:
+            raise TeamValidationError("Team coordinator Git integration is not enabled.")
+        specs = {
+            "status": ({"action"}, set()),
+            "inspect": ({"action", "run_id"}, {"run_id"}),
+            "plan": ({"action", "run_id"}, {"run_id"}),
+            "integrate": ({"action", "batch_id"}, {"batch_id"}),
+            "recover": ({"action"}, set()),
+        }
+        _fields(arguments, *specs[action])
+        if action == "status":
+            value = delivery.integration_status()
+        elif action == "inspect":
+            value = delivery.inspect_delivery(_string(arguments, "run_id"))
+        elif action == "plan":
+            value = await delivery.plan_integration(_string(arguments, "run_id"))
+        elif action == "integrate":
+            value = await delivery.integrate(_string(arguments, "batch_id"))
+        else:
+            value = await delivery.recover_git()
+        return value, {}
+
+
 async def _guarded_action(
     permit_factory: Callable[[], Any] | None,
     guarded: bool,
@@ -411,6 +542,48 @@ def _strings(value: object) -> tuple[str, ...]:
     if not isinstance(value, (list, tuple)) or any(not isinstance(item, str) for item in value):
         raise TeamValidationError("Expected an array of strings")
     return tuple(value)
+
+
+def _task_drafts(value: object) -> tuple[CoordinatorTaskDraft, ...]:
+    if not isinstance(value, list) or not value:
+        raise TeamValidationError("tasks must be a non-empty array")
+    result = []
+    allowed = {
+        "local_id", "title", "description", "dependency_local_ids", "target_member_id",
+        "required_role", "required_tool_names", "acceptance_criteria", "delivery_kind",
+    }
+    required = {"local_id", "title", "description", "acceptance_criteria"}
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise TeamValidationError("Each coordinator task must be an object")
+        _fields(item, allowed, required)
+        target = item.get("target_member_id")
+        role = item.get("required_role")
+        if target is not None and (not isinstance(target, str) or not target):
+            raise TeamValidationError("target_member_id must be a string")
+        if role is not None and (not isinstance(role, str) or not role):
+            raise TeamValidationError("required_role must be a string")
+        result.append(
+            CoordinatorTaskDraft(
+                _string(item, "local_id"),
+                _string(item, "title"),
+                _optional_string(item, "description"),
+                _strings(item.get("dependency_local_ids", [])),
+                target,
+                role,
+                _strings(item.get("required_tool_names", [])),
+                _strings(item.get("acceptance_criteria")),
+                DeliveryKind(str(item.get("delivery_kind", DeliveryKind.GIT.value))),
+            )
+        )
+    return tuple(result)
+
+
+def _optional_string(arguments: Mapping[str, object], name: str) -> str:
+    value = arguments.get(name, "")
+    if not isinstance(value, str):
+        raise TeamValidationError(f"{name} must be a string")
+    return value
 
 
 def _encode(value: object) -> str:
