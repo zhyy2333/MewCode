@@ -132,44 +132,105 @@ python -m mewcode
 
 `/status` 的 Token 数据覆盖当前进程内当前会话的全部模型调用，包括普通对话、PLAN、Skill、上下文压缩和自动记忆更新；Provider 未报告的累计字段显示为 `n/a`，不会用估算值代替。
 
-## 子 Agent 系统
+## Agent Loop
 
-主 Agent 通过始终稳定的 `agent` 工具委派独立任务。工具只有 `type`、`task`、`role`、`background` 四个参数：`defined` 必须指定已加载角色，默认在前台等待；`fork` 不接受角色或 `background` 参数并始终进入后台。定义式任务超过 10 秒会原地转为后台，也可在运行时按 `Ctrl+B` 手动转后台；这不会取消、重启或重计任务。`Ctrl+C` 仍取消当前主运行以及仍与其绑定的前台子任务，已经解除到后台的任务继续执行。
+普通消息会启动 ReAct Agent Loop。MewCode 会持续让模型思考、调用工具、读取结果并调整下一步，直到模型给出不再包含工具调用的最终回复，无需逐步追加提示。
 
-角色是带严格 YAML frontmatter 的 Markdown 文件。项目级 `<workspace>/.mewcode/agents/` 覆盖用户级 `~/.mewcode/agents/`，再覆盖包内置角色，最后覆盖启动时显式注入的插件根；高层无效定义会产生诊断并回退到低层有效定义，同层有效重名会拒绝启动。目录只在启动时读取，没有热重载。`isolation` 可选，缺省为 `shared`：
+每次运行最多调用模型 20 次；如果第 20 次响应仍要求工具，MewCode 会停止且不会执行最后一批工具。运行还会在用户按下 `Ctrl+C`、连续三轮只请求未知工具、Provider 流出错或内部错误时停止。`Ctrl+C` 只取消当前一轮，清理完成后可以继续在同一 REPL 中输入任务。
 
-```markdown
----
-name: code-reviewer
-description: Review code changes without modifying them.
-tools:
-  - read_file
-  - find_files
-  - search_code
-disallowed_tools: []
-model: inherit
-max_turns: 20
-permission_mode: default
-isolation: worktree
----
-You are an independent code reviewer...
+模型一次返回多个工具调用时，相邻的只读工具会并发执行，最大并发数为 4；写文件、编辑文件和运行命令按原始顺序独占执行。终端会实时显示文本、简短工具状态、迭代进度和 Token 用量，不显示完整工具参数或大段工具结果。
+
+## 权限系统
+
+每个有效工具调用在执行前都会经过危险命令黑名单、内置文件工具路径沙箱、分层规则、权限模式与人工确认。黑名单和路径沙箱是不可绕过的安全上限；即使使用 `allow` 模式或显式 allow 规则，危险命令和越界文件路径仍会被拒绝。权限拒绝会作为工具失败返回模型，Agent Loop 可以改用更安全的策略继续工作。
+
+三档模式的含义如下：
+
+- `strict`：deny 直接拒绝；本会话已确认的精确 allow 自动执行；持久 allow 与未匹配调用仍需首次确认。
+- `default`：采用明确的 allow/deny，未匹配调用需要确认。
+- `allow`：deny 仍然生效，其余调用自动执行。
+
+规则按会话、项目本地、项目共享、用户全局的顺序解析。持久化文件位置为：
+
+- 用户全局：`~/.mewcode/permissions.yaml`
+- 项目共享：`<workspace>/.mewcode/permissions.yaml`
+- 项目本地：`<workspace>/.mewcode/permissions.local.yaml`
+
+三个 YAML 文件格式相同：
+
+```yaml
+rules:
+  - rule: "run_command(git *)"
+    result: allow
+  - rule: "write_file(src/generated/**)"
+    result: deny
 ```
 
-`model: inherit` 使用委派父请求的 Profile；其他值必须是配置中已有的 Profile 名。`haiku`、`sonnet`、`opus` 没有内置别名，只有用户实际创建同名 Profile 时才有效。完整示例见 `examples/agents/code-reviewer.md` 和 `examples/agents/worktree-coder.md`；内置 `explore` 角色只开放 `read_file`、`find_files`、`search_code`。
+规则使用实际工具名和主要参数，支持精确与 glob 匹配。同层中精确规则优先于 glob，固定文本更多者优先，具体度并列时 deny 获胜。命令 glob 的 `*` 可匹配空格；路径 glob 的 `*` 不跨 `/`，`**` 可递归跨目录。用 `\\`、`\*`、`\?`、`\[`、`\]` 表示字面量反斜杠或 glob 字符。
 
-定义式子 Agent 从空历史和固定角色正文启动，只复制人工指令与长期记忆，不继承父对话、活动 Skill 或临时 Hook prompt。Fork 首轮复用产生委派调用的实际父请求 prompt、消息前缀、工具顺序和输出上限，并只在尾部追加新任务，以便 Provider 有机会复用缓存；缓存实际命中不作保证。两类任务的消息、权限 session、文件读取观察、上下文归档和 Token 统计彼此隔离；`shared` 角色仍使用主工作区，`worktree` 角色使用独立 Git Worktree。
+需要确认时可选择拒绝、仅本次、本会话或永久。永久放行只把当前调用的精确 allow 写入项目本地 `permissions.local.yaml`；该文件默认不提交，项目共享 `permissions.yaml` 可以提交。
 
-工具能力采用多层交集：父模式安全上限、角色白名单、角色黑名单、启动时冻结的后台能力名单和全局禁止名单共同收窄。`agent`、`load_skill` 不能在子 Agent 中执行，禁止嵌套委派。Fork 为保持缓存前缀可继续展示父工具 schema，但越界工具会在 Hook 和权限检查之前被冻结策略拒绝。子 Agent 不进行交互审批；任何原本为 `ASK` 的权限决定都会以非交互来源自动改写为拒绝，再把普通工具失败交回子模型继续处理。
+路径沙箱仅约束 MewCode 内置的读取、写入、编辑、查找和搜索工具。`run_command` 子进程从工作区启动，但本阶段没有操作系统级文件隔离；它仍受危险命令黑名单、权限规则、模式与人工确认保护。
 
-后台任务结束时终端只显示单行摘要。完整的有界结果可用 `/task <id>` 查看，并会在根 Agent 的下一次真实模型请求中以 `<untrusted-subagent-results>` 边界一次性注入；它不写入主历史。任务表和通知纯属进程内状态，退出后不恢复；`/reset` 会先取消并清空所有任务和待投递通知。
+## 工具系统
 
-`worktree` 角色会在 `<workspace>/.mewcode/worktrees/task/<摘要>/` 创建独立目录和 `mewcode/worktree/task/<摘要>` 临时分支。所有文件、命令、Skill 进程、项目 Hook、stdio MCP、Prompt 环境和上下文归档都显式绑定该绝对目录，MewCode 不调用进程级 `chdir`。主 Agent 启动时冻结的用户级配置继续复用，项目指令、项目记忆、Hook 和 MCP 则从该 Worktree 重新加载。
+MewCode 会把以下内置工具暴露给模型：
 
-任务退出时，干净且没有未发布提交的临时目录会自动删除；存在 tracked 修改、未忽略的 untracked 文件、未被任一远端跟踪引用包含的新提交，或保护检查不确定时会保留，并在 `/task`、通知和 `/worktrees` 中显示。`--force` 只允许人工本地命令逐次指定，不能由 Agent 工具、配置或后台清理启用。后台清理只处理超过 24 小时的非活动候选，每轮最多 256 个，并复用相同的归属验证和非强制保护。
+- `read_file(path)`：读取当前工作区内的 UTF-8 文本文件。
+- `write_file(path, content)`：在当前工作区内写入 UTF-8 文本。
+- `edit_file(path, old_text, new_text)`：只在原文恰好匹配一次时替换文本。
+- `run_command(command, timeout_seconds?)`：在工作区根目录执行命令。
+- `find_files(pattern)`：用 glob 模式查找文件。
+- `search_code(query, path?)`：搜索 UTF-8 文本文件内容。
 
-可提交的初始化规则位于 `.mewcode/worktrees.yaml`，示例见 `examples/worktrees.yaml`。默认只尝试复制明确列出的本地 MewCode 配置/记忆；自定义 `copy` 和 `link` 规则也只接受主工作区内“未跟踪且已忽略”的内容。`link` 失败不会回退为大规模复制，`git_hooks` 通过子进程专属的 `core.hooksPath` 环境覆盖生效，不修改共享 Git 配置。
+工具只能访问启动 `mewcode` 时所在的当前工作区。父目录跳转、越界绝对路径和符号链接越界都会被拒绝。
 
-Worktree 是并发文件隔离，不是操作系统安全沙箱；能够执行任意命令的代码仍可能访问绝对路径。普通 `agent` 临时 Worktree 流程不提供自动合并、跨 Worktree 代码同步、多 Agent 团队编排、跨会话后台任务持久化、嵌套 Agent、子 Agent 人工审批或缓存命中保证，合并仍由上层显式执行 `git merge`。持久团队在双开关启用后可以使用 Phase 14C 的独立受控集成流程，见下文。
+命令工具默认超时 30 秒，最大超时 120 秒，并会拦截明显危险的破坏性命令。
+
+## 结构化系统提示与缓存
+
+每次模型请求都使用同一套结构化系统提示。稳定前缀依次包含 Identity、System Constraints、Task Mode、Action Execution、Tool Use、Tone and Style 和 Text Output；Environment、自动发现的项目/用户指令、Skill 目录、已激活共享 Skill 内容、长期记忆以及当次 `<system-reminder>` 位于稳定边界之后。
+
+Plan 和 Execute 模式按一次 Agent Run 内的真实模型调用次数注入提醒：第 1, 5, 9, 13, 17 次使用完整指令，其余调用使用精简提醒。Direct Mode 不增加模式提醒。提醒使用系统语义，不会作为用户消息写入对话历史。
+
+工具定义和稳定系统提示会按 Provider 协议组成确定性的缓存前缀。缓存是否实际写入或命中仍取决于模型支持、前缀长度和服务端状态，MewCode 不保证每次命中。Token 行会显示：
+
+```text
+tokens: in=... out=... total=... cache-read=... cache-write=... cumulative=... cumulative-cache-read=... cumulative-cache-write=...
+```
+
+MCP 工具来自启动时静态快照，不会改变结构化提示的运行时边界。Skill 只有在用户调用斜杠命令或 Agent 调用 `load_skill` 后才激活；未激活 SOP 和专属工具 schema 不进入模型请求。
+
+## 上下文管理
+
+每次模型请求前，MewCode 会先限制工具结果体积，再检查累计历史容量。单个工具结果估算超过 8K Token 时会保存完整结果；同一轮工具结果合计超过 12K 时，会从最大的结果开始继续保存，直到活动内容回到预算内。上下文中的占位内容保留文件路径以及合计最多约 1K Token 的首尾预览。
+
+当整体请求接近窗口上限时，MewCode 会用当前活动 Profile 和 Provider 生成一份无工具、最大输出 8192 Token 的结构化滚动摘要。近期约 10K Token 且至少 5 条消息保持原文，工具调用组不会被拆开；较早的完整记录写入工作区的 `.mewcode/context/<session-id>/`。摘要与近期原文之间的边界提示要求模型在需要代码、文件或工具细节时重新读取原文件或存盘记录，不得根据摘要猜测。
+
+自动触发边界为 `context_window - 本次最大输出 Token - 13000`。`/compact` 即使未达到自动阈值也会显式尝试一次，摘要请求使用 `context_window - 8192 - 3000` 的容量边界；没有可压缩的早期消息时不会调用模型。连续三次摘要失败后，本会话停止自动摘要：安全请求仍可继续，存在溢出风险的请求会在调用主模型前报错。此时可再次执行 `/compact`；成功后失败计数清零并恢复自动摘要。
+
+Token 数采用近似估算：以上一次 API 返回的输入 usage 为锚，只按后续字符增量修正；ASCII 约按 4 字符/Token、非 ASCII 约按 1 字符/Token 估算，并用安全余量吸收误差，不依赖精确 tokenizer。存盘文件只在当前会话期间保留，正常退出时删除；下次启动会清理崩溃遗留目录，同时保留仍由其他进程锁定的活动会话。
+
+## Plan Mode
+
+`/plan` 是持续状态切换命令，本身不接收任务、不调用模型，也不写入对话历史。切换后，底栏立即显示 `[PLAN]`，后续普通消息使用计划提示并且只开放只读工具；即使用户要求修改文件或运行有副作用的操作，也不会获得写工具。
+
+```text
+mew> /plan
+[PLAN]
+mew> 分析配置加载器应如何增加环境变量校验
+agent: iteration 1
+tool: search_code ...
+...
+
+mew> /do
+[DEFAULT]
+mew> 按刚才的分析实现并验证
+```
+
+`/do` 只把持续模式切回 DEFAULT，不会自动执行或改写旧版本会话中保存的计划。内置 `/review` 是独立只读 Skill；在 PLAN 中调用时仍受只读安全上限约束，完成或失败后不会改变持续模式。
+
+当前阶段不包含通用网络沙箱、自动化质量评估或 Hook 之外的审计系统。
 
 ## Skill 系统
 
@@ -257,59 +318,6 @@ Explain the change with this focus: {{input}}
 
 本阶段不使用向量数据库、RAG 检索或团队记忆同步。
 
-## Agent Loop
-
-普通消息会启动 ReAct Agent Loop。MewCode 会持续让模型思考、调用工具、读取结果并调整下一步，直到模型给出不再包含工具调用的最终回复，无需逐步追加提示。
-
-每次运行最多调用模型 20 次；如果第 20 次响应仍要求工具，MewCode 会停止且不会执行最后一批工具。运行还会在用户按下 `Ctrl+C`、连续三轮只请求未知工具、Provider 流出错或内部错误时停止。`Ctrl+C` 只取消当前一轮，清理完成后可以继续在同一 REPL 中输入任务。
-
-模型一次返回多个工具调用时，相邻的只读工具会并发执行，最大并发数为 4；写文件、编辑文件和运行命令按原始顺序独占执行。终端会实时显示文本、简短工具状态、迭代进度和 Token 用量，不显示完整工具参数或大段工具结果。
-
-## 结构化系统提示与缓存
-
-每次模型请求都使用同一套结构化系统提示。稳定前缀依次包含 Identity、System Constraints、Task Mode、Action Execution、Tool Use、Tone and Style 和 Text Output；Environment、自动发现的项目/用户指令、Skill 目录、已激活共享 Skill 内容、长期记忆以及当次 `<system-reminder>` 位于稳定边界之后。
-
-Plan 和 Execute 模式按一次 Agent Run 内的真实模型调用次数注入提醒：第 1, 5, 9, 13, 17 次使用完整指令，其余调用使用精简提醒。Direct Mode 不增加模式提醒。提醒使用系统语义，不会作为用户消息写入对话历史。
-
-工具定义和稳定系统提示会按 Provider 协议组成确定性的缓存前缀。缓存是否实际写入或命中仍取决于模型支持、前缀长度和服务端状态，MewCode 不保证每次命中。Token 行会显示：
-
-```text
-tokens: in=... out=... total=... cache-read=... cache-write=... cumulative=... cumulative-cache-read=... cumulative-cache-write=...
-```
-
-MCP 工具来自启动时静态快照，不会改变结构化提示的运行时边界。Skill 只有在用户调用斜杠命令或 Agent 调用 `load_skill` 后才激活；未激活 SOP 和专属工具 schema 不进入模型请求。
-
-## 上下文管理
-
-每次模型请求前，MewCode 会先限制工具结果体积，再检查累计历史容量。单个工具结果估算超过 8K Token 时会保存完整结果；同一轮工具结果合计超过 12K 时，会从最大的结果开始继续保存，直到活动内容回到预算内。上下文中的占位内容保留文件路径以及合计最多约 1K Token 的首尾预览。
-
-当整体请求接近窗口上限时，MewCode 会用当前活动 Profile 和 Provider 生成一份无工具、最大输出 8192 Token 的结构化滚动摘要。近期约 10K Token 且至少 5 条消息保持原文，工具调用组不会被拆开；较早的完整记录写入工作区的 `.mewcode/context/<session-id>/`。摘要与近期原文之间的边界提示要求模型在需要代码、文件或工具细节时重新读取原文件或存盘记录，不得根据摘要猜测。
-
-自动触发边界为 `context_window - 本次最大输出 Token - 13000`。`/compact` 即使未达到自动阈值也会显式尝试一次，摘要请求使用 `context_window - 8192 - 3000` 的容量边界；没有可压缩的早期消息时不会调用模型。连续三次摘要失败后，本会话停止自动摘要：安全请求仍可继续，存在溢出风险的请求会在调用主模型前报错。此时可再次执行 `/compact`；成功后失败计数清零并恢复自动摘要。
-
-Token 数采用近似估算：以上一次 API 返回的输入 usage 为锚，只按后续字符增量修正；ASCII 约按 4 字符/Token、非 ASCII 约按 1 字符/Token 估算，并用安全余量吸收误差，不依赖精确 tokenizer。存盘文件只在当前会话期间保留，正常退出时删除；下次启动会清理崩溃遗留目录，同时保留仍由其他进程锁定的活动会话。
-
-## Plan Mode
-
-`/plan` 是持续状态切换命令，本身不接收任务、不调用模型，也不写入对话历史。切换后，底栏立即显示 `[PLAN]`，后续普通消息使用计划提示并且只开放只读工具；即使用户要求修改文件或运行有副作用的操作，也不会获得写工具。
-
-```text
-mew> /plan
-[PLAN]
-mew> 分析配置加载器应如何增加环境变量校验
-agent: iteration 1
-tool: search_code ...
-...
-
-mew> /do
-[DEFAULT]
-mew> 按刚才的分析实现并验证
-```
-
-`/do` 只把持续模式切回 DEFAULT，不会自动执行或改写旧版本会话中保存的计划。内置 `/review` 是独立只读 Skill；在 PLAN 中调用时仍受只读安全上限约束，完成或失败后不会改变持续模式。
-
-当前阶段不包含通用网络沙箱、自动化质量评估或 Hook 之外的审计系统。
-
 ## Hook 自动化
 
 Hook 在 Agent 生命周期的固定边界执行声明式自动化。配置按以下顺序追加加载，文件缺失等同空配置；任一文件存在格式错误时，整个 Hook 目录在启动阶段被拒绝，不会先执行部分规则：
@@ -359,52 +367,44 @@ command stdin 与 HTTP body 使用相同的有界、带 `schema_version` 的 JSO
 
 完整示例见 `examples/hooks.yaml`。本阶段不提供显式 priority、热重载、失败重试、跨重启 once、真实子 Agent、通用 OS 沙箱或跨平台 shell 语法转换。
 
-## 权限系统
+## 子 Agent 系统
 
-每个有效工具调用在执行前都会经过危险命令黑名单、内置文件工具路径沙箱、分层规则、权限模式与人工确认。黑名单和路径沙箱是不可绕过的安全上限；即使使用 `allow` 模式或显式 allow 规则，危险命令和越界文件路径仍会被拒绝。权限拒绝会作为工具失败返回模型，Agent Loop 可以改用更安全的策略继续工作。
+主 Agent 通过始终稳定的 `agent` 工具委派独立任务。工具只有 `type`、`task`、`role`、`background` 四个参数：`defined` 必须指定已加载角色，默认在前台等待；`fork` 不接受角色或 `background` 参数并始终进入后台。定义式任务超过 10 秒会原地转为后台，也可在运行时按 `Ctrl+B` 手动转后台；这不会取消、重启或重计任务。`Ctrl+C` 仍取消当前主运行以及仍与其绑定的前台子任务，已经解除到后台的任务继续执行。
 
-三档模式的含义如下：
+角色是带严格 YAML frontmatter 的 Markdown 文件。项目级 `<workspace>/.mewcode/agents/` 覆盖用户级 `~/.mewcode/agents/`，再覆盖包内置角色，最后覆盖启动时显式注入的插件根；高层无效定义会产生诊断并回退到低层有效定义，同层有效重名会拒绝启动。目录只在启动时读取，没有热重载。`isolation` 可选，缺省为 `shared`：
 
-- `strict`：deny 直接拒绝；本会话已确认的精确 allow 自动执行；持久 allow 与未匹配调用仍需首次确认。
-- `default`：采用明确的 allow/deny，未匹配调用需要确认。
-- `allow`：deny 仍然生效，其余调用自动执行。
-
-规则按会话、项目本地、项目共享、用户全局的顺序解析。持久化文件位置为：
-
-- 用户全局：`~/.mewcode/permissions.yaml`
-- 项目共享：`<workspace>/.mewcode/permissions.yaml`
-- 项目本地：`<workspace>/.mewcode/permissions.local.yaml`
-
-三个 YAML 文件格式相同：
-
-```yaml
-rules:
-  - rule: "run_command(git *)"
-    result: allow
-  - rule: "write_file(src/generated/**)"
-    result: deny
+```markdown
+---
+name: code-reviewer
+description: Review code changes without modifying them.
+tools:
+  - read_file
+  - find_files
+  - search_code
+disallowed_tools: []
+model: inherit
+max_turns: 20
+permission_mode: default
+isolation: worktree
+---
+You are an independent code reviewer...
 ```
 
-规则使用实际工具名和主要参数，支持精确与 glob 匹配。同层中精确规则优先于 glob，固定文本更多者优先，具体度并列时 deny 获胜。命令 glob 的 `*` 可匹配空格；路径 glob 的 `*` 不跨 `/`，`**` 可递归跨目录。用 `\\`、`\*`、`\?`、`\[`、`\]` 表示字面量反斜杠或 glob 字符。
+`model: inherit` 使用委派父请求的 Profile；其他值必须是配置中已有的 Profile 名。`haiku`、`sonnet`、`opus` 没有内置别名，只有用户实际创建同名 Profile 时才有效。完整示例见 `examples/agents/code-reviewer.md` 和 `examples/agents/worktree-coder.md`；内置 `explore` 角色只开放 `read_file`、`find_files`、`search_code`。
 
-需要确认时可选择拒绝、仅本次、本会话或永久。永久放行只把当前调用的精确 allow 写入项目本地 `permissions.local.yaml`；该文件默认不提交，项目共享 `permissions.yaml` 可以提交。
+定义式子 Agent 从空历史和固定角色正文启动，只复制人工指令与长期记忆，不继承父对话、活动 Skill 或临时 Hook prompt。Fork 首轮复用产生委派调用的实际父请求 prompt、消息前缀、工具顺序和输出上限，并只在尾部追加新任务，以便 Provider 有机会复用缓存；缓存实际命中不作保证。两类任务的消息、权限 session、文件读取观察、上下文归档和 Token 统计彼此隔离；`shared` 角色仍使用主工作区，`worktree` 角色使用独立 Git Worktree。
 
-路径沙箱仅约束 MewCode 内置的读取、写入、编辑、查找和搜索工具。`run_command` 子进程从工作区启动，但本阶段没有操作系统级文件隔离；它仍受危险命令黑名单、权限规则、模式与人工确认保护。
+工具能力采用多层交集：父模式安全上限、角色白名单、角色黑名单、启动时冻结的后台能力名单和全局禁止名单共同收窄。`agent`、`load_skill` 不能在子 Agent 中执行，禁止嵌套委派。Fork 为保持缓存前缀可继续展示父工具 schema，但越界工具会在 Hook 和权限检查之前被冻结策略拒绝。子 Agent 不进行交互审批；任何原本为 `ASK` 的权限决定都会以非交互来源自动改写为拒绝，再把普通工具失败交回子模型继续处理。
 
-## 工具系统
+后台任务结束时终端只显示单行摘要。完整的有界结果可用 `/task <id>` 查看，并会在根 Agent 的下一次真实模型请求中以 `<untrusted-subagent-results>` 边界一次性注入；它不写入主历史。任务表和通知纯属进程内状态，退出后不恢复；`/reset` 会先取消并清空所有任务和待投递通知。
 
-MewCode 会把以下内置工具暴露给模型：
+`worktree` 角色会在 `<workspace>/.mewcode/worktrees/task/<摘要>/` 创建独立目录和 `mewcode/worktree/task/<摘要>` 临时分支。所有文件、命令、Skill 进程、项目 Hook、stdio MCP、Prompt 环境和上下文归档都显式绑定该绝对目录，MewCode 不调用进程级 `chdir`。主 Agent 启动时冻结的用户级配置继续复用，项目指令、项目记忆、Hook 和 MCP 则从该 Worktree 重新加载。
 
-- `read_file(path)`：读取当前工作区内的 UTF-8 文本文件。
-- `write_file(path, content)`：在当前工作区内写入 UTF-8 文本。
-- `edit_file(path, old_text, new_text)`：只在原文恰好匹配一次时替换文本。
-- `run_command(command, timeout_seconds?)`：在工作区根目录执行命令。
-- `find_files(pattern)`：用 glob 模式查找文件。
-- `search_code(query, path?)`：搜索 UTF-8 文本文件内容。
+任务退出时，干净且没有未发布提交的临时目录会自动删除；存在 tracked 修改、未忽略的 untracked 文件、未被任一远端跟踪引用包含的新提交，或保护检查不确定时会保留，并在 `/task`、通知和 `/worktrees` 中显示。`--force` 只允许人工本地命令逐次指定，不能由 Agent 工具、配置或后台清理启用。后台清理只处理超过 24 小时的非活动候选，每轮最多 256 个，并复用相同的归属验证和非强制保护。
 
-工具只能访问启动 `mewcode` 时所在的当前工作区。父目录跳转、越界绝对路径和符号链接越界都会被拒绝。
+可提交的初始化规则位于 `.mewcode/worktrees.yaml`，示例见 `examples/worktrees.yaml`。默认只尝试复制明确列出的本地 MewCode 配置/记忆；自定义 `copy` 和 `link` 规则也只接受主工作区内“未跟踪且已忽略”的内容。`link` 失败不会回退为大规模复制，`git_hooks` 通过子进程专属的 `core.hooksPath` 环境覆盖生效，不修改共享 Git 配置。
 
-命令工具默认超时 30 秒，最大超时 120 秒，并会拦截明显危险的破坏性命令。
+Worktree 是并发文件隔离，不是操作系统安全沙箱；能够执行任意命令的代码仍可能访问绝对路径。普通 `agent` 临时 Worktree 流程不提供自动合并、跨 Worktree 代码同步、多 Agent 团队编排、跨会话后台任务持久化、嵌套 Agent、子 Agent 人工审批或缓存命中保证，合并仍由上层显式执行 `git merge`。持久团队在双开关启用后可以使用 Phase 14C 的独立受控集成流程，见下文。
 
 ## Agent Teams
 
